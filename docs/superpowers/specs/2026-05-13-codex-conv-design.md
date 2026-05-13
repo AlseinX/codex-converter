@@ -7,6 +7,17 @@
 
 `codex-conv` is a reverse proxy that converts between OpenAI Responses API (used by Codex CLI) and Anthropic Messages API. It enables using any Anthropic-compatible backend with Codex CLI without modification.
 
+### Core Principle: Perfect Forwarding
+
+The proxy must act as a **transparent protocol converter** — only translating between two API formats. It must not:
+
+- **Fabricate data:** Never inject values that don't come from upstream or downstream (no hardcoded token counts, no synthetic fields)
+- **Drop data silently:** Every field from the downstream request must either be forwarded (mapped to Anthropic equivalent) or explicitly documented as unsupported with a verified rationale explaining why Anthropic has no equivalent
+- **Override client intent:** Never replace a client-specified value with a proxy-decided value unless required by protocol format differences (e.g., `stream` forced to `true` because the proxy architecture requires SSE internally)
+- **Invent behavior:** Never add custom logic beyond what either API defines (no custom threshold tables, no synthetic mappings, no heuristic decisions)
+
+When a field exists in both APIs, forward it directly. When a field exists in only one API, document it with a verified explanation. When in doubt, forward.
+
 ## Architecture
 
 ### High-Level
