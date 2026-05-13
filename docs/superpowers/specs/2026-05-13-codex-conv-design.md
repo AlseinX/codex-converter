@@ -88,13 +88,12 @@ In-flight state maintained per request:
 - ID map: `toolu_xxx` ↔ `call_xxx` bidirectional
 - Namespace registry: `flat_name → (namespace, tool_name)`
 - Index mapping: Anthropic `content_block.index` → Responses API `output_index` + `content_index`
-- Signature accumulator: thinking block encrypted signature for round-trip
 
 #### Thinking/Reasoning Round-Trip
 
 The Anthropic API returns encrypted signatures for thinking blocks during streaming. The proxy handles the round-trip as follows:
 
-1. **Streaming response (Anthropic → Responses API):** When a `content_block_delta` with `type: "signature_delta"` arrives, accumulate the encrypted signature bytes in internal state. The `reasoning_text.done` event carries the accumulated reasoning text. Signature data is used only for the current response's delta accumulation — it is **not** persisted across requests.
+1. **Streaming response (Anthropic → Responses API):** `signature_delta` events are consumed and discarded — the proxy does not accumulate or persist signature data. The `reasoning_text.done` event carries the accumulated reasoning text.
 
 2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears (from a previous response), it is converted to a `redacted_thinking` content block:
    ```json
@@ -235,7 +234,7 @@ Anthropic Claude 4.6+ supports `output_config.effort` — a direct string parame
 | `"medium"` | `"medium"` | Direct match |
 | `"high"` | `"high"` | Direct match |
 | `"xhigh"` | `"xhigh"` | Direct match (Opus 4.7+ / gpt-5.5) |
-| `"none"` | Omit `thinking` and `output_config` | No Anthropic equivalent; disable thinking entirely |
+| `"none"` | Omit `thinking` and `output_config` | OpenAI defines this as "no reasoning" — disable thinking entirely |
 | `"minimal"` | `"low"` | No Anthropic `minimal`; map to closest value |
 
 **Why `adaptive` + `effort` instead of `budget_tokens`:**
@@ -268,7 +267,7 @@ Omit `system` parameter entirely if both `instructions` and system input items a
 | `{"type":"message","role":"assistant","content":[...]}` | `{"role":"assistant","content":[...]}` |
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"function_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
-| `{"type":"reasoning","content":[{"type":"summary_text","text":"..."}]}` | `{"role":"assistant","content":[{"type":"redacted_thinking"}]}` |
+| `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}]}` | `{"role":"assistant","content":[{"type":"redacted_thinking"}]}` |
 
 Key details:
 - **ID mapping:** `call_id` ↔ `tool_use.id`. Proxy generates `toolu_` prefixed IDs, maintains bidirectional map
@@ -300,7 +299,7 @@ Flattened namespace tool names may exceed 64 chars (Anthropic limit). Apply Code
 | Anthropic content block | Responses API output item |
 |---|---|
 | `{"type":"text","text":"..."}` | `{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"...","annotations":[]}]}` |
-| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","status":"completed","content":[{"type":"output_text","text":"..."}]}` |
+| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[{"type":"summary_text","text":"..."}]}` |
 | `{"type":"tool_use","id":"toolu_xxx","name":"mcp__svr__tool","input":{...}}` | `{"type":"function_call","id":"fc_xxx","call_id":"call_xxx","name":"tool","namespace":"mcp__svr__","arguments":"{...}"}` |
 
 tool_use → function_call details:
@@ -389,6 +388,17 @@ message_stop
 
 Multiple tool_use blocks in one response: each converted to independent `function_call` output item with its own `output_index`.
 
+#### Response ID Generation
+
+Each Responses API response requires an `id` field. The proxy generates IDs by prefixing the Anthropic message ID:
+
+| Output item type | ID format | Source |
+|---|---|---|
+| Response | `resp_{anthropic_message_id}` | Anthropic `message_start.message.id` (strip `msg_` prefix, prepend `resp_`) |
+| Message output | `msg_{anthropic_message_id}` | Same Anthropic message ID |
+| Reasoning output | `rs_{uuid_v4}` | Proxy-generated UUID (no Anthropic equivalent) |
+| Function call output | `fc_{sequential}` | Proxy-generated sequential per-response |
+
 #### SSE Wire Format Examples
 
 Each SSE event consists of an `event:` line and a `data:` line with JSON payload. Below are representative examples:
@@ -429,10 +439,10 @@ event: content_block_start
 data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}
 
 event: response.output_item.added
-data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","status":"in_progress","content":[]}}
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[]}}
 
 event: response.content_part.added
-data: {"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}
+data: {"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"summary_text","text":""}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Let me analyze..."}}
@@ -443,7 +453,7 @@ data: {"type":"response.reasoning_text.delta","output_index":1,"content_index":0
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"ErUB..."}}
 
-(No Responses API event emitted — signature accumulated internally)
+(No Responses API event emitted — signature consumed and discarded)
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":1}
@@ -452,10 +462,10 @@ event: response.reasoning_text.done
 data: {"type":"response.reasoning_text.done","output_index":1,"content_index":0,"text":"Let me analyze..."}
 
 event: response.content_part.done
-data: {"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"output_text","text":"Let me analyze..."}}
+data: {"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"summary_text","text":"Let me analyze..."}}
 
 event: response.output_item.done
-data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","status":"completed","content":[{"type":"summary_text","text":"Let me analyze..."}]}}
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[{"type":"summary_text","text":"Let me analyze..."}]}}
 ```
 
 **Tool use streaming:**
@@ -491,7 +501,7 @@ event: message_stop
 data: {"type":"message_stop"}
 
 event: response.completed
-data: {"type":"response.completed","response":{"id":"resp_xxx","status":"completed","output":[...],"usage":{"input_tokens":100,"output_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}
+data: {"type":"response.completed","response":{"id":"resp_xxx","status":"completed","output":[...],"usage":{"input_tokens":100,"output_tokens":15,"input_tokens_details":{"cached_tokens":0}}}}
 ```
 
 ## Unsupported Responses API Features
@@ -524,8 +534,8 @@ The following fields are forwarded to Anthropic with value mapping where needed:
 |---|---|---|
 | `"auto"` | `"auto"` | Direct match |
 | `"default"` | `"standard_only"` | Anthropic uses different name |
-| `"flex"` | Omit (use default) | No Anthropic equivalent |
-| `"priority"` | Omit (use default) | Anthropic priority is per-account, not per-request |
+| `"flex"` | Rejected with 400 error | No Anthropic equivalent — cannot silently downgrade client intent |
+| `"priority"` | Rejected with 400 error | Anthropic priority is per-account, not per-request — cannot silently downgrade client intent |
 
 ## MCP Namespace Handling
 
