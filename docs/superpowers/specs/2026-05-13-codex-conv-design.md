@@ -147,15 +147,17 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | Responses API | Anthropic | Notes |
 |---|---|---|
 | `model` | `model` | Passthrough |
-| `stream` | `stream` | **Always `true`** — proxy ignores downstream value and forces streaming to enable real-time SSE conversion |
+| `stream` | `stream` | **Always `true`** — proxy requires streaming from upstream to perform real-time SSE event conversion. Downstream always receives SSE regardless of this value. If downstream sends `stream: false`, proxy still streams upstream and returns the completed response as a single SSE stream |
 | `instructions` | `system` | Merged with system items from input |
 | `tools` | `tools` | Namespace flattening + registry |
 | `tool_choice` | `tool_choice` | See mapping table |
 | `parallel_tool_calls` | `disable_parallel_tool_use` | Semantics inverted |
-| `reasoning.effort` | `thinking` | See thinking mapping |
+| `reasoning.effort` | `thinking` + `output_config.effort` | Direct string forwarding, see mapping section |
 | `temperature` | `temperature` | Passthrough |
 | `top_p` | `top_p` | Passthrough |
 | `max_output_tokens` | `max_tokens` | Field name differs |
+| `metadata` | `metadata` | Forward `user_id`, strip other keys |
+| `service_tier` | `service_tier` | Value mapping, see Unsupported Features section |
 
 #### Upstream HTTP Headers
 
@@ -194,32 +196,41 @@ When `parallel_tool_calls: false`, the `disable_parallel_tool_use: true` field i
 | `parallel_tool_calls: true` | Omit `disable_parallel_tool_use` from `tool_choice` object (default allows) |
 | `parallel_tool_calls: false` | Add `disable_parallel_tool_use: true` to `tool_choice` object |
 
-#### `reasoning` → `thinking` Mapping
+#### `reasoning` → `thinking` + `output_config.effort` Mapping
+
+Anthropic Claude 4.6+ supports `output_config.effort` — a direct string parameter analogous to OpenAI's `reasoning.effort`. The proxy forwards effort values directly without custom integer conversion.
+
+**When `reasoning` is present (effort specified):**
 
 ```json
 // Responses API
-{"reasoning": {"effort": "high", "generate_summary": "auto"}}
+{"reasoning": {"effort": "high"}}
 ```
 
 ```json
 // Anthropic
-{"thinking": {"type": "enabled", "budget_tokens": N}}
+{"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
 ```
 
-- `effort` → `budget_tokens`: concrete mapping below
-- `generate_summary: "auto"` → `thinking.type: "enabled"`
-- When thinking enabled: Anthropic requires `max_tokens >= budget_tokens`
+- `reasoning.effort` → `output_config.effort`: direct string forwarding
+- When reasoning present: set `thinking.type: "adaptive"` (Anthropic's modern thinking mode)
+- `reasoning.effort` absent or `null` → omit both `thinking` and `output_config` (Anthropic defaults)
 
-#### `effort` → `budget_tokens` Mapping
+**Value mapping:**
 
-| `reasoning.effort` | `thinking.budget_tokens` | Notes |
+| Responses API `reasoning.effort` | Anthropic `output_config.effort` | Notes |
 |---|---|---|
-| `"low"` | `1024` | Minimal thinking budget |
-| `"medium"` | `10240` | Balanced thinking budget |
-| `"high"` | `32768` | Extended thinking budget |
-| Unset / absent | Omit `thinking` field entirely | Thinking disabled |
+| `"low"` | `"low"` | Direct match |
+| `"medium"` | `"medium"` | Direct match |
+| `"high"` | `"high"` | Direct match |
+| `"xhigh"` | `"xhigh"` | Direct match (Opus 4.7+ / gpt-5.5) |
+| `"none"` | Omit `thinking` and `output_config` | No Anthropic equivalent; disable thinking entirely |
+| `"minimal"` | `"low"` | No Anthropic `minimal`; map to closest value |
 
-When `budget_tokens` exceeds `max_output_tokens`, clamp `max_tokens` to at least `budget_tokens` (Anthropic requirement).
+**Why `adaptive` + `effort` instead of `budget_tokens`:**
+- `budget_tokens` is **deprecated** on Claude Opus 4.6/Sonnet 4.6 and **rejected** (400 error) on Opus 4.7
+- `output_config.effort` is the modern, GA parameter supported on all current Claude models
+- Direct string forwarding preserves semantics without custom integer thresholds
 
 #### `system` Parameter Construction
 
@@ -309,9 +320,7 @@ tool_use → function_call details:
 
 Calculation: `cached_tokens = cache_creation_input_tokens + cache_read_input_tokens`
 
-| Responses API field | Source |
-|---|---|
-| `usage.output_tokens_details.reasoning_tokens` | Always `0` — Anthropic has no separate reasoning token count |
+Note: `output_tokens_details.reasoning_tokens` is omitted from response — Anthropic has no equivalent field, so we do not fabricate values.
 
 ### Streaming Conversion (Event-by-Event, Real-Time)
 
@@ -476,18 +485,36 @@ data: {"type":"response.completed","response":{"id":"resp_xxx","status":"complet
 
 ## Unsupported Responses API Features
 
-The following Responses API features are not supported and handled as follows:
+The following Responses API features have no Anthropic equivalent and are handled as follows:
 
-| Feature | Behavior |
-|---|---|
-| `previous_response_id` | Ignored (stripped from request). Codex is stateless and does not use this in practice |
-| `store` | Ignored (stripped from request). No server-side conversation storage |
-| `include` | Ignored (stripped from request). No partial response inclusion support |
-| `truncation` | Ignored (stripped from request). No truncation strategy support |
-| `n` | Ignored, forced to `1` (single response only) |
-| `metadata` | Ignored (stripped from request). No metadata passthrough |
-| `service_tier` | Ignored (stripped from request). No tier selection |
-| Built-in tools (`web_search`, `file_search`, `code_interpreter`) | Rejected with 400 error. Only function-type tools (including MCP namespace tools) are supported |
+| Feature | Behavior | Rationale |
+|---|---|---|
+| `previous_response_id` | Ignored (stripped) | Codex always sends full `input` history; this field is always `None` in HTTP requests. Anthropic has no server-side conversation state |
+| `store` | Ignored (stripped) | Server-side response storage. Anthropic API is stateless, every request includes full history |
+| `include` | Ignored (stripped) | Requests encrypted reasoning content. Anthropic returns thinking content inline via `thinking` blocks, not via `include` |
+| `truncation` | Ignored (stripped) | Input context truncation control. Codex never sends this field. Anthropic naturally errors on context overflow (equivalent to `"disabled"` behavior) |
+| `n` | Ignored (forced `1`) | Not in Responses API spec (removed from Chat Completions). Codex never sends it. Anthropic always returns single response |
+| Built-in tools (`web_search`, `file_search`, `code_interpreter`) | Rejected with 400 error | Only function-type tools (including MCP namespace tools) are supported |
+
+#### Forwarded Fields (with mapping)
+
+The following fields are forwarded to Anthropic with value mapping where needed:
+
+**`metadata`:** Direct forwarding of `metadata.user_id`. Both APIs accept `{"metadata": {"user_id": "..."}}`. Extra keys beyond `user_id` are stripped (Anthropic only supports `user_id`).
+
+| Responses API | Anthropic | Notes |
+|---|---|---|
+| `metadata.user_id` | `metadata.user_id` | Direct passthrough |
+| `metadata.*` (other keys) | Stripped | Anthropic only supports `user_id` |
+
+**`service_tier`:** Forwarded with value mapping. Both APIs have tier/priority control.
+
+| Responses API | Anthropic | Notes |
+|---|---|---|
+| `"auto"` | `"auto"` | Direct match |
+| `"default"` | `"standard_only"` | Anthropic uses different name |
+| `"flex"` | Omit (use default) | No Anthropic equivalent |
+| `"priority"` | Omit (use default) | Anthropic priority is per-account, not per-request |
 
 ## MCP Namespace Handling
 
