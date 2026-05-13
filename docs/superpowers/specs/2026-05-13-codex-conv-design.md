@@ -664,3 +664,5 @@ tempfile = "3"
 3. **No silent errors:** all errors must be properly handled; if unsure, stop and ask user
 4. **No unspecified behavior:** all ambiguous cases must be escalated to user
 5. **Testing:** unit tests fully cover state machine, integration tests use real Codex CLI with mock Anthropic server
+6. **Code quality:** must pass `cargo clippy` and `cargo fmt --check` with zero warnings
+7. **No unsafe code:** the entire codebase must not contain any `unsafe` blocks
