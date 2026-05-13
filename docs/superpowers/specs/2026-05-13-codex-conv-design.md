@@ -79,6 +79,14 @@ In-flight state maintained per request:
 - Index mapping: Anthropic `content_block.index` → Responses API `output_index` + `content_index`
 - Signature accumulator: thinking block encrypted signature for round-trip
 
+#### Thinking/Reasoning Round-Trip
+
+The Anthropic API returns encrypted signatures for thinking blocks that must be preserved:
+
+1. **Streaming response (Anthropic → Responses API):** When a `content_block_delta` with `type: "signature_delta"` arrives, accumulate the encrypted signature bytes in internal state. The `reasoning_text.done` event carries the accumulated reasoning text.
+
+2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears (from a previous response), it is converted to a `redacted_thinking` content block (type `"redacted_thinking"`) — NOT a plain `thinking` block. The actual thinking text is not sent back; only the opaque marker is sent, which Anthropic uses to verify continuity. This ensures the encrypted signature round-trips correctly without exposing or re-sending the raw thinking content.
+
 ## URL Routing
 
 ### Format
@@ -96,9 +104,25 @@ Proxy extracts:
 - Upstream base URL: `https://api.anthropic.com` (no `/v1`, follows Anthropic convention)
 - Upstream endpoint: `/v1/messages` (proxy appends, not configurable)
 
+### Hostname Validation (SSRF Protection)
+
+The extracted upstream hostname is validated to prevent SSRF attacks. The following are rejected with HTTP 400:
+
+- Private IPv4 ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`
+- Loopback IPv6: `::1`
+- Hostname `localhost`
+- Literal IP addresses in any of the above ranges
+
+Validation occurs after URL parsing but before connecting upstream. Optionally bypassed via `server.allowed_upstreams` config (for internal testing):
+
+| Path | Type | Default | Description |
+|---|---|---|---|
+| `server.allowed_upstreams` | string[] | `[]` | Hostnames exempt from SSRF validation |
+
 ### Key/Model Passthrough
 
-- **API Key:** From downstream `Authorization` header → upstream `x-api-key` header
+- **API Key Extraction:** From downstream `Authorization` header. Strip `Bearer ` prefix if present; use raw value if no prefix. Return HTTP 401 if header is missing or empty
+- **API Key Forwarding:** Sent as upstream `x-api-key` header (and `anthropic-version` header, see Upstream HTTP Headers)
 - **Model ID:** Request body `model` field passed through unchanged
 
 ### Rationale for no `/v1` in base URL
@@ -128,7 +152,16 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `temperature` | `temperature` | Passthrough |
 | `top_p` | `top_p` | Passthrough |
 | `max_output_tokens` | `max_tokens` | Field name differs |
-| — | `anthropic_version` | Fixed value |
+
+#### Upstream HTTP Headers
+
+All requests to the Anthropic API include these HTTP headers:
+
+| Header | Value | Source |
+|---|---|---|
+| `x-api-key` | API key | From downstream `Authorization` header (see Key Extraction below) |
+| `anthropic-version` | `2023-06-01` | Configurable via `upstream.anthropic_version`, defaults to `2023-06-01` |
+| `content-type` | `application/json` | Fixed |
 
 #### `tool_choice` Mapping
 
@@ -139,12 +172,23 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `"none"` | `{"type": "none"}` |
 | `{"type":"function","name":"x"}` | `{"type":"tool","name":"x"}` |
 
-#### `parallel_tool_calls` Mapping
+When `parallel_tool_calls: false`, the `disable_parallel_tool_use: true` field is placed **inside** the `tool_choice` object:
 
 | Responses API | Anthropic |
 |---|---|
-| `parallel_tool_calls: true` | Omit `disable_parallel_tool_use` (default allows) |
-| `parallel_tool_calls: false` | `disable_parallel_tool_use: true` |
+| `"auto"` + `parallel_tool_calls: false` | `{"type": "auto", "disable_parallel_tool_use": true}` |
+| `"required"` + `parallel_tool_calls: false` | `{"type": "any", "disable_parallel_tool_use": true}` |
+| `{"type":"function","name":"x"}` + `parallel_tool_calls: false` | `{"type":"tool","name":"x","disable_parallel_tool_use": true}` |
+| `"none"` + `parallel_tool_calls: false` | `{"type": "none"}` (no change, no tools to parallelize) |
+
+#### `parallel_tool_calls` Mapping
+
+`disable_parallel_tool_use` is embedded within the `tool_choice` object, not a separate top-level field.
+
+| Responses API | Anthropic |
+|---|---|
+| `parallel_tool_calls: true` | Omit `disable_parallel_tool_use` from `tool_choice` object (default allows) |
+| `parallel_tool_calls: false` | Add `disable_parallel_tool_use: true` to `tool_choice` object |
 
 #### `reasoning` → `thinking` Mapping
 
@@ -168,7 +212,15 @@ Merge order:
 1. `instructions` field content
 2. Input items with `role: "system"`
 
-Omit `system` parameter if both are empty.
+The `system` parameter is always emitted as an **array of content blocks**, even when there is only one text entry:
+
+```json
+{"system": [{"type": "text", "text": "You are a helpful assistant."}]}
+```
+
+The `instructions` string is wrapped: `"instructions text"` → `[{"type": "text", "text": "instructions text"}]`.
+
+Omit `system` parameter entirely if both `instructions` and system input items are empty.
 
 #### Input Items → Messages
 
@@ -179,13 +231,13 @@ Omit `system` parameter if both are empty.
 | `{"type":"message","role":"assistant","content":[...]}` | `{"role":"assistant","content":[...]}` |
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"function_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
-| `{"type":"reasoning","content":[{"type":"summary_text","text":"..."}]}` | `{"role":"assistant","content":[{"type":"thinking","thinking":"..."}]}` |
+| `{"type":"reasoning","content":[{"type":"summary_text","text":"..."}]}` | `{"role":"assistant","content":[{"type":"redacted_thinking"}]}` |
 
 Key details:
 - **ID mapping:** `call_id` ↔ `tool_use.id`. Proxy generates `toolu_` prefixed IDs, maintains bidirectional map
 - **arguments → input:** JSON string → parsed JSON object. Parse failure → reject entire request
 - **namespace restoration:** `function_call` with `namespace` + `name` → Anthropic `tool_use.name` = `mcp__{server}__{tool}`. Look up registry for original namespace and name
-- **tool_result.content:** `function_call_output.output` is a string, but Anthropic `tool_result.content` can be string or content blocks array. Determine content type for mapping
+- **tool_result.content:** `function_call_output.output` (always a string) → Anthropic `tool_result.content` as plain string. Anthropic accepts both string and content blocks array; we always use the string form for simplicity and correctness
 - **Anthropic message alternation:** Ensure user/assistant messages strictly alternate. Consecutive `function_call` items merged into same assistant message content array. Consecutive `function_call_output` items merged into same user message content array
 
 #### User Content Block Mapping
@@ -237,7 +289,10 @@ tool_use → function_call details:
 |---|---|
 | `usage.input_tokens` | `usage.input_tokens` |
 | `usage.output_tokens` | `usage.output_tokens` |
-| `usage.cache_creation_input_tokens` | `usage.input_tokens_details.cached_tokens` |
+| `usage.cache_creation_input_tokens` | `usage.input_tokens_details.cached_tokens` (summed with cache_read) |
+| `usage.cache_read_input_tokens` | `usage.input_tokens_details.cached_tokens` (summed with cache_creation) |
+
+Calculation: `cached_tokens = cache_creation_input_tokens + cache_read_input_tokens`
 
 ### Streaming Conversion (Event-by-Event, Real-Time)
 
@@ -295,6 +350,107 @@ message_stop
 
 Multiple tool_use blocks in one response: each converted to independent `function_call` output item with its own `output_index`.
 
+#### SSE Wire Format Examples
+
+Each SSE event consists of an `event:` line and a `data:` line with JSON payload. Below are representative examples:
+
+**Text streaming (Anthropic → Responses API):**
+```
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","status":"in_progress","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Hello world"}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hello world","annotations":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello world","annotations":[]}]}}
+```
+
+**Thinking streaming:**
+```
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Let me analyze..."}}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","output_index":1,"content_index":0,"delta":"Let me analyze..."}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"ErUB..."}}
+
+(No Responses API event emitted — signature accumulated internally)
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: response.reasoning_text.done
+data: {"type":"response.reasoning_text.done","output_index":1,"content_index":0,"text":"Let me analyze..."}
+```
+
+**Tool use streaming:**
+```
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_01ABC","name":"mcp__svr__tool","input":{}}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_002","call_id":"call_002","name":"tool","namespace":"mcp__svr__","status":"in_progress","arguments":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"key\":"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_002","call_id":"call_002","delta":"{\"key\":"}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","output_index":2,"item_id":"fc_002","call_id":"call_002","arguments":"{\"key\":\"value\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_002","call_id":"call_002","name":"tool","namespace":"mcp__svr__","status":"completed","arguments":"{\"key\":\"value\"}"}}
+```
+
+**Stream end:**
+```
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_xxx","status":"completed","output":[...],"usage":{"input_tokens":100,"output_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}
+```
+
+## Unsupported Responses API Features
+
+The following Responses API features are not supported and handled as follows:
+
+| Feature | Behavior |
+|---|---|
+| `previous_response_id` | Ignored (stripped from request). Codex is stateless and does not use this in practice |
+| `store` | Ignored (stripped from request). No server-side conversation storage |
+| `include` | Ignored (stripped from request). No partial response inclusion support |
+| Built-in tools (`web_search`, `file_search`, `code_interpreter`) | Rejected with 400 error. Only function-type tools (including MCP namespace tools) are supported |
+
 ## MCP Namespace Handling
 
 ### Problem
@@ -324,6 +480,7 @@ Codex sends MCP tools as `{"type": "namespace", "name": "mcp__memory__", "tools"
 Anthropic limits tool names to `^[a-zA-Z0-9_-]{1,64}$`. When flattened names exceed 64 chars:
 - Truncate + append SHA-1 hash suffix (12 hex chars) for uniqueness
 - Register both original and truncated names in registry
+- **Collision detection:** After truncation, check if the resulting name already exists in the registry. If so, extend the hash suffix (up to full SHA-1 hex = 40 chars) until unique. If still colliding (extremely unlikely), reject the request with 400 error (`too_many_namespaced_tools`)
 
 ## Configuration System
 
@@ -347,6 +504,7 @@ All items use `.` separated paths. All have default values. `-c` config file is 
 | `upstream.tls.extra_ca_certs` | string[] | `[]` | Additional CA cert paths to trust |
 | `upstream.tls.use_system_roots` | bool | `true` | Trust system root certificates |
 | `upstream.proxy` | string | `""` | HTTP proxy address (CONNECT), empty = direct |
+| `upstream.anthropic_version` | string | `"2023-06-01"` | Anthropic API version header value |
 
 **Logging:**
 
@@ -534,7 +692,7 @@ Test the Conversion Task state machine as a whole:
 | Completion | Each stop_reason → correct status mapping, usage mapping |
 | Error paths | Anthropic streaming error → correct error + response.failed + [DONE] sequence |
 | Namespace lifecycle | Flatten + build in request phase → lookup + restore in response phase |
-| Edge cases | Empty content, long tool name truncation+hash, unknown tool, consecutive function_call merge, consecutive function_call_output merge |
+| Edge cases | Empty content, long tool name truncation+hash, unknown tool, consecutive function_call merge, consecutive function_call_output merge, built-in tool rejection, private IP rejection |
 | Config system | Three-way injection priority, Option semantics, defaults |
 | URL routing | Protocol normalization, various upstream paths, invalid path rejection |
 
