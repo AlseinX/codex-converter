@@ -643,7 +643,7 @@ tokio = { version = "1.52", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-yaml_serde = "0.1"
+yaml_serde = "0.10"
 clap = { version = "4.6", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
