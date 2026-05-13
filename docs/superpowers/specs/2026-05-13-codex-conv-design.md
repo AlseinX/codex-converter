@@ -81,11 +81,15 @@ In-flight state maintained per request:
 
 #### Thinking/Reasoning Round-Trip
 
-The Anthropic API returns encrypted signatures for thinking blocks that must be preserved:
+The Anthropic API returns encrypted signatures for thinking blocks during streaming. The proxy handles the round-trip as follows:
 
-1. **Streaming response (Anthropic → Responses API):** When a `content_block_delta` with `type: "signature_delta"` arrives, accumulate the encrypted signature bytes in internal state. The `reasoning_text.done` event carries the accumulated reasoning text.
+1. **Streaming response (Anthropic → Responses API):** When a `content_block_delta` with `type: "signature_delta"` arrives, accumulate the encrypted signature bytes in internal state. The `reasoning_text.done` event carries the accumulated reasoning text. Signature data is used only for the current response's delta accumulation — it is **not** persisted across requests.
 
-2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears (from a previous response), it is converted to a `redacted_thinking` content block (type `"redacted_thinking"`) — NOT a plain `thinking` block. The actual thinking text is not sent back; only the opaque marker is sent, which Anthropic uses to verify continuity. This ensures the encrypted signature round-trips correctly without exposing or re-sending the raw thinking content.
+2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears (from a previous response), it is converted to a `redacted_thinking` content block:
+   ```json
+   {"type": "redacted_thinking"}
+   ```
+   This is Anthropic's opaque marker type — it intentionally carries **no data field, no signature, no thinking text**. It simply signals to Anthropic that thinking occurred in a prior turn. This is the correct approach for a stateless proxy: the proxy does not need to store signatures between requests, and `redacted_thinking` does not require them.
 
 ## URL Routing
 
@@ -143,7 +147,7 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | Responses API | Anthropic | Notes |
 |---|---|---|
 | `model` | `model` | Passthrough |
-| `stream` | `stream` | Passthrough |
+| `stream` | `stream` | **Always `true`** — proxy ignores downstream value and forces streaming to enable real-time SSE conversion |
 | `instructions` | `system` | Merged with system items from input |
 | `tools` | `tools` | Namespace flattening + registry |
 | `tool_choice` | `tool_choice` | See mapping table |
@@ -202,9 +206,20 @@ When `parallel_tool_calls: false`, the `disable_parallel_tool_use: true` field i
 {"thinking": {"type": "enabled", "budget_tokens": N}}
 ```
 
-- `effort` → `budget_tokens`: model-aware mapping (reference CLIProxyAPI logic)
+- `effort` → `budget_tokens`: concrete mapping below
 - `generate_summary: "auto"` → `thinking.type: "enabled"`
 - When thinking enabled: Anthropic requires `max_tokens >= budget_tokens`
+
+#### `effort` → `budget_tokens` Mapping
+
+| `reasoning.effort` | `thinking.budget_tokens` | Notes |
+|---|---|---|
+| `"low"` | `1024` | Minimal thinking budget |
+| `"medium"` | `10240` | Balanced thinking budget |
+| `"high"` | `32768` | Extended thinking budget |
+| Unset / absent | Omit `thinking` field entirely | Thinking disabled |
+
+When `budget_tokens` exceeds `max_output_tokens`, clamp `max_tokens` to at least `budget_tokens` (Anthropic requirement).
 
 #### `system` Parameter Construction
 
@@ -293,6 +308,10 @@ tool_use → function_call details:
 | `usage.cache_read_input_tokens` | `usage.input_tokens_details.cached_tokens` (summed with cache_creation) |
 
 Calculation: `cached_tokens = cache_creation_input_tokens + cache_read_input_tokens`
+
+| Responses API field | Source |
+|---|---|
+| `usage.output_tokens_details.reasoning_tokens` | Always `0` — Anthropic has no separate reasoning token count |
 
 ### Streaming Conversion (Event-by-Event, Real-Time)
 
@@ -386,6 +405,15 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"type":"messa
 
 **Thinking streaming:**
 ```
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","status":"in_progress","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}
+
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Let me analyze..."}}
 
@@ -402,6 +430,12 @@ data: {"type":"content_block_stop","index":1}
 
 event: response.reasoning_text.done
 data: {"type":"response.reasoning_text.done","output_index":1,"content_index":0,"text":"Let me analyze..."}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"output_text","text":"Let me analyze..."}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","status":"completed","content":[{"type":"summary_text","text":"Let me analyze..."}]}}
 ```
 
 **Tool use streaming:**
@@ -449,6 +483,10 @@ The following Responses API features are not supported and handled as follows:
 | `previous_response_id` | Ignored (stripped from request). Codex is stateless and does not use this in practice |
 | `store` | Ignored (stripped from request). No server-side conversation storage |
 | `include` | Ignored (stripped from request). No partial response inclusion support |
+| `truncation` | Ignored (stripped from request). No truncation strategy support |
+| `n` | Ignored, forced to `1` (single response only) |
+| `metadata` | Ignored (stripped from request). No metadata passthrough |
+| `service_tier` | Ignored (stripped from request). No tier selection |
 | Built-in tools (`web_search`, `file_search`, `code_interpreter`) | Rejected with 400 error. Only function-type tools (including MCP namespace tools) are supported |
 
 ## MCP Namespace Handling
@@ -478,9 +516,9 @@ Codex sends MCP tools as `{"type": "namespace", "name": "mcp__memory__", "tools"
 ### Tool Name Sanitization
 
 Anthropic limits tool names to `^[a-zA-Z0-9_-]{1,64}$`. When flattened names exceed 64 chars:
-- Truncate + append SHA-1 hash suffix (12 hex chars) for uniqueness
+- Truncate + append hash suffix (12 hex chars) for uniqueness
 - Register both original and truncated names in registry
-- **Collision detection:** After truncation, check if the resulting name already exists in the registry. If so, extend the hash suffix (up to full SHA-1 hex = 40 chars) until unique. If still colliding (extremely unlikely), reject the request with 400 error (`too_many_namespaced_tools`)
+- **Collision detection:** After truncation, check if the resulting name already exists in the registry. If collision detected, hash the name with an incrementing counter (`SHA-1(name + ":" + counter)`) to produce a different hash suffix. Retry up to 8 times. If still colliding, reject the request with 400 error (`too_many_namespaced_tools`)
 
 ## Configuration System
 
