@@ -7,6 +7,19 @@
 
 `codex-conv` is a reverse proxy that converts between OpenAI Responses API (used by Codex CLI) and Anthropic Messages API. It enables using any Anthropic-compatible backend with Codex CLI without modification.
 
+**Sole use case:** The only downstream client is Codex CLI connecting to Anthropic API-compatible models. This proxy is not a general-purpose Responses API-to-Anthropic converter. All design decisions are scoped to what Codex CLI actually sends and receives. Spec changes should be evaluated against Codex CLI behavior, not the full Responses API surface.
+
+**Codex CLI tool types (source: `openai/codex` repository, Rust implementation):**
+- `exec_command` — primary shell execution tool (replaces old Node.js `shell` tool). All shell commands go through this
+- `apply_patch` — a freeform (grammar-based) function tool for editing files. Has its own handler (`ApplyPatchHandler`) with tool name `"apply_patch"`, sent as `ToolKind::Function` with `FreeformTool` format (Lark grammar). Also invokable via `exec_command` (intercepted by `intercept_apply_patch` which emits a warning)
+- MCP tools — sent as namespaced function tools (`mcp__{server}__{tool}`)
+- `update_plan` — plan tracking tool
+- Codex does not use Responses API built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`, etc.)
+
+### Critical Principle: Information Freshness
+
+Codex CLI evolves rapidly (rewritten from Node.js to Rust, tools renamed, new tool types added). External articles and blog posts become outdated quickly — the `shell` tool description in many 2025 articles refers to the old Node.js implementation. **All factual claims about Codex CLI behavior must be verified against the current source code** ([`openai/codex` on GitHub](https://github.com/openai/codex)) or official documentation, not third-party articles. When researching, prefer primary sources and check publication dates.
+
 ### Core Principle: Perfect Forwarding
 
 The proxy must act as a **transparent protocol converter** — only translating between two API formats. It must not:
