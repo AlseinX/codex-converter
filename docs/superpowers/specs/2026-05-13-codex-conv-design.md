@@ -190,8 +190,8 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `tool_choice` | `tool_choice` | See mapping table |
 | `parallel_tool_calls` | `disable_parallel_tool_use` | Semantics inverted |
 | `reasoning.effort` | `thinking` + `output_config.effort` | Direct string forwarding, see mapping section |
-| `temperature` | `temperature` | Passthrough with range clamping: Anthropic range 0–1 vs OpenAI 0–2. Values >1 must be clamped to 1. When thinking enabled, temperature must remain at default 1.0 (or omitted). Codex CLI never sends `temperature`, so this is not a practical concern, but if present with reasoning, proxy must omit it |
-| `top_p` | `top_p` | Passthrough. When thinking enabled, Anthropic restricts to 0.95–1.0 |
+| `temperature` | `temperature` | Passthrough with range clamping: Anthropic range 0–1 vs OpenAI 0–2. Values >1 must be clamped to 1. When thinking enabled, omit from Anthropic request (Anthropic requires default 1.0). **Opus 4.7:** non-default temperature/top_p/top_k are rejected unconditionally (400 error) regardless of thinking state — proxy must omit these parameters for Opus 4.7 (Reference: protocol_research.md #6). Codex CLI never sends `temperature`, so this is not a practical concern |
+| `top_p` | `top_p` | Passthrough. When thinking enabled, clamp to 0.95–1.0 range. **Opus 4.7:** must be omitted entirely (see temperature note) |
 | `max_output_tokens` | `max_tokens` | Field name differs |
 | `metadata` | `metadata` | Forward `user_id`, strip other keys |
 | `service_tier` | `service_tier` | Value mapping, see Unsupported Features section |
@@ -386,16 +386,18 @@ content_block_stop (index=0)
 
 content_block_start (index=1, type=thinking)
   → response.output_item.added (type=reasoning, summary=[])
+  → response.reasoning_summary_part.added          (summary_index, empty part)
 
 content_block_delta (index=1, type=thinking_delta)
-  → response.reasoning_summary_text.delta          (repeated, content_index)
+  → response.reasoning_summary_text.delta          (repeated, summary_index)
   Note: `response.reasoning_text.delta` is NOT emitted — it maps to the `content` field (raw reasoning text from GPT-OSS models), which is not applicable to Anthropic thinking. The proxy only emits `reasoning_summary_text` events.
 
 content_block_delta (index=1, type=signature_delta)
   → Consumed and discarded (no Responses API event)
 
 content_block_stop (index=1)
-  → response.reasoning_summary_text.done           (accumulated text, content_index)
+  → response.reasoning_summary_text.done           (accumulated text, summary_index)
+  → response.reasoning_summary_part.done           (final part with full text, summary_index)
   → response.output_item.done
 
 content_block_start (index=2, type=tool_use)
@@ -435,7 +437,7 @@ Codex CLI treats all IDs as opaque strings with no format validation. Reference:
 
 #### SSE Wire Format Examples
 
-Each SSE event consists of an `event:` line and a `data:` line with JSON payload. Below are representative examples:
+Each SSE event consists of an `event:` line and a `data:` line with JSON payload. Below are representative examples. **Note:** OpenAI streaming events include a `sequence_number` field for ordering. Wire format examples omit this field for clarity, but the implementation must include it in every event.
 
 **Text streaming (Anthropic → Responses API):**
 ```
@@ -475,11 +477,14 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking"
 event: response.output_item.added
 data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[]}}
 
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","output_index":1,"item_id":"rs_001","summary_index":0,"part":{"type":"summary_text","text":""}}
+
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Let me analyze..."}}
 
 event: response.reasoning_summary_text.delta
-data: {"type":"response.reasoning_summary_text.delta","output_index":1,"content_index":0,"delta":"Let me analyze..."}
+data: {"type":"response.reasoning_summary_text.delta","output_index":1,"item_id":"rs_001","summary_index":0,"delta":"Let me analyze..."}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"ErUB..."}}
@@ -490,7 +495,10 @@ event: content_block_stop
 data: {"type":"content_block_stop","index":1}
 
 event: response.reasoning_summary_text.done
-data: {"type":"response.reasoning_summary_text.done","output_index":1,"content_index":0,"text":"Let me analyze..."}
+data: {"type":"response.reasoning_summary_text.done","output_index":1,"item_id":"rs_001","summary_index":0,"text":"Let me analyze..."}
+
+event: response.reasoning_summary_part.done
+data: {"type":"response.reasoning_summary_part.done","output_index":1,"item_id":"rs_001","summary_index":0,"part":{"type":"summary_text","text":"Let me analyze..."}}
 
 event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[{"type":"summary_text","text":"Let me analyze..."}]}}

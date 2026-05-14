@@ -374,3 +374,69 @@ Confirmed. The structure is `{"type": "summary_text", "text": "..."}`. No other 
 
 ### Reference
 - [1] OpenAI Responses streaming events reference — https://developers.openai.com/api/reference/resources/responses/streaming-events/
+
+---
+
+## 18. OpenAI `response.reasoning_summary_part.added` event existence and fields
+
+### Description
+Does the event `response.reasoning_summary_part.added` officially exist in the OpenAI Responses API streaming events spec? What are its fields and when is it emitted? What is its relationship to `response.reasoning_summary_text.delta`?
+
+### Result
+
+**Official existence:** Confirmed. The event is documented in the OpenAI Responses API streaming events reference [1]. It appears alongside `response.reasoning_summary_part.done`.
+
+**Fields:**
+- `type`: always `"response.reasoning_summary_part.added"`
+- `item_id`: string — ID of the reasoning item this summary part belongs to
+- `output_index`: number — index of the output item
+- `part`: object `{ text, type }` where `type` is always `"summary_text"` and `text` is the summary part text
+- `sequence_number`: number — event sequence number
+- `summary_index`: number — index of the summary part within the reasoning summary
+
+**Emission timing:** Emitted when a new reasoning summary part is added. In practice, it is emitted once at the start of a reasoning block (before any text deltas), carrying an empty or initial `part`.
+
+**Relationship to `response.reasoning_summary_text.delta`:**
+- `response.reasoning_summary_part.added` signals the creation of a summary part container.
+- `response.reasoning_summary_text.delta` carries incremental text (`delta: string`) for that part.
+- `response.reasoning_summary_text.done` signals completion of the text, carrying the full `text`.
+- `response.reasoning_summary_part.done` signals the part itself is completed, carrying the final `part` object.
+
+In other words: `part.added` opens the part, `text.delta` streams the content, `text.done` finalizes the text stream, and `part.done` closes the part.
+
+**CLIProxyAPI behavior:** CLIProxyAPI emits `response.reasoning_summary_part.added` when it sees a Claude `content_block_start` with `type: "thinking"`. It sends the event with an empty `part.text` before emitting any `response.reasoning_summary_text.delta` events. On `content_block_stop`, it emits `response.reasoning_summary_text.done` followed by `response.reasoning_summary_part.done` [2].
+
+### Reference
+- [1] OpenAI Responses streaming events reference — https://developers.openai.com/api/reference/resources/responses/streaming-events/
+- [2] CLIProxyAPI source: `internal/translator/claude/openai/responses/claude_openai-responses_response.go` — https://github.com/router-for-me/CLIProxyAPI
+
+---
+
+## 19. Anthropic `service_tier` accepted values
+
+### Description
+What values does the Anthropic Messages API accept for the `service_tier` parameter? The spec maps OpenAI `"default"` → `"standard_only"` and `"auto"` → `"auto"` — are these correct?
+
+### Result
+Confirmed. The Anthropic Messages API accepts exactly two values for `service_tier`: `"auto"` and `"standard_only"`. The spec's mapping of OpenAI `"default"` → Anthropic `"standard_only"` and `"auto"` → `"auto"` is correct [1].
+
+Note: the Anthropic response `usage` object returns a different field (`usage.service_tier`) with values `"standard"`, `"priority"`, or `"batch"` — these describe which tier was actually used, not input parameter values.
+
+### Reference
+- [1] Anthropic Messages API docs — https://docs.anthropic.com/en/api/messages (see `service_tier` parameter)
+
+---
+
+## 20. Codex CLI `update_plan` tool
+
+### Description
+Does the Codex CLI have a tool called `update_plan`? What type is it and when is it sent?
+
+### Result
+Confirmed. `update_plan` is a function-type tool (`ToolKind::Function`) in the current Rust-based Codex CLI. It is always registered in the tool registry. The handler is `PlanHandler` in `codex-rs/core/src/tools/handlers/plan.rs`. The tool spec (in `plan_spec.rs`) defines it as a `ResponsesApiTool` with parameters: `explanation` (optional string) and `plan` (required array of `{step, status}` objects). It is a non-mutating tool (no filesystem or environment changes). It is not allowed in Plan mode [1][2].
+
+From the proxy's perspective, `update_plan` is a regular function-type tool (like `exec_command` and `apply_patch`) — no special handling needed beyond standard function tool conversion.
+
+### Reference
+- [1] Codex CLI source: `codex-rs/core/src/tools/handlers/plan.rs` — https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/plan.rs
+- [2] Codex CLI source: `codex-rs/core/src/tools/handlers/plan_spec.rs` — https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/plan_spec.rs
