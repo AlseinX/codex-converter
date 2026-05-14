@@ -267,7 +267,7 @@ Omit `system` parameter entirely if both `instructions` and system input items a
 | `{"type":"message","role":"assistant","content":[...]}` | `{"role":"assistant","content":[...]}` |
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"function_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
-| `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}]}` | `{"role":"assistant","content":[{"type":"redacted_thinking"}]}` |
+| `{"type":"reasoning","content":[{"type":"output_text","text":"..."}]}` | `{"role":"assistant","content":[{"type":"redacted_thinking"}]}` |
 
 Key details:
 - **ID mapping:** `call_id` ↔ `tool_use.id`. Proxy generates `toolu_` prefixed IDs, maintains bidirectional map
@@ -299,7 +299,7 @@ Flattened namespace tool names may exceed 64 chars (Anthropic limit). Apply Code
 | Anthropic content block | Responses API output item |
 |---|---|
 | `{"type":"text","text":"..."}` | `{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"...","annotations":[]}]}` |
-| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[{"type":"summary_text","text":"..."}]}` |
+| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","content":[{"type":"output_text","text":"..."}]}` |
 | `{"type":"tool_use","id":"toolu_xxx","name":"mcp__svr__tool","input":{...}}` | `{"type":"function_call","id":"fc_xxx","call_id":"call_xxx","name":"tool","namespace":"mcp__svr__","arguments":"{...}"}` |
 
 tool_use → function_call details:
@@ -354,18 +354,16 @@ content_block_stop (index=0)
   → response.output_item.done
 
 content_block_start (index=1, type=thinking)
-  → response.output_item.added (type=reasoning)
-  → response.content_part.added
+  → response.output_item.added (type=reasoning, content=[])
 
 content_block_delta (index=1, type=thinking_delta)
-  → response.reasoning_text.delta                  (repeated)
+  → response.reasoning_text.delta                  (repeated, content_index)
 
 content_block_delta (index=1, type=signature_delta)
-  → Accumulate encrypted signature to internal state (for round-trip in subsequent requests)
+  → Consumed and discarded (no Responses API event)
 
 content_block_stop (index=1)
-  → response.reasoning_text.done                   (accumulated text)
-  → response.content_part.done
+  → response.reasoning_text.done                   (accumulated text, content_index)
   → response.output_item.done
 
 content_block_start (index=2, type=tool_use)
@@ -388,16 +386,18 @@ message_stop
 
 Multiple tool_use blocks in one response: each converted to independent `function_call` output item with its own `output_index`.
 
-#### Response ID Generation
+#### Response ID Handling
 
-Each Responses API response requires an `id` field. The proxy generates IDs by prefixing the Anthropic message ID:
+Response IDs are passed through from Anthropic where possible:
 
-| Output item type | ID format | Source |
+| Output item type | ID source | Format |
 |---|---|---|
-| Response | `resp_{anthropic_message_id}` | Anthropic `message_start.message.id` (strip `msg_` prefix, prepend `resp_`) |
-| Message output | `msg_{anthropic_message_id}` | Same Anthropic message ID |
-| Reasoning output | `rs_{uuid_v4}` | Proxy-generated UUID (no Anthropic equivalent) |
-| Function call output | `fc_{sequential}` | Proxy-generated sequential per-response |
+| Response | Anthropic `message_start.message.id` | Passthrough as-is (e.g., `msg_01XFDUDYJgAACzvnptvVoYEL`) |
+| Message output | Same as response | Passthrough |
+| Reasoning output | Proxy-generated | `rs_{uuid_v4}` |
+| Function call output | Proxy-generated | `fc_{sequential}` |
+
+Codex CLI treats all IDs as opaque strings with no format validation. Reference: CLIProxyAPI passes Anthropic `msg_...` IDs directly.
 
 #### SSE Wire Format Examples
 
@@ -433,16 +433,13 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello world","annotations":[]}]}}
 ```
 
-**Thinking streaming:**
+**Thinking streaming (Anthropic thinking → Responses API raw reasoning text):**
 ```
 event: content_block_start
 data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}
 
 event: response.output_item.added
-data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[]}}
-
-event: response.content_part.added
-data: {"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"summary_text","text":""}}
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_001","content":[]}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Let me analyze..."}}
@@ -461,11 +458,8 @@ data: {"type":"content_block_stop","index":1}
 event: response.reasoning_text.done
 data: {"type":"response.reasoning_text.done","output_index":1,"content_index":0,"text":"Let me analyze..."}
 
-event: response.content_part.done
-data: {"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"summary_text","text":"Let me analyze..."}}
-
 event: response.output_item.done
-data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[{"type":"summary_text","text":"Let me analyze..."}]}}
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_001","content":[{"type":"output_text","text":"Let me analyze..."}]}}
 ```
 
 **Tool use streaming:**
@@ -528,14 +522,14 @@ The following fields are forwarded to Anthropic with value mapping where needed:
 | `metadata.user_id` | `metadata.user_id` | Direct passthrough |
 | `metadata.*` (other keys) | Stripped | Anthropic only supports `user_id` |
 
-**`service_tier`:** Forwarded with value mapping. Both APIs have tier/priority control.
+**`service_tier`:** Forwarded with value mapping where Anthropic has an equivalent. Codex CLI sends `"priority"` or `"flex"`.
 
 | Responses API | Anthropic | Notes |
 |---|---|---|
 | `"auto"` | `"auto"` | Direct match |
 | `"default"` | `"standard_only"` | Anthropic uses different name |
-| `"flex"` | Rejected with 400 error | No Anthropic equivalent — cannot silently downgrade client intent |
-| `"priority"` | Rejected with 400 error | Anthropic priority is per-account, not per-request — cannot silently downgrade client intent |
+| `"flex"` | Omit (no Anthropic equivalent) | Anthropic has no flex tier; request proceeds without tier specification |
+| `"priority"` | Omit (no Anthropic equivalent) | Anthropic priority is per-account, not per-request; request proceeds without tier specification |
 
 ## MCP Namespace Handling
 
