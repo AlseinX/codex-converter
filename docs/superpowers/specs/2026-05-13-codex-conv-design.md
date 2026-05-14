@@ -91,15 +91,21 @@ In-flight state maintained per request:
 
 #### Thinking/Reasoning Round-Trip
 
-The Anthropic API returns encrypted signatures for thinking blocks during streaming. The proxy handles the round-trip as follows:
+The Anthropic API returns encrypted signatures for thinking blocks during streaming. Anthropic requires `redacted_thinking` blocks to include a `data` field with encrypted content when passed back in multi-turn conversations.
 
-1. **Streaming response (Anthropic → Responses API):** `signature_delta` events are consumed and discarded — the proxy does not accumulate or persist signature data. The `reasoning_text.done` event carries the accumulated reasoning text.
+**Architectural constraint:** The proxy is stateless across requests — it cannot persist signatures or encrypted data between requests. This creates a fundamental tension with Anthropic's requirement that thinking/redacted_thinking blocks be preserved intact.
 
-2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears (from a previous response), it is converted to a `redacted_thinking` content block:
+**Solution: Pass through Codex-managed data.** Codex CLI manages the conversation history and sends `reasoning` input items with `encrypted_content` from previous responses. The proxy converts these as follows:
+
+1. **Streaming response (Anthropic → Responses API):** The proxy forwards thinking text as `summary` content in reasoning items. `signature_delta` events are consumed and discarded — the signature is Anthropic-internal and not needed by Codex. Codex does not receive encrypted Anthropic thinking data (it receives plain text in `summary`).
+
+2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears (from a previous response), the proxy converts it to a `thinking` content block with the summary text:
    ```json
-   {"type": "redacted_thinking"}
+   {"type": "thinking", "thinking": "<summary text>", "signature": ""}
    ```
-   This is Anthropic's opaque marker type — it intentionally carries **no data field, no signature, no thinking text**. It simply signals to Anthropic that thinking occurred in a prior turn. This is the correct approach for a stateless proxy: the proxy does not need to store signatures between requests, and `redacted_thinking` does not require them.
+   **Important limitation:** Since the proxy is stateless and does not have the original Anthropic signature, it passes an empty signature. This means Anthropic cannot verify the thinking integrity. For the first turn this works; for subsequent turns where thinking was part of the previous assistant message, Anthropic may reject the request if it requires valid signatures. If this becomes an issue, the proxy would need to either (a) store signatures between requests, or (b) strip thinking blocks entirely from prior turns (accepting degraded multi-turn reasoning).
+
+**Alternative approach (simpler but less accurate):** Strip all `reasoning` input items from the request and do not send any thinking/redacted_thinking blocks to Anthropic. This avoids the signature problem entirely but loses thinking context in multi-turn conversations. Codex typically sends full conversation history including reasoning items, so this may affect model behavior in complex multi-turn tool use scenarios.
 
 ## URL Routing
 
@@ -109,10 +115,13 @@ Codex base URL: `https://my.domain/https/api.anthropic.com`
 
 Codex appends `responses`, sends to: `https://my.domain/https/api.anthropic.com/responses`
 
+Note: the `/v1/` prefix commonly seen in Codex requests (e.g., `/v1/responses`) comes from the user-configured `base_url` in Codex config (typically ending in `/v1`), not from Codex itself. Codex appends only `responses`. The proxy should accept paths ending in `/responses` regardless of prefix.
+
 Protocol normalization (all accepted):
 - `/https/api.anthropic.com/responses`
 - `/https:/api.anthropic.com/responses`
 - `/https://api.anthropic.com/responses`
+- `/v1/https/api.anthropic.com/responses` (if base_url includes `/v1`)
 
 Proxy extracts:
 - Upstream base URL: `https://api.anthropic.com` (no `/v1`, follows Anthropic convention)
@@ -159,12 +168,12 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `model` | `model` | Passthrough |
 | `stream` | `stream` | **Always `true`** — proxy requires streaming from upstream to perform real-time SSE event conversion. Downstream always receives SSE regardless of this value. If downstream sends `stream: false`, proxy still streams upstream and returns the completed response as a single SSE stream |
 | `instructions` | `system` | Merged with system items from input |
-| `tools` | `tools` | Namespace flattening + registry |
+| `tools` | `tools` | Namespace flattening + registry. Field rename: `parameters` → `input_schema` |
 | `tool_choice` | `tool_choice` | See mapping table |
 | `parallel_tool_calls` | `disable_parallel_tool_use` | Semantics inverted |
 | `reasoning.effort` | `thinking` + `output_config.effort` | Direct string forwarding, see mapping section |
-| `temperature` | `temperature` | Passthrough. Note: Anthropic requires `temperature=1` (or omitted) when thinking is enabled. Codex CLI never sends `temperature`, so this is not a practical concern, but if present with reasoning, proxy must omit it |
-| `top_p` | `top_p` | Passthrough |
+| `temperature` | `temperature` | Passthrough with range clamping: Anthropic range 0–1 vs OpenAI 0–2. Values >1 must be clamped to 1. When thinking enabled, temperature must remain at default 1.0 (or omitted). Codex CLI never sends `temperature`, so this is not a practical concern, but if present with reasoning, proxy must omit it |
+| `top_p` | `top_p` | Passthrough. When thinking enabled, Anthropic restricts to 0.95–1.0 |
 | `max_output_tokens` | `max_tokens` | Field name differs |
 | `metadata` | `metadata` | Forward `user_id`, strip other keys |
 | `service_tier` | `service_tier` | Value mapping, see Unsupported Features section |
@@ -233,9 +242,11 @@ Anthropic Claude 4.6+ supports `output_config.effort` — a direct string parame
 | `"low"` | `"low"` | Direct match |
 | `"medium"` | `"medium"` | Direct match |
 | `"high"` | `"high"` | Direct match |
-| `"xhigh"` | `"xhigh"` | Direct match (Opus 4.7+ / gpt-5.5) |
+| `"xhigh"` | `"xhigh"` | Model-gated: only Opus 4.7 on Anthropic, GPT-5.2+ on OpenAI. Unsupported models return 400 |
 | `"none"` | Omit `thinking` and `output_config` | OpenAI defines this as "no reasoning" — disable thinking entirely |
 | `"minimal"` | `"low"` | Protocol-required approximation — Anthropic has no `minimal` level. Codex CLI can send this value (verified in ReasoningEffort enum). `"low"` is the closest available Anthropic level |
+
+**Reverse direction note:** Anthropic supports `"max"` effort (Opus 4.7, Opus 4.6, Sonnet 4.6) which has no OpenAI equivalent. Since this proxy only converts Responses API → Anthropic (not reverse), this is not a concern. If reverse conversion is ever needed, `"max"` → `"high"` would be the closest approximation.
 
 **Why `adaptive` + `effort` instead of `budget_tokens`:**
 - `budget_tokens` is **deprecated** on Claude Opus 4.6/Sonnet 4.6 and **rejected** (400 error) on Opus 4.7
@@ -267,7 +278,7 @@ Omit `system` parameter entirely if both `instructions` and system input items a
 | `{"type":"message","role":"assistant","content":[...]}` | `{"role":"assistant","content":[...]}` |
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"function_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
-| `{"type":"reasoning","content":[{"type":"output_text","text":"..."}]}` | `{"role":"assistant","content":[{"type":"redacted_thinking"}]}` |
+| `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}],"encrypted_content":"..."}` | `{"role":"assistant","content":[{"type":"redacted_thinking","data":"..."}]}` (see Thinking/Reasoning Round-Trip) |
 
 Key details:
 - **ID mapping:** `call_id` ↔ `tool_use.id`. Proxy generates `toolu_` prefixed IDs, maintains bidirectional map
@@ -299,7 +310,7 @@ Flattened namespace tool names may exceed 64 chars (Anthropic limit). Apply Code
 | Anthropic content block | Responses API output item |
 |---|---|
 | `{"type":"text","text":"..."}` | `{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"...","annotations":[]}]}` |
-| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","content":[{"type":"output_text","text":"..."}]}` |
+| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[{"type":"summary_text","text":"..."}]}` |
 | `{"type":"tool_use","id":"toolu_xxx","name":"mcp__svr__tool","input":{...}}` | `{"type":"function_call","id":"fc_xxx","call_id":"call_xxx","name":"tool","namespace":"mcp__svr__","arguments":"{...}"}` |
 
 tool_use → function_call details:
@@ -314,10 +325,11 @@ tool_use → function_call details:
 | Anthropic `stop_reason` | Responses API `status` |
 |---|---|
 | `end_turn` | `"completed"` |
-| `max_tokens` | `"incomplete"`, `incomplete_details.reason: "max_output_tokens"` |
+| `max_tokens` | `"incomplete"`, `incomplete_details.reason: "max_output_tokens"`. Emits `response.incomplete` event (not `response.completed`) |
 | `stop_sequence` | `"completed"` |
 | `tool_use` | `"completed"` (output contains function_call items) |
 | `pause_turn` | `"completed"` |
+| `refusal` | `"completed"` (model declined to generate content) |
 
 #### Usage Mapping
 
@@ -354,16 +366,16 @@ content_block_stop (index=0)
   → response.output_item.done
 
 content_block_start (index=1, type=thinking)
-  → response.output_item.added (type=reasoning, content=[])
+  → response.output_item.added (type=reasoning, summary=[])
 
 content_block_delta (index=1, type=thinking_delta)
-  → response.reasoning_text.delta                  (repeated, content_index)
+  → response.reasoning_summary_text.delta          (repeated, content_index)
 
 content_block_delta (index=1, type=signature_delta)
   → Consumed and discarded (no Responses API event)
 
 content_block_stop (index=1)
-  → response.reasoning_text.done                   (accumulated text, content_index)
+  → response.reasoning_summary_text.done           (accumulated text, content_index)
   → response.output_item.done
 
 content_block_start (index=2, type=tool_use)
@@ -381,7 +393,7 @@ message_delta (stop_reason, usage)
   → Record stop_reason and usage to internal state
 
 message_stop
-  → response.completed                              (with status, usage, output summary)
+  → response.completed OR response.incomplete      (completed for normal end, incomplete for max_tokens)
 ```
 
 Multiple tool_use blocks in one response: each converted to independent `function_call` output item with its own `output_index`.
@@ -433,19 +445,19 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello world","annotations":[]}]}}
 ```
 
-**Thinking streaming (Anthropic thinking → Responses API raw reasoning text):**
+**Thinking streaming (Anthropic thinking → Responses API reasoning summary):**
 ```
 event: content_block_start
 data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}
 
 event: response.output_item.added
-data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_001","content":[]}}
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[]}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Let me analyze..."}}
 
-event: response.reasoning_text.delta
-data: {"type":"response.reasoning_text.delta","output_index":1,"content_index":0,"delta":"Let me analyze..."}
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","output_index":1,"content_index":0,"delta":"Let me analyze..."}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"ErUB..."}}
@@ -455,11 +467,11 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta",
 event: content_block_stop
 data: {"type":"content_block_stop","index":1}
 
-event: response.reasoning_text.done
-data: {"type":"response.reasoning_text.done","output_index":1,"content_index":0,"text":"Let me analyze..."}
+event: response.reasoning_summary_text.done
+data: {"type":"response.reasoning_summary_text.done","output_index":1,"content_index":0,"text":"Let me analyze..."}
 
 event: response.output_item.done
-data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_001","content":[{"type":"output_text","text":"Let me analyze..."}]}}
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_001","summary":[{"type":"summary_text","text":"Let me analyze..."}]}}
 ```
 
 **Tool use streaming:**
@@ -474,19 +486,19 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"key\":"}}
 
 event: response.function_call_arguments.delta
-data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_002","call_id":"call_002","delta":"{\"key\":"}
+data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_002","delta":"{\"key\":"}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":2}
 
 event: response.function_call_arguments.done
-data: {"type":"response.function_call_arguments.done","output_index":2,"item_id":"fc_002","call_id":"call_002","arguments":"{\"key\":\"value\"}"}
+data: {"type":"response.function_call_arguments.done","output_index":2,"item_id":"fc_002","arguments":"{\"key\":\"value\"}"}
 
 event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_002","call_id":"call_002","name":"tool","namespace":"mcp__svr__","status":"completed","arguments":"{\"key\":\"value\"}"}}
 ```
 
-**Stream end:**
+**Stream end (normal completion):**
 ```
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}
@@ -496,6 +508,22 @@ data: {"type":"message_stop"}
 
 event: response.completed
 data: {"type":"response.completed","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","status":"completed","output":[...],"usage":{"input_tokens":100,"output_tokens":15,"input_tokens_details":{"cached_tokens":0}}}}
+
+data: [DONE]
+```
+
+**Stream end (max_tokens — incomplete):**
+```
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":4096}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","status":"incomplete","output":[...],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":4096,"input_tokens_details":{"cached_tokens":0}}}}
+
+data: [DONE]
 ```
 
 ## Unsupported Responses API Features
@@ -509,7 +537,7 @@ The following Responses API features have no Anthropic equivalent and are handle
 | `include` | Ignored (stripped) | Requests encrypted reasoning content. Anthropic returns thinking content inline via `thinking` blocks, not via `include` |
 | `truncation` | Ignored (stripped) | Input context truncation control. Codex never sends this field. Anthropic naturally errors on context overflow (equivalent to `"disabled"` behavior) |
 | `n` | Ignored (forced `1`) | Not in Responses API spec (removed from Chat Completions). Codex never sends it. Anthropic always returns single response |
-| Built-in tools (`web_search`, `file_search`, `code_interpreter`) | Rejected with 400 error | Only function-type tools (including MCP namespace tools) are supported |
+| Built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`) | Rejected with 400 error | Only function-type tools (including MCP namespace tools) are supported |
 
 #### Forwarded Fields (with mapping)
 
@@ -530,6 +558,7 @@ The following fields are forwarded to Anthropic with value mapping where needed:
 | `"default"` | `"standard_only"` | Anthropic uses different name |
 | `"flex"` | Omit (no Anthropic equivalent) | Anthropic has no flex tier; request proceeds without tier specification |
 | `"priority"` | Omit (no Anthropic equivalent) | Anthropic priority is per-account, not per-request; request proceeds without tier specification |
+| `"scale"` | Omit (no Anthropic equivalent) | Anthropic has no scale tier; request proceeds without tier specification |
 
 ## MCP Namespace Handling
 
@@ -696,7 +725,7 @@ Responses API:
 | `permission_error` | `invalid_request_error` | `invalid_api_key` |
 | `not_found_error` | `invalid_request_error` | `model_not_found` |
 | `request_too_large` | `invalid_request_error` | `request_too_large` |
-| `rate_limit_error` | `invalid_request_error` | `rate_limit_exceeded` |
+| `rate_limit_error` | `rate_limit_error` | `rate_limit_exceeded` |
 | `api_error` | `server_error` | `server_error` |
 | `overloaded_error` | `server_error` | `server_error` |
 | Unknown 4XX | `invalid_request_error` | `invalid_request` |
