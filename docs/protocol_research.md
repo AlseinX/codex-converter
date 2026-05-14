@@ -131,7 +131,7 @@ Must temperature and top_p be restricted when thinking is enabled? How should th
 
 ### Result
 
-**Anthropic constraints:** "Thinking isn't compatible with `temperature` or `top_k` modifications." Temperature must be 1.0 or omitted. `top_p` range is 0.95–1.0 when thinking enabled. For Opus 4.7, setting `temperature`/`top_p`/`top_k` to non-default values returns 400 even when thinking is disabled [1].
+**Anthropic constraints:** "Thinking isn't compatible with `temperature` or `top_k` modifications." Temperature must be 1.0 or omitted. `top_p` range is 0.95–1.0 when thinking enabled [1]. For Opus 4.7, setting `temperature`/`top_p`/`top_k` to non-default values returns 400 **unconditionally** (regardless of whether thinking is enabled or disabled) — this is a model-level restriction, not a thinking-mode restriction [6][7].
 
 **OpenAI range:** Temperature 0–2, top_p 0–1. Codex CLI never sends `temperature` [2].
 
@@ -153,6 +153,8 @@ Must temperature and top_p be restricted when thinking is enabled? How should th
 - [3] CLIProxyAPI source: `claude_openai-request.go`, `claude_openai-responses_request.go` — https://github.com/router-for-me/CLIProxyAPI
 - [4] LiteLLM source — https://github.com/BerriAI/litellm
 - [5] codex-bridge source — https://github.com/nicholasyangyang/codex-bridge
+- [6] Anthropic "What's new in Claude Opus 4.7" — https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7 (confirms temperature/top_p/top_k are deprecated unconditionally for Opus 4.7)
+- [7] Anthropic Migration Guide — https://platform.claude.com/docs/en/about-claude/models/migration-guide (confirms sampling parameters removed for Opus 4.7, recommends omitting them entirely)
 
 ---
 

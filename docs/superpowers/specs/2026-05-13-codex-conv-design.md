@@ -328,7 +328,7 @@ Flattened namespace tool names may exceed 64 chars (Anthropic limit). Apply Code
 | Anthropic content block | Responses API output item |
 |---|---|
 | `{"type":"text","text":"..."}` | `{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"...","annotations":[]}]}` |
-| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[{"type":"summary_text","text":"..."}]}` |
+| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[{"type":"summary_text","text":"..."}]}`. The `encrypted_content` field is **omitted** — Anthropic returns plain thinking text with no encrypted payload, so there is nothing to populate. The field is absent from the object, not `null` or empty |
 | `{"type":"tool_use","id":"toolu_xxx","name":"mcp__svr__tool","input":{...}}` | `{"type":"function_call","id":"fc_xxx","call_id":"call_xxx","name":"tool","namespace":"mcp__svr__","arguments":"{...}"}` |
 
 tool_use → function_call details:
@@ -348,6 +348,7 @@ tool_use → function_call details:
 | `tool_use` | `"completed"` (output contains function_call items) |
 | `pause_turn` | `"completed"` |
 | `refusal` | `"completed"` (model declined to generate content) |
+| `model_context_window_exceeded` | `"incomplete"`, `incomplete_details.reason: "max_output_tokens"`. Emits `response.incomplete` event. Available on Sonnet 4.5+ by default; earlier models need beta header |
 
 #### Usage Mapping
 
@@ -388,6 +389,7 @@ content_block_start (index=1, type=thinking)
 
 content_block_delta (index=1, type=thinking_delta)
   → response.reasoning_summary_text.delta          (repeated, content_index)
+  Note: `response.reasoning_text.delta` is NOT emitted — it maps to the `content` field (raw reasoning text from GPT-OSS models), which is not applicable to Anthropic thinking. The proxy only emits `reasoning_summary_text` events.
 
 content_block_delta (index=1, type=signature_delta)
   → Consumed and discarded (no Responses API event)
@@ -412,6 +414,8 @@ message_delta (stop_reason, usage)
 
 message_stop
   → response.completed OR response.incomplete      (completed for normal end, incomplete for max_tokens)
+
+[DONE]                                                  (terminal marker)
 ```
 
 Multiple tool_use blocks in one response: each converted to independent `function_call` output item with its own `output_index`.
