@@ -163,7 +163,7 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `tool_choice` | `tool_choice` | See mapping table |
 | `parallel_tool_calls` | `disable_parallel_tool_use` | Semantics inverted |
 | `reasoning.effort` | `thinking` + `output_config.effort` | Direct string forwarding, see mapping section |
-| `temperature` | `temperature` | Passthrough |
+| `temperature` | `temperature` | Passthrough. Note: Anthropic requires `temperature=1` (or omitted) when thinking is enabled. Codex CLI never sends `temperature`, so this is not a practical concern, but if present with reasoning, proxy must omit it |
 | `top_p` | `top_p` | Passthrough |
 | `max_output_tokens` | `max_tokens` | Field name differs |
 | `metadata` | `metadata` | Forward `user_id`, strip other keys |
@@ -235,7 +235,7 @@ Anthropic Claude 4.6+ supports `output_config.effort` — a direct string parame
 | `"high"` | `"high"` | Direct match |
 | `"xhigh"` | `"xhigh"` | Direct match (Opus 4.7+ / gpt-5.5) |
 | `"none"` | Omit `thinking` and `output_config` | OpenAI defines this as "no reasoning" — disable thinking entirely |
-| `"minimal"` | `"low"` | No Anthropic `minimal`; map to closest value |
+| `"minimal"` | `"low"` | Protocol-required approximation — Anthropic has no `minimal` level. Codex CLI can send this value (verified in ReasoningEffort enum). `"low"` is the closest available Anthropic level |
 
 **Why `adaptive` + `effort` instead of `budget_tokens`:**
 - `budget_tokens` is **deprecated** on Claude Opus 4.6/Sonnet 4.6 and **rejected** (400 error) on Opus 4.7
@@ -325,10 +325,10 @@ tool_use → function_call details:
 |---|---|
 | `usage.input_tokens` | `usage.input_tokens` |
 | `usage.output_tokens` | `usage.output_tokens` |
-| `usage.cache_creation_input_tokens` | `usage.input_tokens_details.cached_tokens` (summed with cache_read) |
-| `usage.cache_read_input_tokens` | `usage.input_tokens_details.cached_tokens` (summed with cache_creation) |
+| `usage.cache_creation_input_tokens` | Included in `usage.input_tokens` (no separate field in Responses API) |
+| `usage.cache_read_input_tokens` | `usage.input_tokens_details.cached_tokens` |
 
-Calculation: `cached_tokens = cache_creation_input_tokens + cache_read_input_tokens`
+`cache_creation_input_tokens` represents cache write cost (future savings), `cache_read_input_tokens` represents cache hits (current savings). Only cache reads map to `cached_tokens` — this matches the semantic meaning of "tokens served from cache." Cache creation tokens are folded into `input_tokens` total. Reference: CLIProxyAPI Chat Completions path uses the same mapping.
 
 Note: `output_tokens_details.reasoning_tokens` is omitted from response — Anthropic has no equivalent field, so we do not fabricate values.
 
@@ -495,7 +495,7 @@ event: message_stop
 data: {"type":"message_stop"}
 
 event: response.completed
-data: {"type":"response.completed","response":{"id":"resp_xxx","status":"completed","output":[...],"usage":{"input_tokens":100,"output_tokens":15,"input_tokens_details":{"cached_tokens":0}}}}
+data: {"type":"response.completed","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","status":"completed","output":[...],"usage":{"input_tokens":100,"output_tokens":15,"input_tokens_details":{"cached_tokens":0}}}}
 ```
 
 ## Unsupported Responses API Features
