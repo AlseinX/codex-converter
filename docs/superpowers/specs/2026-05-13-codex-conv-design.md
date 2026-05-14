@@ -40,7 +40,7 @@ Codex CLI  --[HTTP POST + SSE]-->  codex-conv  --[HTTP POST + SSE]-->  Anthropic
            <--[SSE events]--                   <--[SSE events]--
 ```
 
-- **Stateless across requests:** No session state, no `previous_response_id` handling
+- **Mostly stateless across requests:** No session state, no `previous_response_id` handling. Exception: signature cache (TTL-based, see Thinking/Reasoning Round-Trip) for multi-turn thinking integrity
 - **One-to-one request mapping:** Each Responses API request converts to exactly one Anthropic Messages API request
 - **One task per connection:** Each request handled by a single tokio task
 - **Fully parallel:** No per-session queues needed
@@ -52,6 +52,7 @@ Codex CLI  --[HTTP POST + SSE]-->  codex-conv  --[HTTP POST + SSE]-->  Anthropic
 |---|---|
 | **URL Router** | Parse upstream base URL from request path |
 | **Config Layer** | Three-way config injection (YAML / env vars / CLI flags), all with defaults |
+| **Signature Cache** | TTL-based cache (3h default) for Anthropic thinking signatures, keyed by response ID + content block index. Shared across all conversion tasks |
 | **Conversion Task** | Single-request state machine driving the entire conversion lifecycle |
 | **TLS Layer** | Downstream configurable certs, upstream custom root certs + HTTP proxy |
 | **Logging** | tokio tracing with async appender |
@@ -92,11 +93,15 @@ SSE pipeline (event-by-event):
 Send response.completed
         │
         ▼
-Task ends, all state released
+Write accumulated signatures to signature cache
+        │
+        ▼
+Task ends, all in-flight state released
 ```
 
 In-flight state maintained per request:
 - Delta accumulators (for done events)
+- Signature accumulator: collects `signature_delta` data per thinking content block (for signature cache)
 - Tool call mappings: `content_block_index → (tool_use_id, call_id, name)`
 - ID map: `toolu_xxx` ↔ `call_xxx` bidirectional
 - Namespace registry: `flat_name → (namespace, tool_name)`
@@ -104,21 +109,21 @@ In-flight state maintained per request:
 
 #### Thinking/Reasoning Round-Trip
 
-The Anthropic API returns encrypted signatures for thinking blocks during streaming. Anthropic requires `redacted_thinking` blocks to include a `data` field with encrypted content when passed back in multi-turn conversations.
+(Reference: protocol_research.md entry #2 — comparative analysis of CLIProxyAPI, LiteLLM, token_proxy, aio-coding-hub, codex-bridge, llm-rosetta)
 
-**Architectural constraint:** The proxy is stateless across requests — it cannot persist signatures or encrypted data between requests. This creates a fundamental tension with Anthropic's requirement that thinking/redacted_thinking blocks be preserved intact.
+**The problem:** Anthropic returns encrypted signatures (`signature_delta`) and `redacted_thinking` blocks with opaque `data`. These must be passed back unchanged in multi-turn. The proxy is stateless across requests, creating a fundamental tension.
 
-**Solution: Pass through Codex-managed data.** Codex CLI manages the conversation history and sends `reasoning` input items with `encrypted_content` from previous responses. The proxy converts these as follows:
+**Solution: Signature cache + encrypted_content passthrough + rectifier fallback.** Three-layer approach:
 
-1. **Streaming response (Anthropic → Responses API):** The proxy forwards thinking text as `summary` content in reasoning items. `signature_delta` events are consumed and discarded — the signature is Anthropic-internal and not needed by Codex. Codex does not receive encrypted Anthropic thinking data (it receives plain text in `summary`).
+1. **Streaming response (Anthropic → Responses API):** Forward thinking text as `summary` content in reasoning items. Accumulate `signature_delta` data during streaming and store in a signature cache (keyed by response ID + content block index, TTL 3 hours). Discard signatures from the SSE stream — Codex does not receive encrypted Anthropic thinking data (it receives plain text in `summary`).
 
-2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears (from a previous response), the proxy converts it to a `thinking` content block with the summary text:
-   ```json
-   {"type": "thinking", "thinking": "<summary text>", "signature": ""}
-   ```
-   **Important limitation:** Since the proxy is stateless and does not have the original Anthropic signature, it passes an empty signature. This means Anthropic cannot verify the thinking integrity. For the first turn this works; for subsequent turns where thinking was part of the previous assistant message, Anthropic may reject the request if it requires valid signatures. If this becomes an issue, the proxy would need to either (a) store signatures between requests, or (b) strip thinking blocks entirely from prior turns (accepting degraded multi-turn reasoning).
+2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears, the conversion depends on available data:
+   - **If `encrypted_content` is present:** Convert to `{"type": "redacted_thinking", "data": "<encrypted_content>"}` — pass through the opaque data as-is. This preserves Anthropic's encrypted content intact.
+   - **If only `summary` text (no `encrypted_content`):** Look up signature cache. If cached signature exists, convert to `{"type": "thinking", "thinking": "<summary text>", "signature": "<cached signature>"}`. If no cached signature, use empty signature: `{"type": "thinking", "thinking": "<summary text>", "signature": ""}`.
 
-**Alternative approach (simpler but less accurate):** Strip all `reasoning` input items from the request and do not send any thinking/redacted_thinking blocks to Anthropic. This avoids the signature problem entirely but loses thinking context in multi-turn conversations. Codex typically sends full conversation history including reasoning items, so this may affect model behavior in complex multi-turn tool use scenarios.
+3. **Rectifier fallback:** If Anthropic returns 400 due to invalid signatures, strip all thinking/redacted_thinking blocks from the request and retry. This loses multi-turn thinking context but ensures the request succeeds.
+
+**Why this approach:** No existing implementation fully solves the stateless multi-turn problem. CLIProxyAPI silently drops reasoning input; token_proxy fabricates signatures; aio-coding-hub strips on error. This three-layer approach maximizes compatibility: preserves thinking when encrypted content or cached signatures are available, and falls back gracefully when neither exists.
 
 ## URL Routing
 
@@ -291,7 +296,7 @@ Omit `system` parameter entirely if both `instructions` and system input items a
 | `{"type":"message","role":"assistant","content":[...]}` | `{"role":"assistant","content":[...]}` |
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"function_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
-| `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}],"encrypted_content":"..."}` | `{"role":"assistant","content":[{"type":"redacted_thinking","data":"..."}]}` (see Thinking/Reasoning Round-Trip) |
+| `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}],"encrypted_content":"..."}` | `{"role":"assistant","content":[{"type":"redacted_thinking","data":"<encrypted_content>"}`]}` if `encrypted_content` present; otherwise `{"role":"assistant","content":[{"type":"thinking","thinking":"<summary>","signature":"<cached or empty>"}]}` (see Thinking/Reasoning Round-Trip) |
 
 Key details:
 - **ID mapping:** `call_id` ↔ `tool_use.id`. Proxy generates `toolu_` prefixed IDs, maintains bidirectional map
@@ -890,7 +895,8 @@ codex-conv/
 │   │   ├── id_map.rs        # ID mapping: call_id ↔ toolu_id bidirectional
 │   │   ├── content.rs       # Content block type mapping (text/image/thinking/tool_use)
 │   │   ├── error.rs         # Error conversion: Anthropic error → Responses API error
-│   │   └── thinking.rs      # Thinking/reasoning conversion + signature accumulation
+│   │   ├── thinking.rs      # Thinking/reasoning conversion + signature accumulation
+│   │   └── signature_cache.rs # TTL-based signature cache for multi-turn thinking
 │   ├── sse/
 │   │   ├── mod.rs           # SSE read/write: bidirectional streaming
 │   │   ├── anthropic.rs     # Anthropic SSE event parsing
