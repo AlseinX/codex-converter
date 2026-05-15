@@ -440,3 +440,244 @@ From the proxy's perspective, `update_plan` is a regular function-type tool (lik
 ### Reference
 - [1] Codex CLI source: `codex-rs/core/src/tools/handlers/plan.rs` — https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/plan.rs
 - [2] Codex CLI source: `codex-rs/core/src/tools/handlers/plan_spec.rs` — https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/plan_spec.rs
+
+---
+
+## 21. Complete field inventory: directly mappable fields
+
+### Description
+Which fields have a clear semantic mapping between the OpenAI Responses API and the Anthropic Messages API? This entry provides a comprehensive inventory of all fields that the proxy can convert between the two protocols, grouped by direction and transform complexity.
+
+### Result
+
+#### A. Request Direction: Responses API → Anthropic Messages API
+
+##### A1. Top-level parameters with direct mapping
+
+| Responses API field | Anthropic field | Transform | Source |
+|---|---|---|---|
+| `model` | `model` | Passthrough (string) | OpenAI [1], Anthropic [2] |
+| `max_output_tokens` | `max_tokens` | Field rename (integer) | OpenAI [1], Anthropic [2] |
+| `temperature` | `temperature` | Range clamping: OpenAI 0–2 → Anthropic 0–1. Values >1 clamped to 1. When thinking enabled or Opus 4.7: omit | OpenAI [1], Anthropic [2], entry #6 |
+| `top_p` | `top_p` | Passthrough. When thinking enabled: clamp to 0.95–1.0. Opus 4.7: omit | OpenAI [1], Anthropic [2], entry #6 |
+| `stream` | `stream` | Always forced `true` (proxy architecture requires upstream streaming) | OpenAI [1], Anthropic [3] |
+| `metadata.user_id` | `metadata.user_id` | Direct passthrough (string, max 256 chars on Anthropic) | OpenAI [1], Anthropic [2] |
+| `service_tier` | `service_tier` | Value mapping: `"auto"` → `"auto"`, `"default"` → `"standard_only"`, `"flex"`/`"priority"`/`"scale"` → omit | OpenAI [1], Anthropic [2], entry #19 |
+| `instructions` | `system` | String → wrapped as `[{type: "text", text: "..."}]` array | OpenAI [1], Anthropic [2] |
+
+##### A2. Parameters with structural transform
+
+| Responses API field | Anthropic field | Transform | Source |
+|---|---|---|---|
+| `reasoning.effort` | `thinking.type` + `output_config.effort` | Set `thinking.type: "adaptive"`, forward effort string directly. `"none"` → omit both. `"minimal"` → `"low"` | OpenAI [1], Anthropic [2], entries #3/#4/#5 |
+| `tool_choice` | `tool_choice` | `"auto"` → `{type:"auto"}`, `"required"` → `{type:"any"}`, `"none"` → `{type:"none"}`, `{type:"function",name}` → `{type:"tool",name}` | OpenAI [1], Anthropic [2] |
+| `parallel_tool_calls` | `tool_choice.disable_parallel_tool_use` | Semantics inverted. Embedded inside `tool_choice` object, not top-level | OpenAI [1], Anthropic [2] |
+| `tools` (function) | `tools` | `parameters` → `input_schema`. Namespace tools flattened: `mcp__{server}__{tool}` | OpenAI [1], Anthropic [2] |
+
+##### A3. Input item type mapping
+
+| Responses API input item | Anthropic message | Transform | Source |
+|---|---|---|---|
+| `{type:"message", role:"user"}` | `{role:"user", content:[...]}` | Content block mapping (see A4) | OpenAI [1], Anthropic [2] |
+| `{type:"message", role:"assistant"}` | `{role:"assistant", content:[...]}` | Content block mapping | OpenAI [1], Anthropic [2] |
+| `{type:"message", role:"system"}` | Top-level `system` parameter | Extracted from input, merged with `instructions` | OpenAI [1], Anthropic [2] |
+| `{type:"function_call", call_id, name, arguments}` | `{role:"assistant", content:[{type:"tool_use", id, name, input}]}` | `call_id` → `toolu_` prefixed id. `arguments` (JSON string) → `input` (JSON object). Namespace restoration | OpenAI [1], Anthropic [2] |
+| `{type:"function_call_output", call_id, output}` | `{role:"user", content:[{type:"tool_result", tool_use_id, content}]}` | `call_id` → mapped `toolu_` id. `output` (string) → `content` (string) | OpenAI [1], Anthropic [2] |
+| `{type:"reasoning", encrypted_content, summary}` | `{role:"assistant", content:[{type:"redacted_thinking", data}]}` | If `encrypted_content` present | OpenAI [1], Anthropic [2], entry #2 |
+| `{type:"reasoning", summary}` (no encrypted_content) | `{role:"assistant", content:[{type:"thinking", thinking, signature}]}` | Signature from cache or empty string | OpenAI [1], Anthropic [2], entry #2 |
+
+##### A4. User content block mapping
+
+| Responses API content block | Anthropic content block | Source |
+|---|---|---|
+| `{type:"input_text", text}` | `{type:"text", text}` | OpenAI [1], Anthropic [2] |
+| `{type:"input_image", image_url:"https://..."}` | `{type:"image", source:{type:"url", url:"..."}}` | OpenAI [1], Anthropic [2] |
+| `{type:"input_image", image_url:{url:"data:image/png;base64,..."}}` | `{type:"image", source:{type:"base64", media_type:"image/png", data:"..."}}` | OpenAI [1], Anthropic [2] |
+
+##### A5. Cache control passthrough
+
+Anthropic natively supports `cache_control` on content blocks, system blocks, and tool definitions [2]. Codex may send `cache_control: {type: "ephemeral"}` — preserve as-is on corresponding Anthropic content blocks. LiteLLM also preserves cache_control markers [4].
+
+#### B. Response Direction: Anthropic Messages API → Responses API
+
+##### B1. Top-level response fields
+
+| Anthropic field | Responses API field | Transform | Source |
+|---|---|---|---|
+| `id` | `id` | Passthrough (e.g., `msg_01XFDUDYJgAACzvnptvVoYEL`) | Anthropic [2], OpenAI [5] |
+| (generated) | `object` | Hardcoded `"response"` | OpenAI [5] |
+| (generated) | `created_at` | Proxy-generated Unix timestamp | OpenAI [5] |
+| (generated) | `completed_at` | Proxy-generated Unix timestamp (when completed) | OpenAI [5] |
+| `stop_reason` | `status` | See B3 | Anthropic [2], OpenAI [5] |
+| `stop_reason` + `usage` | `incomplete_details` | `max_tokens`/`model_context_window_exceeded` → `{reason:"max_output_tokens"}` | Anthropic [2], OpenAI [5], entry #7 |
+
+##### B2. Content block → output item mapping
+
+| Anthropic content block | Responses API output item | Source |
+|---|---|---|
+| `{type:"text", text}` | `{type:"message", role:"assistant", content:[{type:"output_text", text, annotations:[]}]}` | Anthropic [2], OpenAI [5] |
+| `{type:"thinking", thinking}` | `{type:"reasoning", id:"rs_xxx", summary:[{type:"summary_text", text}]}`. `encrypted_content` omitted | Anthropic [2], OpenAI [5], entries #9/#17 |
+| `{type:"tool_use", id, name, input}` | `{type:"function_call", id:"fc_xxx", call_id:"call_xxx", name, namespace, arguments}`. `input` (object) → `arguments` (JSON string) | Anthropic [2], OpenAI [5] |
+
+##### B3. Stop reason → status mapping
+
+| Anthropic `stop_reason` | Responses API `status` | Terminal event | Source |
+|---|---|---|---|
+| `end_turn` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5], entry #7 |
+| `stop_sequence` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
+| `tool_use` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
+| `pause_turn` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
+| `refusal` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
+| `max_tokens` | `"incomplete"` | `response.incomplete` | Anthropic [6], OpenAI [5], entry #7 |
+| `model_context_window_exceeded` | `"incomplete"` | `response.incomplete` | Anthropic [6], OpenAI [5], entry #7 |
+
+##### B4. Usage mapping
+
+| Anthropic field | Responses API field | Transform | Source |
+|---|---|---|---|
+| `usage.input_tokens` | `usage.input_tokens` | Passthrough | Anthropic [2], OpenAI [5] |
+| `usage.output_tokens` | `usage.output_tokens` | Passthrough | Anthropic [2], OpenAI [5] |
+| `usage.cache_read_input_tokens` | `usage.input_tokens_details.cached_tokens` | Field rename | Anthropic [2], OpenAI [5] |
+| `usage.cache_creation_input_tokens` | (folded into `input_tokens`) | No separate field in Responses API | Anthropic [2], OpenAI [5] |
+| (computed) | `usage.total_tokens` | `input_tokens + output_tokens` | OpenAI [5] |
+
+##### B5. Streaming event mapping
+
+Full event-by-event mapping documented in spec Streaming Conversion section. Key events:
+
+| Anthropic SSE event | Responses API SSE event | Source |
+|---|---|---|
+| `message_start` | `response.created` + `response.in_progress` | Anthropic [3], OpenAI [7], entry #1 |
+| `content_block_start` (text) | `response.output_item.added` + `response.content_part.added` | Anthropic [3], OpenAI [7] |
+| `content_block_delta` (text_delta) | `response.output_text.delta` | Anthropic [3], OpenAI [7] |
+| `content_block_stop` (text) | `response.output_text.done` + `response.content_part.done` + `response.output_item.done` | Anthropic [3], OpenAI [7] |
+| `content_block_start` (thinking) | `response.output_item.added` + `response.reasoning_summary_part.added` | Anthropic [3], OpenAI [7], entry #18 |
+| `content_block_delta` (thinking_delta) | `response.reasoning_summary_text.delta` | Anthropic [3], OpenAI [7], entries #10/#18 |
+| `content_block_delta` (signature_delta) | (consumed, no event) | Anthropic [3], entry #1 |
+| `content_block_stop` (thinking) | `response.reasoning_summary_text.done` + `response.reasoning_summary_part.done` + `response.output_item.done` | Anthropic [3], OpenAI [7], entry #18 |
+| `content_block_start` (tool_use) | `response.output_item.added` | Anthropic [3], OpenAI [7] |
+| `content_block_delta` (input_json_delta) | `response.function_call_arguments.delta` | Anthropic [3], OpenAI [7], entry #12 |
+| `content_block_stop` (tool_use) | `response.function_call_arguments.done` + `response.output_item.done` | Anthropic [3], OpenAI [7] |
+| `message_delta` (stop_reason, usage) | Internal state recorded | Anthropic [3], OpenAI [7] |
+| `message_stop` | `response.completed` or `response.incomplete` + `[DONE]` | Anthropic [3], OpenAI [7], entry #11 |
+| `error` (streaming) | `error` + `response.failed` + `[DONE]` | Anthropic [2], OpenAI [7] |
+
+##### B6. Error mapping
+
+| Anthropic `error.type` | Responses API `error.type` | `error.code` | Source |
+|---|---|---|---|
+| `invalid_request_error` | `invalid_request_error` | `invalid_request` | Anthropic [2], OpenAI [5] |
+| `authentication_error` | `invalid_request_error` | `invalid_api_key` | Anthropic [2], OpenAI [5] |
+| `permission_error` | `invalid_request_error` | `invalid_api_key` | Anthropic [2], OpenAI [5] |
+| `not_found_error` | `invalid_request_error` | `model_not_found` | Anthropic [2], OpenAI [5] |
+| `request_too_large` | `invalid_request_error` | `request_too_large` | Anthropic [2], OpenAI [5] |
+| `rate_limit_error` | `rate_limit_error` | `rate_limit_exceeded` | Anthropic [2], OpenAI [5], entry #8 |
+| `api_error` | `server_error` | `server_error` | Anthropic [2], OpenAI [5] |
+| `overloaded_error` | `server_error` | `server_error` | Anthropic [2], OpenAI [5] |
+
+### Reference
+- [1] OpenAI Responses API — https://developers.openai.com/api/reference/responses/overview/
+- [2] Anthropic Messages API — https://docs.anthropic.com/en/api/messages
+- [3] Anthropic Streaming Messages — https://platform.claude.com/docs/en/build-with-claude/streaming
+- [4] LiteLLM source — https://github.com/BerriAI/litellm (cache_control passthrough)
+- [5] OpenAI Responses API response fields — https://developers.openai.com/api/reference/responses/overview/ (response object)
+- [6] Anthropic Handling Stop Reasons — https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+- [7] OpenAI Responses streaming events — https://developers.openai.com/api/reference/resources/responses/streaming-events/
+
+---
+
+## 22. Complete field inventory: unmappable/dropped fields
+
+### Description
+Which fields from each API have NO meaningful equivalent on the other side and must be dropped, ignored, or fabricated? This entry documents every field that cannot be mapped, with the verified rationale for why no mapping exists.
+
+### Result
+
+#### A. Responses API Request Fields with No Anthropic Equivalent (Dropped)
+
+| Responses API field | Behavior | Rationale | Source |
+|---|---|---|---|
+| `previous_response_id` | Ignored (stripped) | OpenAI uses server-side conversation state to chain requests. Anthropic API is stateless — every request must include full conversation history. Codex always sends full `input` array, so this field is always `None` in HTTP requests | OpenAI [1], Anthropic [2] |
+| `store` | Ignored (stripped) | OpenAI server-side response storage for later retrieval. Anthropic has no server-side storage. Codex doesn't rely on stored responses (it resends full history) | OpenAI [1] |
+| `include` | Ignored (stripped) | OpenAI parameter requesting encrypted reasoning content in the response (e.g., `["reasoning.encrypted_content"]`). Anthropic returns thinking content inline via `thinking` blocks, not through a separate include mechanism. The proxy discards Anthropic signatures and does not generate OpenAI-encrypted content | OpenAI [1], Anthropic [2] |
+| `truncation` | Ignored (stripped) | OpenAI input context truncation strategy (`"auto"`, `"disabled"`, `"last"`). Anthropic naturally errors on context overflow (equivalent to `"disabled"` behavior). Codex never sends this field | OpenAI [1], Anthropic [2] |
+| `n` | Forced to `1` | Number of response choices. Removed from Responses API spec (was in Chat Completions). Codex never sends it. Anthropic always returns a single response | OpenAI [1] |
+| `metadata.*` (non-`user_id` keys) | Stripped | Anthropic `metadata` only supports `user_id` (string, max 256 chars). OpenAI `metadata` accepts arbitrary key-value pairs. Only `user_id` is forwarded | OpenAI [1], Anthropic [2] |
+| `service_tier` (`"flex"`, `"priority"`, `"scale"`) | Omitted from Anthropic request | These OpenAI service tiers have no Anthropic equivalent. `"auto"` and `"default"` map to Anthropic `"auto"` and `"standard_only"`. The three unmappable tiers are silently dropped | OpenAI [1], Anthropic [2], entry #19 |
+| `text` (format configuration) | Ignored (stripped) | OpenAI structured output configuration (`{format: {type: "json_schema", schema: ...}}`). Anthropic uses `output_config.format` for the same purpose but with a different schema structure. Codex never sends `text.format` | OpenAI [1], Anthropic [2] |
+| `user` | Ignored (stripped) | OpenAI end-user identifier. While Anthropic has `metadata.user_id`, the `user` field from OpenAI is a different mechanism. If `metadata.user_id` is present, that takes precedence. Codex does not send `user` | OpenAI [1] |
+| Built-in tool types (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`) | Rejected with 400 | These are Responses API built-in tool types (not function-type). Anthropic has no equivalent for web search/file search/code interpreter as built-in tools. Codex never sends these (uses only function-type tools) | OpenAI [1], entry #14 |
+| Input `reasoning.content` field | Not forwarded | OpenAI reasoning items can carry a `content` field (array of `{type: "reasoning_text", text}` for raw reasoning text from GPT-OSS models). Anthropic has no raw reasoning text concept — only `thinking` (summary) and `redacted_thinking`. The proxy maps `summary` only | OpenAI [1], entry #9 |
+
+#### B. Responses API Request Fields Requiring Special Handling (Not Directly Dropped, Not Directly Mapped)
+
+| Responses API field | Behavior | Notes | Source |
+|---|---|---|---|
+| `reasoning.encrypted_content` | Conditional conversion | If present on input reasoning item → `redacted_thinking.data`. This is the round-trip path for Anthropic encrypted content. See entry #2 | OpenAI [1], Anthropic [2], entry #2 |
+| `reasoning.summary` | Conditional conversion | If no `encrypted_content` → `thinking` block with cached or empty signature. See entry #2 | OpenAI [1], Anthropic [2], entry #2 |
+| `reasoning` (overall structure) | Structural conversion | OpenAI `{effort, summary}` → Anthropic `thinking.type` + `output_config.effort`. Different nesting structure | OpenAI [1], Anthropic [2], entries #3/#4/#5 |
+
+#### C. Anthropic Response Fields with No Responses API Equivalent (Dropped)
+
+| Anthropic field | Behavior | Rationale | Source |
+|---|---|---|---|
+| `type` (always `"message"`) | Dropped | Responses API uses `object: "response"` with different top-level structure. No semantic mapping | Anthropic [2], OpenAI [5] |
+| `role` (always `"assistant"`) | Dropped | Implied by the output item type in Responses API. No separate field | Anthropic [2], OpenAI [5] |
+| `model` (in response) | Dropped | Could map to Responses API `model` field but Codex already knows the model. Not forwarded to reduce response size | Anthropic [2], OpenAI [5] |
+| `stop_sequence` | Dropped | Anthropic returns which custom stop sequence matched (if any). Responses API has no equivalent field. The `stop_sequences` feature is not used in the proxy context | Anthropic [2], OpenAI [5] |
+| `usage.cache_creation_input_tokens` | Folded into `input_tokens` | Anthropic reports cache write cost. Responses API has no separate field. Folded into `input_tokens` total. Only cache reads map to `cached_tokens` — matches semantic meaning of "tokens served from cache" | Anthropic [2], OpenAI [5] |
+| `usage.cache_creation` (breakdown) | Dropped | Anthropic returns cache creation breakdown by TTL (`ephemeral_5m_input_tokens`, `ephemeral_1h_input_tokens`). Responses API has no cache breakdown fields | Anthropic [2] |
+| `usage.server_tool_use` | Dropped | Anthropic reports server tool use counts (e.g., `web_search_requests`). Proxy doesn't support server tools | Anthropic [2] |
+| `usage.service_tier` | Dropped | Anthropic reports which tier was actually used (`"standard"`, `"priority"`, `"batch"`). Responses API has no matching response field | Anthropic [2] |
+| `content[].signature` (thinking blocks) | Consumed and cached, not forwarded | Anthropic thinking signatures are encrypted internal data. They are accumulated during streaming and stored in the signature cache for multi-turn round-trip. They are never sent to Codex CLI | Anthropic [2], [3], entry #1 |
+| `content[].cache_control` | Dropped | Internal Anthropic caching hint. Not meaningful to forward to Codex CLI | Anthropic [2] |
+| `content[].citations` (text blocks) | Dropped | Anthropic text citation feature. Responses API uses different annotation types (`file_citation`, `url_citation`). Codex doesn't use Anthropic citations | Anthropic [2], OpenAI [5] |
+| `content[].caller` (tool_use blocks) | Dropped | Anthropic tool caller information (`direct`, `code_execution_*`). Not applicable in proxy context | Anthropic [2] |
+| `container` (top-level) | Dropped | Anthropic container lifecycle management. Proxy doesn't support container tools | Anthropic [2] |
+
+#### D. Anthropic Request Fields Never Received (Codex Does Not Send)
+
+These Anthropic request fields exist in the API but Codex CLI never generates them, so the proxy never needs to convert them:
+
+| Anthropic field | Why Codex doesn't send it | Source |
+|---|---|---|
+| `top_k` | Codex never sends `top_k`. OpenAI Responses API has no equivalent | Anthropic [2] |
+| `stop_sequences` | Codex never sends custom stop sequences | Anthropic [2] |
+| `thinking.display` | Anthropic controls how thinking appears (`"summarized"`, `"omitted"`). Codex sends `reasoning.effort`, not `display` | Anthropic [2] |
+| `thinking.budget_tokens` | Deprecated (rejected on Opus 4.7). Codex uses `reasoning.effort` → `output_config.effort` instead | Anthropic [2], entry #3 |
+| `container` | Container lifecycle management. Codex doesn't use Anthropic containers | Anthropic [2] |
+| `inference_geo` | Geographic inference routing. Codex doesn't send this | Anthropic [2] |
+| `mcp_servers` | Anthropic native MCP support (proxy handles MCP at the Codex level via namespace flattening) | Anthropic [2] |
+| `output_config.format` | Anthropic structured output. Codex doesn't request structured output format | Anthropic [2] |
+| `tools[].cache_control` | Anthropic cache breakpoint on tool definitions. Codex may send `cache_control` on content, but not specifically on tool definitions | Anthropic [2] |
+| `tools[].type` | Anthropic `custom` tool type. Proxy always generates `custom` type | Anthropic [2] |
+| `tools[].allowed_callers` | Anthropic tool access control. Not applicable in proxy context | Anthropic [2] |
+| `tools[].defer_loading` | Anthropic deferred tool loading. Not applicable in proxy context | Anthropic [2] |
+| `tools[].eager_input_streaming` | Anthropic streaming control for tool input. Not applicable | Anthropic [2] |
+| `tools[].input_examples` | Anthropic tool input examples. Codex sends tool descriptions, not input examples | Anthropic [2] |
+| `tools[].strict` | Anthropic strict tool validation. Codex tool specs don't include `strict` | Anthropic [2] |
+| Content block types: `image`, `document`, `search_result`, `web_search_tool_result`, etc. | Codex only sends `input_text` and `input_image` user content. Anthropic-only content block types are never generated by the conversion | Anthropic [2] |
+
+#### E. Responses API Response Fields the Proxy Must Fabricate
+
+These Responses API response fields have no Anthropic source — the proxy must generate them:
+
+| Responses API field | Source | Rationale |
+|---|---|---|
+| `object` | Hardcoded `"response"` | Required by Responses API response structure. Anthropic uses `type: "message"` |
+| `created_at` | Proxy-generated timestamp | Anthropic doesn't return creation time in the message object |
+| `completed_at` | Proxy-generated timestamp | Anthropic doesn't return completion time |
+| `usage.total_tokens` | Computed: `input_tokens + output_tokens` | Responses API expects total; Anthropic doesn't provide it |
+| `output[].id` (reasoning) | Proxy-generated `rs_{uuid_v4}` | Anthropic thinking blocks have no ID; Responses API requires one per output item |
+| `output[].id` (function_call) | Proxy-generated `fc_{sequential}` | Anthropic `tool_use` has `id` (`toolu_xxx`) but Responses API needs separate `id` and `call_id` |
+| `output[].call_id` (function_call) | Proxy-generated `call_{sequential}` | Anthropic uses `toolu_xxx` as tool use ID; Responses API uses separate `call_id` for matching |
+| `output[].annotations` (output_text) | Hardcoded `[]` | Anthropic text has no annotations; Codex expects the field (possibly optional) |
+| `output[].status` | Derived from `stop_reason` or `"in_progress"` during streaming | Responses API items have status; Anthropic content blocks don't |
+
+### Reference
+- [1] OpenAI Responses API — https://developers.openai.com/api/reference/responses/overview/
+- [2] Anthropic Messages API — https://docs.anthropic.com/en/api/messages
+- [3] Anthropic Streaming Messages — https://platform.claude.com/docs/en/build-with-claude/streaming
+- [4] LiteLLM source — https://github.com/BerriAI/litellm
+- [5] OpenAI Responses streaming events — https://developers.openai.com/api/reference/resources/responses/streaming-events/
+- [6] Anthropic Handling Stop Reasons — https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
