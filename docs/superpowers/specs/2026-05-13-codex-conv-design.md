@@ -52,7 +52,7 @@ Codex CLI  --[HTTP POST + SSE]-->  codex-conv  --[HTTP POST + SSE]-->  Anthropic
 |---|---|
 | **URL Router** | Parse upstream base URL from request path |
 | **Config Layer** | Three-way config injection (YAML / env vars / CLI flags), all with defaults |
-| **Signature Cache** | TTL-based cache (3h default) for Anthropic thinking signatures, keyed by response ID + content block index. Shared across all conversion tasks |
+| **Signature Cache** | TTL-based cache (3h default) for Anthropic thinking signatures, keyed by proxy-generated reasoning item ID (`rs_xxx`). Shared across all conversion tasks |
 | **Conversion Task** | Single-request state machine driving the entire conversion lifecycle |
 | **TLS Layer** | Downstream configurable certs, upstream custom root certs + HTTP proxy |
 | **Logging** | tokio tracing with async appender |
@@ -115,7 +115,7 @@ In-flight state maintained per request:
 
 **Solution: Signature cache + encrypted_content passthrough + rectifier fallback.** Three-layer approach:
 
-1. **Streaming response (Anthropic → Responses API):** Forward thinking text as `summary` content in reasoning items. Accumulate `signature_delta` data during streaming and store in a signature cache (keyed by response ID + content block index, TTL 3 hours). Discard signatures from the SSE stream — Codex does not receive encrypted Anthropic thinking data (it receives plain text in `summary`).
+1. **Streaming response (Anthropic → Responses API):** Forward thinking text as `summary` content in reasoning items. Accumulate `signature_delta` data during streaming and store in a signature cache (keyed by the proxy-generated reasoning item ID `rs_xxx`, TTL 3 hours). Discard signatures from the SSE stream — Codex does not receive encrypted Anthropic thinking data (it receives plain text in `summary`).
 
 2. **Subsequent request (Responses API → Anthropic):** When a `reasoning` input item appears, the conversion depends on available data:
    - **If `encrypted_content` is present:** Convert to `{"type": "redacted_thinking", "data": "<encrypted_content>"}` — pass through the opaque data as-is. This preserves Anthropic's encrypted content intact.
@@ -190,8 +190,8 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `tool_choice` | `tool_choice` | See mapping table |
 | `parallel_tool_calls` | `disable_parallel_tool_use` | Semantics inverted |
 | `reasoning.effort` | `thinking` + `output_config.effort` | Direct string forwarding, see mapping section |
-| `temperature` | `temperature` | Passthrough with range clamping: Anthropic range 0–1 vs OpenAI 0–2. Values >1 must be clamped to 1. When thinking enabled, omit from Anthropic request (Anthropic requires default 1.0). **Opus 4.7:** non-default temperature/top_p/top_k are rejected unconditionally (400 error) regardless of thinking state — proxy must omit these parameters for Opus 4.7 (Reference: protocol_research.md #6). Codex CLI never sends `temperature`, so this is not a practical concern |
-| `top_p` | `top_p` | Passthrough. When thinking enabled, clamp to 0.95–1.0 range. **Opus 4.7:** must be omitted entirely (see temperature note) |
+| `temperature` | `temperature` | Passthrough with range clamping: Anthropic range 0–1 vs OpenAI 0–2. Values >1 must be clamped to 1. When thinking enabled, omit from Anthropic request (Anthropic requires default 1.0). Codex CLI never sends `temperature` (verified: `ResponsesApiRequest` struct in `codex-rs/codex-api/src/common.rs` has no temperature field), so this is not a practical concern |
+| `top_p` | `top_p` | Passthrough. When thinking enabled, clamp to 0.95–1.0 range. Codex CLI never sends `top_p` (same source as temperature) |
 | `max_output_tokens` | `max_tokens` | Field name differs |
 | `metadata` | `metadata` | Forward `user_id`, strip other keys |
 | `service_tier` | `service_tier` | Value mapping, see Unsupported Features section |
@@ -303,7 +303,10 @@ Key details:
 - **arguments → input:** JSON string → parsed JSON object. Parse failure → reject entire request
 - **namespace restoration:** `function_call` with `namespace` + `name` → Anthropic `tool_use.name` = `mcp__{server}__{tool}`. Look up registry for original namespace and name
 - **tool_result.content:** `function_call_output.output` (always a string) → Anthropic `tool_result.content` as plain string. Anthropic accepts both string and content blocks array; we always use the string form for simplicity and correctness
-- **Anthropic message alternation:** Ensure user/assistant messages strictly alternate. Consecutive `function_call` items merged into same assistant message content array. Consecutive `function_call_output` items merged into same user message content array
+- **Anthropic message alternation:** Ensure user/assistant messages strictly alternate. Consecutive same-role input items are merged:
+  - Consecutive `reasoning` + `function_call` items → merged into same assistant message content array as `[thinking/redacted_thinking, tool_use]` blocks (preserving order). This is the common pattern: Codex sends a reasoning item followed by a function_call from the same model turn
+  - Consecutive `function_call` items → merged into same assistant message content array as multiple `tool_use` blocks
+  - Consecutive `function_call_output` items → merged into same user message content array as multiple `tool_result` blocks
 
 #### User Content Block Mapping
 
@@ -328,7 +331,8 @@ Flattened namespace tool names may exceed 64 chars (Anthropic limit). Apply Code
 | Anthropic content block | Responses API output item |
 |---|---|
 | `{"type":"text","text":"..."}` | `{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"...","annotations":[]}]}` |
-| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[{"type":"summary_text","text":"..."}]}`. The `encrypted_content` field is **omitted** — Anthropic returns plain thinking text with no encrypted payload, so there is nothing to populate. The field is absent from the object, not `null` or empty |
+| `{"type":"thinking","thinking":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[{"type":"summary_text","text":"..."}]}`. The `encrypted_content` and `content` fields are **omitted** — Anthropic returns plain thinking text with no encrypted payload, so there is nothing to populate. The fields are absent from the object, not `null` or empty |
+| `{"type":"redacted_thinking","data":"..."}` | `{"type":"reasoning","id":"rs_xxx","summary":[],"encrypted_content":"<data>"}`. Anthropic returns `redacted_thinking` when its safety system redacts portions of thinking content. This can occur with any thinking mode (including `adaptive`) — it is server-initiated, not client-controlled. The opaque `data` maps to `encrypted_content` for round-trip preservation. No `summary` text is available. The proxy must cache the `data` alongside the `rs_xxx` ID so it can reconstruct `redacted_thinking` if this reasoning item appears in a subsequent input |
 | `{"type":"tool_use","id":"toolu_xxx","name":"mcp__svr__tool","input":{...}}` | `{"type":"function_call","id":"fc_xxx","call_id":"call_xxx","name":"tool","namespace":"mcp__svr__","arguments":"{...}"}` |
 
 tool_use → function_call details:
@@ -398,6 +402,13 @@ content_block_delta (index=1, type=signature_delta)
 content_block_stop (index=1)
   → response.reasoning_summary_text.done           (accumulated text, summary_index)
   → response.reasoning_summary_part.done           (final part with full text, summary_index)
+  → response.output_item.done
+
+content_block_start (index=N, type=redacted_thinking)
+  → response.output_item.added (type=reasoning, summary=[], encrypted_content=<data>)
+  → Cache the data field alongside the rs_xxx ID for round-trip
+
+content_block_stop (index=N, type=redacted_thinking)
   → response.output_item.done
 
 content_block_start (index=2, type=tool_use)
