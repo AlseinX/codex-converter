@@ -14,7 +14,7 @@
 - `apply_patch` — a freeform (grammar-based) function tool for editing files. Has its own handler (`ApplyPatchHandler`) with tool name `"apply_patch"`, sent as `ToolKind::Function` with `FreeformTool` format (Lark grammar). Also invokable via `exec_command` (intercepted by `intercept_apply_patch` which emits a warning)
 - MCP tools — sent as namespaced function tools (`mcp__{server}__{tool}`)
 - `update_plan` — plan tracking tool
-- Codex does not use Responses API built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`, etc.)
+- Codex does not use Responses API built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`, etc.) in its default configuration. If the client sends built-in tools, the proxy converts them to Anthropic custom tools with derived `input_schema` (see Built-in Tool Conversion section)
 
 ### Critical Principle: Information Freshness
 
@@ -30,6 +30,10 @@ The proxy must act as a **transparent protocol converter** — only translating 
 - **Invent behavior:** Never add custom logic beyond what either API defines (no custom threshold tables, no synthetic mappings, no heuristic decisions)
 
 When a field exists in both APIs, forward it directly. When a field exists in only one API, document it with a verified explanation. When in doubt, forward.
+
+### Non-Goal: Security
+
+Security is explicitly a **non-goal** of this proxy. The design prioritizes **maximum compatibility, usability, and connectivity** between Codex CLI and Anthropic API. The proxy assumes a trusted deployment environment (localhost or private network) and does not implement SSRF protection, input sanitization, rate limiting, or any security hardening. Such concerns are outside the scope of protocol conversion and should be handled by infrastructure layers (firewalls, reverse proxies, etc.) if needed.
 
 ## Architecture
 
@@ -145,21 +149,6 @@ Proxy extracts:
 - Upstream base URL: `https://api.anthropic.com` (no `/v1`, follows Anthropic convention)
 - Upstream endpoint: `/v1/messages` (proxy appends, not configurable)
 
-### Hostname Validation (SSRF Protection)
-
-The extracted upstream hostname is validated to prevent SSRF attacks. The following are rejected with HTTP 400:
-
-- Private IPv4 ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`
-- Loopback IPv6: `::1`
-- Hostname `localhost`
-- Literal IP addresses in any of the above ranges
-
-Validation occurs after URL parsing but before connecting upstream. Optionally bypassed via `server.allowed_upstreams` config (for internal testing):
-
-| Path | Type | Default | Description |
-|---|---|---|---|
-| `server.allowed_upstreams` | string[] | `[]` | Hostnames exempt from SSRF validation |
-
 ### Key/Model Passthrough
 
 - **API Key Extraction:** From downstream `Authorization` header. Strip `Bearer ` prefix if present; use raw value if no prefix. Return HTTP 401 if header is missing or empty
@@ -237,21 +226,36 @@ When `parallel_tool_calls: false`, the `disable_parallel_tool_use: true` field i
 
 Anthropic Claude 4.6+ supports `output_config.effort` — a direct string parameter analogous to OpenAI's `reasoning.effort`. The proxy forwards effort values directly without custom integer conversion.
 
-**When `reasoning` is present (effort specified):**
+**When `reasoning` is present:**
 
 ```json
 // Responses API
-{"reasoning": {"effort": "high"}}
+{"reasoning": {"effort": "high", "summary": "auto"}}
 ```
 
 ```json
 // Anthropic
-{"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
+{"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}
 ```
 
 - `reasoning.effort` → `output_config.effort`: direct string forwarding
 - When reasoning present: set `thinking.type: "adaptive"` (Anthropic's modern thinking mode)
-- `reasoning.effort` absent or `null` → omit both `thinking` and `output_config` (Anthropic defaults)
+- `thinking.display` is set based on `reasoning.summary` (see mapping table below)
+- `reasoning` absent or `reasoning.effort: "none"` → omit both `thinking` and `output_config` (Anthropic defaults)
+
+**`thinking.display` mapping (based on `reasoning.summary`):**
+
+On Opus 4.7+, `thinking.display` defaults to `"omitted"` — no thinking text returned. The proxy must explicitly set `display: "summarized"` when the client wants reasoning text.
+
+| Responses API `reasoning.summary` | Anthropic `thinking.display` | Notes |
+|---|---|---|
+| absent / `null` | `"summarized"` | Default to showing thinking when reasoning enabled |
+| `"auto"` | `"summarized"` | Direct match — default behavior |
+| `"concise"` | `"summarized"` | Anthropic has no granularity control, closest match |
+| `"detailed"` | `"summarized"` | Same — no Anthropic granularity |
+| `"none"` | `"omitted"` | Client explicitly opts out of reasoning summaries |
+
+When `display: "omitted"`, Anthropic returns only `signature_delta` events (no `thinking_delta`). The proxy still emits a reasoning output item with empty `summary: []` — the signature needs caching for multi-turn integrity, and Codex uses reasoning item IDs to reference thinking in subsequent turns. No streaming logic change needed beyond the request-side change.
 
 **Value mapping:**
 
@@ -297,16 +301,28 @@ Omit `system` parameter entirely if both `instructions` and system input items a
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"function_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
 | `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}],"encrypted_content":"..."}` | `{"role":"assistant","content":[{"type":"redacted_thinking","data":"<encrypted_content>"}`]}` if `encrypted_content` present; otherwise `{"role":"assistant","content":[{"type":"thinking","thinking":"<summary>","signature":"<cached or empty>"}]}` (see Thinking/Reasoning Round-Trip) |
+| `{"type":"custom_tool_call","call_id":"...","name":"x","input":"{...}"}` | Same mapping as `function_call`: `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
+| `{"type":"custom_tool_call_output","call_id":"...","output":"..."}` | Same mapping as `function_call_output`: `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
+| `{"type":"compaction","encrypted_content":"..."}` | Dropped — opaque OpenAI context management data, no Anthropic equivalent |
+| `{"type":"context_compaction","encrypted_content":"..."}` | Dropped — same as `compaction` |
+| `{"type":"compaction_trigger"}` | Dropped — same as `compaction` |
+| Built-in tool history items (`web_search_call`, `file_search_call`, `code_interpreter_call`, `computer_call`, `computer_call_output`, `image_generation_call`, `shell_call`, `shell_call_output`, `local_shell_call`, `apply_patch_call`, `apply_patch_call_output`, `mcp_call`, `tool_search_call`) | See Built-in Tool Conversion → Input Direction section for per-type mapping |
 
 Key details:
 - **ID mapping:** `call_id` ↔ `tool_use.id`. Proxy generates `toolu_` prefixed IDs, maintains bidirectional map
 - **arguments → input:** JSON string → parsed JSON object. Parse failure → reject entire request
 - **namespace restoration:** `function_call` with `namespace` + `name` → Anthropic `tool_use.name` = `mcp__{server}__{tool}`. Look up registry for original namespace and name
-- **tool_result.content:** `function_call_output.output` (always a string) → Anthropic `tool_result.content` as plain string. Anthropic accepts both string and content blocks array; we always use the string form for simplicity and correctness
+- **tool_result.content:** `function_call_output.output` can be either a plain string or an array of content items:
+  - If string → Anthropic `tool_result.content` as plain string (current default)
+  - If array of content items → Anthropic `tool_result.content` as array of Anthropic content blocks, using the same content block mapping as User Content Block Mapping (e.g., `{type: "input_text", text: "..."}` → `{type: "text", text: "..."}`, `{type: "input_image", image_url: "..."}` → `{type: "image", source: {type: "url", url: "..."}}`)
+- **`success` → `is_error`:** Codex's `function_call_output` has a `success` field (Codex extension, not standard Responses API). Map to Anthropic's `tool_result.is_error`: `success: false` → `is_error: true`; `success: true` or absent → omit `is_error` (default is no error)
 - **Anthropic message alternation:** Ensure user/assistant messages strictly alternate. Consecutive same-role input items are merged:
   - Consecutive `reasoning` + `function_call` items → merged into same assistant message content array as `[thinking/redacted_thinking, tool_use]` blocks (preserving order). This is the common pattern: Codex sends a reasoning item followed by a function_call from the same model turn
   - Consecutive `function_call` items → merged into same assistant message content array as multiple `tool_use` blocks
   - Consecutive `function_call_output` items → merged into same user message content array as multiple `tool_result` blocks
+  - Consecutive `custom_tool_call` items → merged same as `function_call`
+  - Consecutive `custom_tool_call_output` items → merged same as `function_call_output`
+- **`phase` stripping:** Message items may carry `phase: "commentary"` or `phase: "final_answer"`. Strip on input (Anthropic has no equivalent). Do not generate on output (Anthropic provides no signal).
 
 #### User Content Block Mapping
 
@@ -365,11 +381,25 @@ tool_use → function_call details:
 
 `cache_creation_input_tokens` represents cache write cost (future savings), `cache_read_input_tokens` represents cache hits (current savings). Only cache reads map to `cached_tokens` — this matches the semantic meaning of "tokens served from cache." Cache creation tokens are folded into `input_tokens` total. Reference: CLIProxyAPI Chat Completions path uses the same mapping.
 
+Additional Anthropic usage fields with no Responses API equivalent (dropped):
+- `usage.cache_creation` (breakdown by TTL) — no Responses API cache breakdown fields
+- `usage.server_tool_use` — proxy doesn't support server tools
+- `usage.service_tier` — informational, no Responses API equivalent
+- `usage.speed` — Anthropic fast mode indicator, no Responses API equivalent
+
 Note: `output_tokens_details.reasoning_tokens` is omitted from response — Anthropic has no equivalent field, so we do not fabricate values.
 
 ### Streaming Conversion (Event-by-Event, Real-Time)
 
 Event sequence (Anthropic → Responses API):
+
+**Consumed events (no Responses API output):**
+
+| Anthropic SSE event | Behavior |
+|---|---|
+| `ping` | Consumed silently, no event emitted. Anthropic sends these periodically during streaming to keep connections alive |
+
+**Forwarded events:**
 
 ```
 message_start
@@ -578,7 +608,10 @@ The following Responses API features have no Anthropic equivalent and are handle
 | `include` | Ignored (stripped) | Requests encrypted reasoning content. Anthropic returns thinking content inline via `thinking` blocks, not via `include` |
 | `truncation` | Ignored (stripped) | Input context truncation control. Codex never sends this field. Anthropic naturally errors on context overflow (equivalent to `"disabled"` behavior) |
 | `n` | Ignored (forced `1`) | Not in Responses API spec (removed from Chat Completions). Codex never sends it. Anthropic always returns single response |
-| Built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`) | Rejected with 400 error | Only function-type tools (including MCP namespace tools) are supported |
+| Built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`, `local_shell`, `shell`, `apply_patch`, `mcp`, `tool_search`) | Converted to Anthropic custom tools with derived `input_schema` | See Built-in Tool Conversion section. All tools are the client's tools — the proxy converts format only |
+| `text.verbosity` | Ignored (stripped) | OpenAI output verbosity control (`"low"/"medium"/"high"`). Anthropic has no equivalent parameter |
+| `client_metadata` | Ignored (stripped) | OpenAI telemetry field containing installation ID and W3C trace context. Anthropic has no equivalent |
+| `prompt_cache_key` | Ignored (stripped) | OpenAI server-side response caching key (set to thread ID). Anthropic has no server-side storage |
 
 #### Forwarded Fields (with mapping)
 
@@ -600,6 +633,241 @@ The following fields are forwarded to Anthropic with value mapping where needed:
 | `"flex"` | Omit (no Anthropic equivalent) | Anthropic has no flex tier; request proceeds without tier specification |
 | `"priority"` | Omit (no Anthropic equivalent) | Anthropic priority is per-account, not per-request; request proceeds without tier specification |
 | `"scale"` | Omit (no Anthropic equivalent) | Anthropic has no scale tier; request proceeds without tier specification |
+
+## Built-in Tool Conversion
+
+### Principle
+
+ALL tools in the request are the client's tools — the proxy does not need Anthropic equivalents. The conversion is purely format-based: translate the tool definition so the model can generate a `tool_use`, then convert the `tool_use` back to the appropriate Responses API output item on response.
+
+Both OpenAI built-in tools and Anthropic native tools are **schema-less** — they have no `input_schema`/`parameters` field. The proxy must provide explicit schemas when converting to Anthropic custom tools so the model knows what parameters to generate.
+
+**Consistency requirement:** The schema the model sees during registration determines the shape of `tool_use.input` the model generates. The response-direction conversion must be consistent with this schema — the model's output must be directly mappable to the target Responses API output item without field renaming or restructuring. Therefore, the schema must mirror the exact nested structure of the corresponding output item's call parameters.
+
+### Request Direction: Built-in Tool Definition → Anthropic Custom Tool
+
+Each OpenAI built-in tool type in the `tools` array is converted to an Anthropic custom tool:
+
+| Responses API tool type | Anthropic tool | Notes |
+|---|---|---|
+| `{"type": "web_search", ...}` | `{"type": "custom", "name": "web_search", "input_schema": {...}}` | Schema mirrors `web_search_call.action` |
+| `{"type": "file_search", ...}` | `{"type": "custom", "name": "file_search", "input_schema": {...}}` | Schema mirrors `file_search_call.queries` |
+| `{"type": "code_interpreter", ...}` | `{"type": "custom", "name": "code_interpreter", "input_schema": {...}}` | Schema mirrors `code_interpreter_call` call fields |
+| `{"type": "computer_use_preview", ...}` | `{"type": "custom", "name": "computer_use", "input_schema": {...}}` | Schema mirrors `computer_call.action` |
+| `{"type": "image_generation", ...}` | `{"type": "custom", "name": "image_generation", "input_schema": {...}}` | Schema for prompt |
+| `{"type": "local_shell", ...}` | `{"type": "custom", "name": "local_shell", "input_schema": {...}}` | Schema mirrors `local_shell_call.action` |
+| `{"type": "shell", ...}` | `{"type": "custom", "name": "shell", "input_schema": {...}}` | Schema mirrors `shell_call.action` |
+| `{"type": "apply_patch", ...}` | `{"type": "custom", "name": "apply_patch", "input_schema": {...}}` | Schema mirrors `apply_patch_call.operation` |
+| `{"type": "mcp", ...}` | **Dropped** (cannot convert) | Server-side hosted tool — OpenAI connects to MCP server and executes calls. A format-only proxy cannot replicate this. Codex does not use this type (uses `{"type": "namespace"}` instead, see MCP Namespace Handling) |
+| `{"type": "tool_search", ...}` | `{"type": "custom", "name": "tool_search", "input_schema": {...}}` | Schema mirrors `tool_search_call.arguments` |
+
+**Tool config passthrough:** Built-in tools may carry configuration fields (e.g., `web_search.user_location`, `web_search.search_context_size`, `file_search.vector_store_ids`, `computer_use_preview.display_width`, `image_generation.input_image_mask`). These configuration fields have no Anthropic equivalent and are **dropped** during request conversion. They control server-side behavior on OpenAI's infrastructure that is not applicable when proxying to Anthropic. The custom tool schema only captures the parameters the model needs to generate in a tool call.
+
+### Derived `input_schema` Definitions
+
+Each schema mirrors the exact nested structure of its corresponding output item's call parameters [34]. This ensures the model's `tool_use.input` matches the schema exactly, and `function_call.arguments` preserves the complete structure via JSON serialization.
+
+**`web_search`** — schema mirrors `web_search_call.action`:
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": {"type": "string", "enum": ["search", "open_page", "find_in_page"], "description": "Action type"},
+    "query": {"type": "string", "description": "Search query (deprecated, use queries)"},
+    "queries": {"type": "array", "items": {"type": "string"}, "description": "Search queries (for type=search)"},
+    "sources": {"type": "array", "items": {"type": "object", "properties": {"type": {"type": "string"}, "url": {"type": "string"}}}, "description": "Source URLs (for type=search)"},
+    "url": {"type": "string", "description": "URL (for open_page/find_in_page)"},
+    "pattern": {"type": "string", "description": "Search pattern (for find_in_page)"}
+  },
+  "required": ["type"]
+}
+```
+
+Model generates: `{"type": "search", "queries": ["..."]}` → serialized as `function_call.arguments`.
+
+**`file_search`** — schema mirrors `file_search_call` call fields:
+```json
+{
+  "type": "object",
+  "properties": {
+    "queries": {"type": "array", "items": {"type": "string"}, "description": "Search queries"}
+  },
+  "required": ["queries"]
+}
+```
+
+Model generates: `{"queries": ["..."]}` → serialized as `function_call.arguments`.
+
+**`code_interpreter`** — schema mirrors `code_interpreter_call` call fields:
+```json
+{
+  "type": "object",
+  "properties": {
+    "code": {"type": "string", "description": "Code to execute"},
+    "container_id": {"type": "string", "description": "Container ID to run code in"}
+  },
+  "required": ["code"]
+}
+```
+
+Model generates: `{"code": "...", "container_id": "..."}` → serialized as `function_call.arguments`.
+
+**`computer_use`** — schema mirrors `computer_call.action`:
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": {"type": "string", "enum": ["screenshot", "click", "double_click", "drag", "keypress", "move", "scroll", "type", "wait"]},
+    "button": {"type": "string", "enum": ["left", "right", "wheel", "back", "forward"], "description": "Mouse button (click)"},
+    "x": {"type": "integer", "description": "X coordinate"},
+    "y": {"type": "integer", "description": "Y coordinate"},
+    "text": {"type": "string", "description": "Text to type (type)"},
+    "keys": {"type": "array", "items": {"type": "string"}, "description": "Keys (click, double_click, drag, keypress, move, scroll)"},
+    "path": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}}, "description": "Drag path (drag)"},
+    "scroll_x": {"type": "integer", "description": "Horizontal scroll (scroll)"},
+    "scroll_y": {"type": "integer", "description": "Vertical scroll (scroll)"}
+  },
+  "required": ["type"]
+}
+```
+
+Model generates: `{"type": "click", "button": "left", "x": 405, "y": 157}` → serialized as `function_call.arguments`.
+
+**`image_generation`** — schema for image prompt:
+```json
+{
+  "type": "object",
+  "properties": {
+    "prompt": {"type": "string", "description": "Image generation prompt"}
+  },
+  "required": ["prompt"]
+}
+```
+
+Model generates: `{"prompt": "..."}` → serialized as `function_call.arguments`. Note: `image_generation_call` does not have a `prompt` field — it has `result` (base64 output). The prompt field is an input-only parameter. Since all built-in tools return as `function_call`, this is not a problem — the prompt is preserved in `arguments`.
+
+**`local_shell`** — schema mirrors `local_shell_call.action`:
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": {"type": "string", "enum": ["exec"]},
+    "command": {"type": "array", "items": {"type": "string"}, "description": "Command and arguments"},
+    "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables"},
+    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds"},
+    "user": {"type": "string", "description": "User to run as"},
+    "working_directory": {"type": "string", "description": "Working directory"}
+  },
+  "required": ["type", "command"]
+}
+```
+
+Model generates: `{"type": "exec", "command": ["ls", "-l"], "env": {}}` → serialized as `function_call.arguments`.
+
+**`shell`** — schema mirrors `shell_call.action`:
+```json
+{
+  "type": "object",
+  "properties": {
+    "commands": {"type": "array", "items": {"type": "string"}, "description": "Commands to execute"},
+    "timeout_ms": {"type": "integer"},
+    "max_output_length": {"type": "integer"}
+  },
+  "required": ["commands"]
+}
+```
+
+Model generates: `{"commands": ["ls -l"]}` → serialized as `function_call.arguments`.
+
+**`apply_patch`** — schema mirrors `apply_patch_call.operation`:
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": {"type": "string", "enum": ["create_file", "update_file", "delete_file"]},
+    "path": {"type": "string", "description": "File path"},
+    "diff": {"type": "string", "description": "V4A diff content (not needed for delete_file)"}
+  },
+  "required": ["type", "path"]
+}
+```
+
+Model generates: `{"type": "update_file", "path": "lib/fib.py", "diff": "..."}` → serialized as `function_call.arguments`.
+
+**`tool_search`** — schema mirrors `tool_search_call.arguments`:
+```json
+{
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string", "description": "Description of the desired tool capability"}
+  },
+  "required": ["goal"]
+}
+```
+
+Model generates: `{"goal": "..."}` → serialized as `function_call.arguments`.
+
+### Response Direction: Anthropic `tool_use` → Responses API Output Item
+
+All built-in tool calls use the **same `function_call` mapping** as regular function tools. The model's `tool_use.input` (which matches the registered schema) is serialized as `function_call.arguments` — a JSON string that preserves the complete nested structure without loss.
+
+```
+Anthropic tool_use:  {"type":"tool_use","id":"toolu_xxx","name":"web_search","input":{"type":"search","queries":["..."]}}
+                                            ↓
+Responses API:       {"type":"function_call","id":"fc_xxx","call_id":"call_xxx","name":"web_search","arguments":"{\"type\":\"search\",\"queries\":[\"...\"]}"}
+```
+
+**Why not native built-in output types (e.g., `web_search_call`):** The registered schema determines `tool_use.input`. For round-trip consistency, the client must send back exactly what it received. If the proxy returned `web_search_call` with `action: {...}`, the client would need to send `web_search_call` back, but the `web_search_call` format mixes model input (`action`) with execution metadata (`status`, `id`). On subsequent turns, the proxy would need to extract `action` from `web_search_call` and reconstruct `tool_use.input`. This reconstruction is fragile — for `image_generation_call`, it's impossible (the output item has `result` but no `prompt` field). Returning `function_call` for all tools guarantees: schema ↔ `tool_use.input` ↔ `function_call.arguments` ↔ `tool_use.input` consistency with zero reconstruction logic.
+
+**Tool name passthrough:** `tool_use.name` (e.g., `"web_search"`) becomes `function_call.name`. The client knows which built-in tool it registered and can dispatch accordingly. Tool names are NOT looked up in the namespace registry — built-in tools have no namespace.
+
+### Input Direction: Built-in Tool History Items
+
+Built-in tool history items can appear in the `input` array from two sources:
+
+1. **Proxy-generated history (round-trip):** The proxy always returns `function_call` + `function_call_output` for built-in tools. On subsequent turns, the client sends these back, and the standard `function_call` / `function_call_output` mapping handles them. No special logic needed.
+
+2. **Imported OpenAI API history:** History from actual OpenAI API calls uses native built-in output types (`web_search_call`, `computer_call`, etc.). These items must be converted to Anthropic messages using the per-type mappings below.
+
+The proxy must handle both sources in the input array.
+
+#### Native Built-in Type → Anthropic Message Mappings
+
+These mappings apply only to imported OpenAI API history items. Each mapping extracts the model-relevant call parameters and places them as `tool_use.input`, matching the registered schema [34]:
+
+| Responses API input item | Anthropic message |
+|---|---|
+| `{"type":"web_search_call","id":"ws_...","status":"completed","action":{...}}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ws_...","name":"web_search","input":<action>}]}` |
+| `{"type":"file_search_call","id":"fs_...","status":"completed","queries":[...],"results":[...]}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_fs_...","name":"file_search","input":{"queries":<queries>}}]}` followed by `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fs_...","content":"<results as JSON string>"}]}` |
+| `{"type":"code_interpreter_call","id":"ci_...","code":"...","container_id":"...","outputs":[...]}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ci_...","name":"code_interpreter","input":{"code":"...","container_id":"..."}}]}` followed by `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ci_...","content":"<outputs as JSON string>"}]}` |
+| `{"type":"computer_call","id":"comp_...","action":{...}}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_comp_...","name":"computer_use","input":<action>}]}` |
+| `{"type":"computer_call_output","call_id":"...","output":{...}}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_comp_...","content":"<output as JSON string>"}]}` |
+| `{"type":"image_generation_call","id":"ig_...","result":"base64...","revised_prompt":"..."}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ig_...","name":"image_generation","input":{"prompt":<revised_prompt>}}]}` followed by `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ig_...","content":"<result>"}]}` |
+| `{"type":"shell_call","id":"sh_...","action":{...}}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_sh_...","name":"shell","input":<action>}]}` |
+| `{"type":"shell_call_output","call_id":"...","output":[...]}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sh_...","content":"<output as JSON string>"}]}` |
+| `{"type":"local_shell_call","id":"lsh_...","action":{...}}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_lsh_...","name":"local_shell","input":<action>}]}` |
+| `{"type":"apply_patch_call","id":"apc_...","operation":{...}}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_apc_...","name":"apply_patch","input":<operation>}]}` |
+| `{"type":"apply_patch_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_apc_...","content":"..."}]}` |
+| `{"type":"mcp_list_tools","id":"mcp_lt_...","server_label":"...","tools":[...]}` | Dropped — infrastructure metadata, not a model-generated call |
+| `{"type":"mcp_call","id":"mcp_c_...","name":"...","server_label":"...","arguments":"...","output":"..."}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mcp_c_...","name":"mcp__<server_label>__<name>","input":<parsed arguments>}]}` followed by `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mcp_c_...","content":"<output>"}]}` |
+| `{"type":"mcp_approval_request","id":"mcp_ar_...","name":"...","arguments":"..."}` | Dropped — approval flow metadata, not a model-generated call |
+| `{"type":"tool_search_call","id":"ts_...","arguments":{"goal":"..."}}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ts_...","name":"tool_search","input":{"goal":"..."}}]}` |
+
+Key details for built-in tool history items:
+- **ID mapping:** Built-in tool call IDs (e.g., `ws_...`, `fs_...`) map to Anthropic `toolu_` prefixed IDs using the same bidirectional ID map as function calls
+- **Call-with-result items** (file_search_call, code_interpreter_call, image_generation_call, mcp_call): These items contain both the call and the result inline. They produce an assistant+user message pair: assistant with `tool_use`, user with `tool_result` containing the result data. For `mcp_call`, `arguments` is parsed from JSON string into the `input` object
+- **Separate call/output items** (computer_call/computer_call_output, shell_call/shell_call_output, apply_patch_call/apply_patch_call_output): Call and output appear as separate input items, mapped to assistant `tool_use` and user `tool_result` respectively, linked by the same ID map
+- **Call-only items** (web_search_call, local_shell_call): These have no separate output type. Map to assistant `tool_use` only
+- **Message alternation:** These items participate in the same alternation merge logic as other input items — consecutive same-role items are merged into a single message
+- **Schema consistency:** The `tool_use.input` in the Anthropic message must match the schema registered in the request direction. For tools with `action`/`operation` wrappers (web_search, computer_use, shell, local_shell, apply_patch), the call's `action`/`operation` object is placed directly as `input`. For tools with flat fields (file_search, code_interpreter, tool_search), the relevant call fields are placed as `input` properties
+- **`mcp_call` imported history uses composite tool name:** Since `{"type": "mcp"}` is dropped (not converted), there is no `mcp_call_tool` registered. Imported `mcp_call` items use the composite name `mcp__<server_label>__<name>` and parse `arguments` as the `input` JSON object. This matches the MCP namespace convention used elsewhere in the proxy
+- **`image_generation_call` uses `revised_prompt` for `input.prompt`:** The original prompt is not preserved in the history item. `revised_prompt` is the closest available field — it's the server's revised version of the original prompt. This is an inherent limitation of the OpenAI API format for this tool type
+
+### `tool_choice` Interaction
+
+When the request has `tool_choice: "none"` but includes built-in tools, the built-in tools are still registered (converted to custom tools) but `tool_choice: "none"` prevents the model from calling any of them. This matches the existing behavior for function tools.
+
+When `tool_choice: "required"` or `tool_choice: {"type": "function", "name": "x"}`, the model is constrained to call tools. If the specified name matches a built-in tool name, the proxy resolves it correctly since all tools (built-in and function) share the same Anthropic custom tool namespace.
 
 ## MCP Namespace Handling
 
@@ -630,7 +898,6 @@ Codex sends MCP tools as `{"type": "namespace", "name": "mcp__memory__", "tools"
 Anthropic limits tool names to `^[a-zA-Z0-9_-]{1,64}$`. When flattened names exceed 64 chars:
 - Truncate + append hash suffix (12 hex chars) for uniqueness
 - Register both original and truncated names in registry
-- **Collision detection:** After truncation, check if the resulting name already exists in the registry. If collision detected, hash the name with an incrementing counter (`SHA-1(name + ":" + counter)`) to produce a different hash suffix. Retry up to 8 times. If still colliding, reject the request with 400 error (`too_many_namespaced_tools`)
 
 ## Configuration System
 
@@ -842,7 +1109,7 @@ Test the Conversion Task state machine as a whole:
 | Completion | Each stop_reason → correct status mapping, usage mapping |
 | Error paths | Anthropic streaming error → correct error + response.failed + [DONE] sequence |
 | Namespace lifecycle | Flatten + build in request phase → lookup + restore in response phase |
-| Edge cases | Empty content, long tool name truncation+hash, unknown tool, consecutive function_call merge, consecutive function_call_output merge, built-in tool rejection, private IP rejection |
+| Edge cases | Empty content, long tool name truncation+hash, unknown tool, consecutive function_call merge, consecutive function_call_output merge, built-in tool conversion, built-in tool history item mapping |
 | Config system | Three-way injection priority, Option semantics, defaults |
 | URL routing | Protocol normalization, various upstream paths, invalid path rejection |
 

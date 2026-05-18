@@ -423,7 +423,7 @@ Confirmed. The Anthropic Messages API accepts exactly two values for `service_ti
 Note: the Anthropic response `usage` object returns a different field (`usage.service_tier`) with values `"standard"`, `"priority"`, or `"batch"` — these describe which tier was actually used, not input parameter values.
 
 ### Reference
-- [1] Anthropic Messages API docs — https://docs.anthropic.com/en/api/messages (see `service_tier` parameter)
+- [1] Anthropic Messages API docs — https://platform.claude.com/docs/en/api (see `service_tier` parameter)
 
 ---
 
@@ -577,7 +577,7 @@ Full event-by-event mapping documented in spec Streaming Conversion section. Key
 
 ### Reference
 - [1] OpenAI Responses API — https://developers.openai.com/api/reference/responses/overview/
-- [2] Anthropic Messages API — https://docs.anthropic.com/en/api/messages
+- [2] Anthropic Messages API — https://platform.claude.com/docs/en/api
 - [3] Anthropic Streaming Messages — https://platform.claude.com/docs/en/build-with-claude/streaming
 - [4] LiteLLM source — https://github.com/BerriAI/litellm (cache_control passthrough)
 - [5] OpenAI Responses API response fields — https://developers.openai.com/api/reference/responses/overview/ (response object)
@@ -676,11 +676,10 @@ These Responses API response fields have no Anthropic source — the proxy must 
 
 ### Reference
 - [1] OpenAI Responses API — https://developers.openai.com/api/reference/responses/overview/
-- [2] Anthropic Messages API — https://docs.anthropic.com/en/api/messages
+- [2] Anthropic Messages API — https://platform.claude.com/docs/en/api
 - [3] Anthropic Streaming Messages — https://platform.claude.com/docs/en/build-with-claude/streaming
 - [4] LiteLLM source — https://github.com/BerriAI/litellm
 - [5] OpenAI Responses streaming events — https://developers.openai.com/api/reference/resources/responses/streaming-events/
-- [6] Anthropic Handling Stop Reasons — https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
 
 ---
 
@@ -765,3 +764,1123 @@ The spec's claim at L583 ("Codex CLI sends `priority` or `flex`") is correct.
 
 ### Reference
 - [1] Codex CLI source: `codex-rs/codex-api/src/common.rs`, `codex-rs/protocol/src/config_types.rs` — https://github.com/openai/codex
+
+---
+
+## 27. `thinking.display` parameter: values, defaults, streaming behavior, and model compatibility
+
+### Description
+What are the exact behaviors of the `thinking.display` parameter in the Anthropic Messages API? This determines how the proxy should handle thinking display when converting between OpenAI Responses API reasoning and Anthropic thinking. Specifically: accepted values, default behavior per model, compatibility with `thinking.type: "adaptive"`, field location, behavior on older models, streaming events with omitted mode, and the difference between "summarized" and "omitted" in streaming.
+
+### Result
+
+**Q1: Accepted values.** `thinking.display` accepts exactly two values: `"summarized"` and `"omitted"` [1][2].
+
+**Q2: Default behavior (when `display` is not set).** Model-dependent [1][2]:
+- **Claude Opus 4.7 and Claude Mythos Preview:** Default is `"omitted"` — thinking blocks are returned with an empty `thinking` field. You must set `display: "summarized"` explicitly to receive summarized thinking text.
+- **Claude Opus 4.6, Claude Sonnet 4.6, and earlier Claude 4 models:** Default is `"summarized"` — thinking blocks contain summarized thinking text.
+- **Older models (Sonnet 3.7, etc.):** These models return full (non-summarized) thinking. The `display` parameter was not applicable/introduced until Claude 4 models.
+- **Invalid with `thinking.type: "disabled"`:** Setting `display` when thinking is disabled is invalid — there is nothing to display.
+
+**Q3: Works with `thinking.type: "adaptive"`.** YES. Confirmed. The official docs explicitly show `display` used with adaptive thinking: `thinking = {"type": "adaptive", "display": "omitted"}` or `thinking = {"type": "adaptive", "display": "summarized"}` [2]. On Claude Opus 4.7, adaptive is the only supported thinking mode, and `display` defaults to `"omitted"`. When using adaptive thinking and the model skips thinking for a simple request, no thinking block is produced regardless of `display` setting.
+
+**Q4: Field location.** Inside the `thinking` object, alongside `type` and (for manual mode) `budget_tokens` [1][2]:
+```json
+{"type": "adaptive", "display": "summarized"}
+{"type": "enabled", "budget_tokens": 10000, "display": "omitted"}
+```
+
+**Q5: Older models.** Sonnet 4.6 and earlier Claude 4 models: `display` defaults to `"summarized"` and can be set to `"omitted"`. Pre-Claude 4 models (Sonnet 3.7, etc.): these return full (non-summarized) thinking inherently. The `display` parameter is a Claude 4+ feature.
+
+**Q6: `signature_delta` with `display: "omitted"`.** YES. When `display: "omitted"` is set, the thinking block opens, a single `signature_delta` arrives (with no `thinking_delta` events), and the block closes. The `signature` field is identical whether `display` is `"summarized"` or `"omitted"` — it carries the encrypted full thinking for multi-turn continuity [1]. Streaming example with omitted:
+```
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EosnCkYICxIMMb3LzNrMu..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+```
+
+**Q7: Streaming event differences.** With `"summarized"`: thinking blocks contain summarized text, streamed via `thinking_delta` events, followed by `signature_delta` before `content_block_stop`. With `"omitted"`: NO `thinking_delta` events are emitted at all — only a single `signature_delta` is sent. Text streaming begins immediately after the thinking block closes. The `signature` field is the same in both modes — only the visible `thinking` text differs (summarized text vs. empty string) [1].
+
+**Key behavioral notes for proxy conversion:**
+- `display` values can be switched between turns in a conversation (supported) [1].
+- The billed output tokens are the same regardless of `display` setting — you pay for full thinking tokens either way [1][2].
+- The `thinking` field in the response is empty (`""`) when `display: "omitted"`, but the `signature` field carries the full encrypted thinking [1].
+- For multi-turn: any text placed in the `thinking` field of a round-tripped omitted block is ignored by the server — it decrypts the `signature` to reconstruct the original thinking [1].
+
+**Design decision for codex-conv:** The proxy should NOT set `display` in requests to Anthropic. Rationale:
+1. The proxy always wants thinking text to stream to Codex CLI as reasoning summaries.
+2. The default on Opus 4.7 is `"omitted"`, which would hide thinking text from the proxy.
+3. Therefore, the proxy should explicitly set `display: "summarized"` when constructing the `thinking` object for models that support it (Claude 4+ models).
+4. This ensures thinking text is always available for mapping to OpenAI `reasoning.summary` items.
+
+### Reference
+- [1] Anthropic Extended Thinking docs — https://platform.claude.com/docs/en/build-with-claude/extended-thinking (see "Controlling thinking display" and "Streaming thinking" sections)
+- [2] Anthropic Adaptive Thinking docs — https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking (see "Working with thinking blocks" and "Controlling thinking display" sections)
+
+---
+
+## 28. Codex CLI `reasoning.summary` field and mapping to `thinking.display`
+
+### Description
+Codex CLI sends a `reasoning.summary` field with values `"auto"`, `"concise"`, `"detailed"`, `"none"`. How should this map to Anthropic's `thinking.display` parameter?
+
+### Result
+
+**Codex CLI source:** The `Reasoning` struct in `codex-rs/protocol/src/models.rs` contains `effort: Option<ReasoningEffort>` and `summary: Option<ReasoningSummary>`. `ReasoningSummary` values: `"auto"`, `"concise"`, `"detailed"`, `"none"` [1].
+
+**Anthropic side:** `thinking.display` accepts `"summarized"` or `"omitted"`. Anthropic has no granularity control (no "concise" vs "detailed") [2].
+
+**Mapping:**
+
+| `reasoning.summary` | `thinking.display` | Rationale |
+|---|---|---|
+| absent / `null` | `"summarized"` | Default to showing thinking when reasoning enabled |
+| `"auto"` | `"summarized"` | Direct match — default behavior |
+| `"concise"` | `"summarized"` | No Anthropic granularity, closest match |
+| `"detailed"` | `"summarized"` | Same |
+| `"none"` | `"omitted"` | Client explicitly opts out of reasoning summaries |
+
+This is pure protocol conversion — every value maps deterministically. No heuristic decisions.
+
+### Reference
+- [1] Codex CLI source: `codex-rs/protocol/src/models.rs` — https://github.com/openai/codex
+- [2] Anthropic Extended Thinking docs — https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+
+---
+
+## 29. Codex CLI dropped request fields: `text.verbosity`, `client_metadata`, `prompt_cache_key`
+
+### Description
+Codex CLI sends several request fields that have no Anthropic equivalent. What are these fields and should they be documented?
+
+### Result
+
+Three fields identified from Codex CLI source [1]:
+
+1. **`text.verbosity`:** Part of `TextControls` struct alongside `format`. Values: `"low"`, `"medium"`, `"high"`. Controls output verbosity. Anthropic has no equivalent parameter.
+
+2. **`client_metadata`:** A `HashMap<String, String>` in `ResponsesApiRequest`. Contains installation ID (`codex-installation-id`) and W3C trace context (`traceparent`, `tracestate`). This is a separate field from OpenAI's `metadata`. Anthropic has no equivalent.
+
+3. **`prompt_cache_key`:** An `Option<String>` set to the thread ID. Used for OpenAI server-side response caching. Anthropic has no server-side storage.
+
+All three are already implicitly dropped (not forwarded) since they have no Anthropic equivalent. Documenting them explicitly improves spec completeness.
+
+### Reference
+- [1] Codex CLI source: `codex-rs/codex-api/src/common.rs`, `codex-rs/protocol/src/models.rs` — https://github.com/openai/codex
+
+---
+
+## 30. `function_call_output.output` content array variant and `success` field
+
+### Description
+Codex CLI can send `function_call_output.output` as either a plain string or an array of content items. The spec only handles the string case. Additionally, `function_call_output` has a `success` field that should map to Anthropic's `tool_result.is_error`.
+
+### Result
+
+**Array variant:** The `FunctionCallOutputBody` enum in `codex-rs/protocol/src/models.rs` is `#[serde(untagged)]` with two variants: `Text(String)` and `ContentItems(Vec<FunctionCallOutputContentItem>)` [1]. Content items include `InputText { text: String }` and `InputImage { image_url: String, detail: Option<ImageDetail> }` — the same content types used in user messages.
+
+The comment in source states: "The `output` field for `function_call_output` uses a dedicated payload type with custom serialization. On the wire it is either: a plain string (`content`) or an array of structured content items (`content_items`)" [1].
+
+**Mapping:** When array → convert each content item using the existing User Content Block Mapping (input_text → text, input_image → image). When string → same as current behavior.
+
+**`success` field:** `FunctionCallOutputPayload` has `body: FunctionCallOutputBody` and `success: Option<bool>` [1]. This is a Codex extension (not standard Responses API). Anthropic's `tool_result` has `is_error: bool`. Mapping: `success: false` → `is_error: true`; `success: true` or absent → omit `is_error`.
+
+**`custom_tool_call_output`** uses the exact same `FunctionCallOutputPayload` type for its `output` field [1].
+
+### Reference
+- [1] Codex CLI source: `codex-rs/protocol/src/models.rs` — https://github.com/openai/codex
+
+---
+
+## 31. Anthropic `ping` streaming event and Codex `compaction`/`custom_tool_call`/`phase` items
+
+### Description
+Several minor protocol elements not covered in the spec: Anthropic's `ping` SSE events, Codex's `compaction`/`context_compaction` input items, `custom_tool_call`/`custom_tool_call_output` items, and `Message.phase`.
+
+### Result
+
+**`ping` events:** Anthropic sends `ping` events during streaming to keep connections alive [1]. These should be consumed silently with no Responses API event emitted.
+
+**`compaction` items:** Codex CLI has `compaction` and `context_compaction` input item types containing `encrypted_content: string` — opaque OpenAI-specific data for context management [2]. These have no Anthropic equivalent and must be dropped.
+
+**`custom_tool_call`/`custom_tool_call_output`:** Codex CLI defines these with the same structure as `function_call`/`function_call_output` [2]:
+- `custom_tool_call`: `{type, status?, call_id, name, input}` — `input` is a string (same as `function_call.arguments`)
+- `custom_tool_call_output`: `{type, call_id, name?, output: FunctionCallOutputPayload}` — uses the same payload type as `function_call_output`
+
+The comment in source: "custom_tool_call_output.output uses the same wire encoding as function_call_output.output so freeform tools can return either plain text or structured content items" [2].
+
+Mapping: identical to `function_call`/`function_call_output`.
+
+**`Message.phase`:** Output messages can carry `phase: "commentary"` or `phase: "final_answer"` — used by Codex's TUI for state indicator behavior during streaming [2]. Anthropic has no equivalent. Strip on input, do not generate on output.
+
+### Reference
+- [1] Anthropic Streaming Messages docs — https://platform.claude.com/docs/en/build-with-claude/streaming
+- [2] Codex CLI source: `codex-rs/protocol/src/models.rs`, `codex-rs/app-server-protocol/schema/typescript/ResponseItem.ts` — https://github.com/openai/codex
+
+---
+
+## 32. Comprehensive re-audit: spec coverage verification
+
+### Description
+Second full audit of the spec against latest official sources to find any remaining conversion gaps.
+
+### Result
+
+Verified against four sources in parallel:
+1. Codex CLI latest source (`openai/codex`) — all `ResponsesApiRequest` fields and `ResponseItem` variants
+2. Anthropic Messages API latest docs — all parameters, response fields, streaming events
+3. OpenAI Responses API latest SDK types — all request/response/streaming types
+4. Internal spec consistency — cross-reference between sections
+
+**All Codex CLI request fields confirmed covered:**
+- `model`, `instructions`, `input`, `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning`, `store`, `stream`, `include`, `service_tier`, `prompt_cache_key`, `text` (verbosity + format), `client_metadata` — all mapped or documented as dropped
+
+**All Codex CLI input item types confirmed covered:**
+- `message` (user/assistant/system), `function_call`, `function_call_output`, `reasoning`, `custom_tool_call`, `custom_tool_call_output`, `compaction`, `context_compaction`, `compaction_trigger`
+
+**All Anthropic streaming events confirmed covered:**
+- `message_start`, `content_block_start` (text/thinking/redacted_thinking/tool_use), `content_block_delta` (text_delta/thinking_delta/signature_delta/input_json_delta), `content_block_stop`, `message_delta`, `message_stop`, `ping`, `error`
+
+**Two minor documentation gaps found and fixed:**
+1. `too_many_namespaced_tools` proxy error code mentioned in collision detection section but missing from proxy-originated errors table → added
+2. Additional Anthropic usage response fields (`usage.cache_creation`, `usage.server_tool_use`, `usage.service_tier`, `usage.speed`) not documented as dropped → added
+
+**No new conversion gaps found.** The spec covers all fields, events, and item types that Codex CLI actually sends and receives. New Responses API features found in the SDK (background mode, conversation, context_management, item_reference, built-in tool types, refusal content type, audio events, etc.) are not used by Codex CLI and are out of scope per the spec's "sole use case: Codex CLI" principle.
+
+### Reference
+- [1] Codex CLI source: `codex-rs/codex-api/src/common.rs`, `codex-rs/protocol/src/models.rs` — https://github.com/openai/codex
+- [2] Anthropic Messages API — https://platform.claude.com/docs/en/api
+- [3] Anthropic Streaming Messages — https://platform.claude.com/docs/en/build-with-claude/streaming
+- [4] OpenAI Python SDK: `src/openai/types/responses/` — https://github.com/openai/openai-python
+
+## 33. Anthropic Messages API built-in tool types: complete request/response format
+
+### Description
+What are the exact tool definitions, configuration parameters, response content block types, and streaming events for each Anthropic native built-in tool type? This research supports conversion design between OpenAI Responses API built-in tools and Anthropic native tools.
+
+### Result
+
+Anthropic built-in tools fall into two execution categories:
+
+**Client tools** return `stop_reason: "tool_use"` with `tool_use` content blocks. The client must execute the tool and return a `tool_result` message. These include: bash, text_editor, computer_use, memory.
+
+**Server tools** execute on Anthropic infrastructure and return results directly in the response content array. These include: web_search, web_fetch, code_execution, advisor, tool_search, mcp_toolset. Server tools use `server_tool_use` and tool-specific result blocks (not `tool_result` messages). Server tool IDs use the `srvtoolu_` prefix (vs. `toolu_` for client tools).
+
+All built-in tools are schema-less — no `input_schema` appears in the tool definition because the schema is built into the model. Tools use date-stamped version strings as the `type` value.
+
+#### 33.1 Web Search Tool
+
+**Tool definition** [1]:
+```json
+{
+  "type": "web_search_20260209",
+  "name": "web_search",
+  "max_uses": 5,
+  "allowed_domains": ["example.com"],
+  "blocked_domains": ["spam.com"],
+  "user_location": {
+    "type": "approximate",
+    "city": "San Francisco",
+    "region": "California",
+    "country": "US",
+    "timezone": "America/Los_Angeles"
+  }
+}
+```
+All fields except `type` are optional. Available versions: `web_search_20260209`, `web_search_20250305`. `max_uses` limits total searches per turn. `user_location` provides geographic context for results.
+
+**Response content blocks** [1]:
+- `server_tool_use`: `{"type": "server_tool_use", "id": "srvtoolu_...", "name": "web_search", "input": {"query": "search terms"}}`
+- `web_search_tool_result`: `{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_...", "content": {"type": "web_search_result", "results": [{"url": "...", "title": "...", "page_age": "...", "encrypted_content": "..."}]}}`
+- Citations (always enabled): `web_search_result_location` with `{url, title, encrypted_index, cited_text}`
+
+**Error codes**: `too_many_requests`, `invalid_input`, `max_uses_exceeded`, `query_too_long`, `unavailable`.
+
+**Stop reason**: Can return `pause_turn` for long-running searches [1].
+
+#### 33.2 Web Fetch Tool
+
+**Tool definition** [2]:
+```json
+{
+  "type": "web_fetch_20260209",
+  "name": "web_fetch",
+  "max_uses": 10,
+  "allowed_domains": ["example.com"],
+  "blocked_domains": ["spam.com"],
+  "citations": {"enabled": true},
+  "max_content_tokens": 100000
+}
+```
+All fields except `type` are optional. Available versions: `web_fetch_20260209`, `web_fetch_20250910`. Requires beta header `web-fetch-2025-09-10`. URL validation: can only fetch URLs previously present in the conversation context.
+
+**Response content blocks** [2]:
+- `server_tool_use`: `{"type": "server_tool_use", "id": "srvtoolu_...", "name": "web_fetch", "input": {"url": "https://..."}}`
+- `web_fetch_tool_result`: `{"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_...", "content": {"type": "web_fetch_result", "url": "...", "content": {"type": "document", "source": {"type": "base64", "media_type": "text/html", "data": "..."}, "title": "...", "citations": [...]}, "retrieved_at": "2026-..."}}`
+- Citations (when `citations.enabled: true`): `char_location` with `{document_index, document_title, start_char_index, end_char_index, cited_text}`
+
+**Error codes**: `invalid_input`, `url_too_long`, `url_not_allowed`, `url_not_accessible`, `too_many_requests`, `unsupported_content_type`, `max_uses_exceeded`, `unavailable`.
+
+#### 33.3 Code Execution Tool
+
+**Tool definition** [3]:
+```json
+{
+  "type": "code_execution_20250825",
+  "name": "code_execution"
+}
+```
+No additional configuration parameters. Available versions: `code_execution_20260120`, `code_execution_20250825`. Provides two sub-tools automatically:
+- `bash_code_execution`: Run shell commands. Input: `{command: "..."}`.
+- `text_editor_code_execution`: View/create/edit files. Commands: `view`, `create`, `str_replace`.
+
+**Response content blocks (bash)** [3]:
+```json
+{"type": "server_tool_use", "id": "srvtoolu_...", "name": "bash_code_execution", "input": {"command": "ls -la"}}
+{"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_...", "content": {"type": "bash_code_execution_result", "stdout": "...", "stderr": "...", "return_code": 0}}
+```
+
+**Response content blocks (text editor)** [3]:
+```json
+{"type": "server_tool_use", "id": "srvtoolu_...", "name": "text_editor_code_execution", "input": {"command": "view", "path": "/tmp/file.py"}}
+{"type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_...", "content": {"type": "text_editor_code_execution_result", "path": "...", "content": "..."}}
+```
+
+**Error block**:
+```json
+{"type": "bash_code_execution_tool_result", "tool_use_id": "...", "content": {"type": "bash_code_execution_tool_result_error", "error_code": "..."}}
+```
+
+**Error codes**: `unavailable`, `execution_time_exceeded`, `container_expired`, `invalid_tool_input`, `too_many_requests`, `file_not_found` (text_editor only), `string_not_found` (text_editor only).
+
+**Container**: When code execution is used, the response includes `container: {id: "...", expires_at: "..."}`. Containers expire 30 days after creation. The `container_upload` content block type enables uploading files to the sandbox [3].
+
+**Stop reason**: Can return `pause_turn` for long-running executions [3].
+
+#### 33.4 Computer Use Tool
+
+**Tool definition** [4]:
+```json
+{
+  "type": "computer_20250124",
+  "name": "computer",
+  "display_width_px": 1024,
+  "display_height_px": 768,
+  "display_number": 0
+}
+```
+Schema-less client tool. Available versions: `computer_20250124`, `computer_20241022`. Requires beta header: `computer-use-2025-01-24` or `computer-use-2024-10-22`. `display_number` is optional.
+
+**Input schema** (built into model) [4]:
+- Basic actions: `screenshot`, `left_click`, `type`, `key`, `mouse_move`.
+- Enhanced actions (computer_20250124 only): `scroll`, `left_click_drag`, `right_click`, `middle_click`, `double_click`, `triple_click`, `left_mouse_down`, `left_mouse_up`, `hold_key`, `wait`.
+
+**Response content blocks**: Standard `tool_use` content block with `name: "computer"` and action-specific input. Client must execute and return `tool_result` with screenshot image.
+
+#### 33.5 Bash Tool
+
+**Tool definition** [5]:
+```json
+{
+  "type": "bash_20250124",
+  "name": "bash"
+}
+```
+Schema-less client tool. Available versions: `bash_20250124`, `bash_20241022`. No configuration parameters beyond `type` and `name`.
+
+**Input schema** (built into model) [5]:
+- `{command: "..."}` — required, the shell command to execute.
+- `{restart: true}` — optional, restart the bash session.
+
+**Response content blocks**: Standard `tool_use` content block with `name: "bash"` and `{command: "..."}` input. Client must execute and return `tool_result`.
+
+#### 33.6 Text Editor Tool
+
+**Tool definition** [6]:
+```json
+{
+  "type": "text_editor_20250728",
+  "name": "str_replace_based_edit_tool",
+  "max_characters": 10000
+}
+```
+Schema-less client tool. Available versions: `text_editor_20250728`, `text_editor_20250124`, `text_editor_20241022`. `max_characters` parameter only available on `text_editor_20250728` and later.
+
+**Input schema** (built into model) [6]:
+- Commands: `view`, `str_replace`, `create`, `insert`, `undo_edit`.
+- Each command takes `path` (required) plus command-specific fields:
+  - `view`: `{command: "view", path: "...", view_range: [start, end]}`
+  - `str_replace`: `{command: "str_replace", path: "...", old_str: "...", new_str: "..."}`
+  - `create`: `{command: "create", path: "...", file_text: "..."}`
+  - `insert`: `{command: "insert", path: "...", insert_line: N, new_str: "..."}`
+  - `undo_edit`: `{command: "undo_edit", path: "..."}`
+
+**Response content blocks**: Standard `tool_use` content block with `name: "str_replace_based_edit_tool"`. Client must execute and return `tool_result`.
+
+#### 33.7 Memory Tool
+
+**Tool definition** [7]:
+```json
+{
+  "type": "memory_20250818",
+  "name": "memory"
+}
+```
+Schema-less client tool. Client-side execution (returns `stop_reason: "tool_use"`). Input: memory operations (store/recall). Available version: `memory_20250818`.
+
+#### 33.8 Other Server Tools
+
+**Advisor**: `{"type": "advisor_20260301", "name": "advisor"}` — Beta. Server-side execution.
+
+**Tool Search**: Types `tool_search_tool_regex_20251119` and `tool_search_tool_bm25_20251119` — GA. Server-side. Used for searching MCP tool definitions.
+
+**MCP Connector**: `{"type": "mcp_toolset", "name": "...", "endpoint_url": "...", "tools": [...]}` — Beta. Server-side. Connects to external MCP servers.
+
+#### 33.9 Streaming Events for Server Tools
+
+Server tools follow a consistent streaming pattern [1][2][3]:
+
+```
+event: content_block_start
+data: {"type": "content_block_start", "index": N,
+       "content_block": {"type": "server_tool_use", "id": "srvtoolu_...", "name": "tool_name"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": N,
+       "delta": {"type": "input_json_delta", "partial_json": "..."}}
+
+event: content_block_stop
+data: {"type": "content_block_stop", "index": N}
+
+// Pause while tool executes on server
+
+event: content_block_start
+data: {"type": "content_block_start", "index": N+1,
+       "content_block": {"type": "<tool>_tool_result", "tool_use_id": "srvtoolu_...", "content": {...}}}
+
+event: content_block_stop
+data: {"type": "content_block_stop", "index": N+1}
+```
+
+Client tools use the standard `tool_use` content block pattern (same as custom tools) with `tool_use` type in `content_block_start` and `input_json_delta` in `content_block_delta`.
+
+#### 33.10 Complete Tool Catalog
+
+| Tool | `type` values | Execution | Status |
+|---|---|---|---|
+| Web search | `web_search_20260209`, `web_search_20250305` | Server | GA |
+| Web fetch | `web_fetch_20260209`, `web_fetch_20250910` | Server | GA |
+| Code execution | `code_execution_20260120`, `code_execution_20250825` | Server | GA |
+| Advisor | `advisor_20260301` | Server | Beta |
+| Tool search | `tool_search_tool_regex_20251119`, `tool_search_tool_bm25_20251119` | Server | GA |
+| MCP connector | `mcp_toolset` | Server | Beta |
+| Memory | `memory_20250818` | Client | GA |
+| Bash | `bash_20250124`, `bash_20241022` | Client | GA |
+| Text editor | `text_editor_20250728`, `text_editor_20250124`, `text_editor_20241022` | Client | GA |
+| Computer use | `computer_20250124`, `computer_20241022` | Client | Beta |
+
+### Reference
+- [1] Anthropic Web search tool — https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/web-search-tool
+- [2] Anthropic Web fetch tool — https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/web-fetch-tool
+- [3] Anthropic Code execution tool — https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/code-execution-tool
+- [4] Anthropic Computer use tool — https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/computer-use-tool
+- [5] Anthropic Bash tool — https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/bash-tool
+- [6] Anthropic Text editor tool — https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/text-editor-tool
+- [7] Anthropic Tool use overview — https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/overview
+
+---
+
+## 34. OpenAI Responses API built-in tool output item types: complete call and output structures
+
+### Description
+What are the exact JSON structures for all OpenAI Responses API built-in tool output items? For each tool type, what parameters does the model generate when calling the tool (the "call" side), and what is the output/result item structure? This is needed to create Anthropic custom tool `input_schema` definitions for each built-in tool type if conversion is required.
+
+The source of truth is the OpenAI Python SDK type definitions (auto-generated from the OpenAPI spec by Stainless), which define the exact field names, types, and discriminated unions [1]. These are cross-referenced against official tool guides [2] where available.
+
+### Result
+
+The complete `ResponseOutputItem` union type from the SDK defines all possible output items in a response's `output` array [1]:
+
+```
+ResponseOutputMessage | ResponseFileSearchToolCall | ResponseFunctionToolCall |
+ResponseFunctionWebSearch | ResponseComputerToolCall | ResponseReasoningItem |
+ResponseCompactionItem | ImageGenerationCall | ResponseCodeInterpreterToolCall |
+LocalShellCall | ResponseFunctionShellToolCall | ResponseFunctionShellToolCallOutput |
+ResponseApplyPatchToolCall | ResponseApplyPatchToolCallOutput | McpCall | McpListTools |
+McpApprovalRequest | ResponseCustomToolCall
+```
+
+Note: `tool_search_call` and `tool_search_output` do NOT appear in this union in the current SDK version — they appear as separate item types. The SDK also defines `ResponseToolSearchCall` and `ResponseToolSearchOutputItem` but they are not part of the `ResponseOutputItem` alias.
+
+Below are the exact structures for each built-in tool type.
+
+#### 34.1 web_search_call (ResponseFunctionWebSearch)
+
+**Type discriminator:** `"web_search_call"`
+
+**Structure** [1][2]:
+```json
+{
+  "id": "ws_67c9fa0502748190b7dd390736892e100be649c1a5ff9609",
+  "type": "web_search_call",
+  "status": "completed",
+  "action": {
+    "type": "search",
+    "query": "latest news about AI",
+    "queries": ["latest news about AI"],
+    "sources": [{"type": "url", "url": "https://..."}]
+  }
+}
+```
+
+**Action types** (discriminated union on `action.type`) [1]:
+- `search`: `{type: "search", query: string, queries?: string[], sources?: [{type: "url", url: string}]}`
+  - `query` is DEPRECATED — use `queries` instead
+  - `sources` lists URLs used in the search
+- `open_page`: `{type: "open_page", url?: string}` — reasoning models only
+- `find_in_page`: `{type: "find_in_page", pattern: string, url: string}` — reasoning models only
+
+**Status values:** `"in_progress"`, `"searching"`, `"completed"`, `"failed"` [1]
+
+**No separate output type.** The `web_search_call` item is self-contained — results are referenced via URL citations in the assistant message's `output_text` annotations.
+
+#### 34.2 file_search_call (ResponseFileSearchToolCall)
+
+**Type discriminator:** `"file_search_call"`
+
+**Structure** [1][3]:
+```json
+{
+  "id": "fs_67c09ccea8c48191ade9367e3ba71515",
+  "type": "file_search_call",
+  "status": "completed",
+  "queries": ["What is deep research?"],
+  "results": [
+    {
+      "file_id": "file-abc123",
+      "filename": "research.pdf",
+      "text": "relevant passage...",
+      "score": 0.95,
+      "attributes": {"key": "value"}
+    }
+  ]
+}
+```
+
+**Fields** [1]:
+- `id`: string (unique ID)
+- `type`: always `"file_search_call"`
+- `status`: `"in_progress"`, `"searching"`, `"completed"`, `"incomplete"`, `"failed"`
+- `queries`: `string[]` (required, search queries used)
+- `results`: `null` or array of result objects with `file_id`, `filename`, `text`, `score`, `attributes` (all optional within result)
+
+**No separate output type.** Results are inline on the call item.
+
+#### 34.3 code_interpreter_call (ResponseCodeInterpreterToolCall)
+
+**Type discriminator:** `"code_interpreter_call"`
+
+**Structure** [1]:
+```json
+{
+  "id": "ci_...",
+  "type": "code_interpreter_call",
+  "status": "completed",
+  "container_id": "cntr_...",
+  "code": "import pandas as pd\ndf = pd.read_csv('data.csv')\nprint(df.head())",
+  "outputs": [
+    {"type": "logs", "logs": "   col1  col2\n0     1     2"},
+    {"type": "image", "url": "https://..."}
+  ]
+}
+```
+
+**Fields** [1]:
+- `id`: string (unique ID)
+- `type`: always `"code_interpreter_call"`
+- `status`: `"in_progress"`, `"completed"`, `"incomplete"`, `"interpreting"`, `"failed"`
+- `container_id`: string (required, the container used to run code)
+- `code`: `string | null` (the code to run, null if not available)
+- `outputs`: `null` or array of output items:
+  - `{type: "logs", logs: string}` — stdout/stderr output
+  - `{type: "image", url: string}` — image output URL
+
+**No separate output type.** The model generates the `code` field. The runtime executes it in the container and populates `outputs`. Results are inline on the call item.
+
+#### 34.4 computer_call (ResponseComputerToolCall)
+
+**Type discriminator:** `"computer_call"`
+
+**Call structure** [1][4]:
+```json
+{
+  "id": "comp_...",
+  "type": "computer_call",
+  "call_id": "call_001",
+  "status": "completed",
+  "action": {
+    "type": "click",
+    "button": "left",
+    "x": 405,
+    "y": 157
+  },
+  "actions": [
+    {"type": "click", "button": "left", "x": 405, "y": 157},
+    {"type": "type", "text": "hello"}
+  ],
+  "pending_safety_checks": []
+}
+```
+
+**Action types** (discriminated union on `action.type`) [1]:
+- `screenshot`: `{type: "screenshot"}` — no additional params
+- `click`: `{type: "click", button: "left"|"right"|"wheel"|"back"|"forward", x: int, y: int, keys?: string[]}`
+- `double_click`: `{type: "double_click", x: int, y: int, keys?: string[]}`
+- `drag`: `{type: "drag", path: [{x: int, y: int}], keys?: string[]}`
+- `keypress`: `{type: "keypress", keys: string[]}`
+- `move`: `{type: "move", x: int, y: int, keys?: string[]}`
+- `scroll`: `{type: "scroll", x: int, y: int, scroll_x: int, scroll_y: int, keys?: string[]}`
+- `type`: `{type: "type", text: string}`
+- `wait`: `{type: "wait"}`
+
+**Note:** The SDK has both `action` (single action, optional) and `actions` (batched actions via `ComputerActionList`, optional) [1].
+
+**Status values:** `"in_progress"`, `"completed"`, `"incomplete"` [1]
+
+**Output type** (ResponseComputerToolCallOutputItem) — provided by client as input on next turn [1]:
+```json
+{
+  "id": "comp_out_...",
+  "type": "computer_call_output",
+  "call_id": "call_001",
+  "status": "completed",
+  "output": {
+    "type": "computer_screenshot",
+    "image_url": "data:image/png;base64,...",
+    "detail": "original"
+  },
+  "acknowledged_safety_checks": [
+    {"id": "psc_...", "code": "...", "message": "..."}
+  ]
+}
+```
+
+#### 34.5 image_generation_call (ImageGenerationCall)
+
+**Type discriminator:** `"image_generation_call"`
+
+**Structure** [1][5]:
+```json
+{
+  "id": "ig_123",
+  "type": "image_generation_call",
+  "status": "completed",
+  "result": "base64_encoded_image_data...",
+  "revised_prompt": "A gray tabby cat hugging an otter..."
+}
+```
+
+**Fields** [1]:
+- `id`: string (unique ID)
+- `type`: always `"image_generation_call"`
+- `status`: `"in_progress"`, `"completed"`, `"generating"`, `"failed"`
+- `result`: `string | null` — base64-encoded generated image
+
+**No separate output type.** The result is inline on the call item.
+
+#### 34.6 shell_call (ResponseFunctionShellToolCall)
+
+**Type discriminator:** `"shell_call"`
+
+**Call structure** [1][6]:
+```json
+{
+  "id": "sh_...",
+  "type": "shell_call",
+  "call_id": "call_9d14ac6f2b73485e91c0f4da6e1b27c8",
+  "status": "in_progress",
+  "action": {
+    "commands": ["ls -l"],
+    "timeout_ms": 120000,
+    "max_output_length": 4096
+  },
+  "environment": {"type": "local"},
+  "created_by": null
+}
+```
+
+**Action fields** [1]:
+- `commands`: `string[]` (required, commands to run)
+- `timeout_ms`: `int | null` (optional)
+- `max_output_length`: `int | null` (optional)
+
+**Environment types** (discriminated union on `environment.type`) [1]:
+- `local`: `{type: "local"}` — run on local machine
+- `container_reference`: `{type: "container_reference", id: string}` — run in existing container
+- `null` / omitted — auto/container
+
+**Status values:** `"in_progress"`, `"completed"`, `"incomplete"` [1]
+
+**Output type** (ResponseFunctionShellToolCallOutput) [1]:
+```json
+{
+  "id": "sh_out_...",
+  "type": "shell_call_output",
+  "call_id": "call_...",
+  "status": "completed",
+  "max_output_length": 4096,
+  "output": [
+    {
+      "stdout": "total 42\ndrwxr-xr-x  ...",
+      "stderr": "",
+      "outcome": {"type": "exit", "exit_code": 0}
+    }
+  ],
+  "created_by": null
+}
+```
+
+**Output.outcome types** (discriminated union on `outcome.type`) [1]:
+- `exit`: `{type: "exit", exit_code: int}`
+- `timeout`: `{type: "timeout"}`
+
+#### 34.7 local_shell_call (LocalShellCall)
+
+**Type discriminator:** `"local_shell_call"`
+
+**IMPORTANT:** This is a DISTINCT type from `shell_call` with a different action structure.
+
+**Call structure** [1]:
+```json
+{
+  "id": "lsh_...",
+  "type": "local_shell_call",
+  "call_id": "call_...",
+  "status": "completed",
+  "action": {
+    "type": "exec",
+    "command": ["ls", "-l"],
+    "env": {"KEY": "value"},
+    "timeout_ms": 120000,
+    "user": null,
+    "working_directory": "/path/to/dir"
+  }
+}
+```
+
+**Action fields** (LocalShellCallAction) [1]:
+- `type`: always `"exec"`
+- `command`: `string[]` (required — NOTE: array of strings, not a single string)
+- `env`: `Record<string, string>` (required, environment variables)
+- `timeout_ms`: `int | null` (optional)
+- `user`: `string | null` (optional user to run as)
+- `working_directory`: `string | null` (optional working directory)
+
+**Status values:** `"in_progress"`, `"completed"`, `"incomplete"` [1]
+
+**No separate output type defined in the SDK output item union.** The `local_shell_call` does not have a corresponding `local_shell_call_output` in the `ResponseOutputItem` union — it is a standalone call item. This is different from `shell_call` which has `ResponseFunctionShellToolCallOutput`.
+
+Note: The official local shell guide shows `command` as a single string in example code, but the SDK type definition uses `List[str]` (array). The SDK is the authoritative source for the wire format [1][7].
+
+#### 34.8 apply_patch_call (ResponseApplyPatchToolCall)
+
+**Type discriminator:** `"apply_patch_call"`
+
+**Call structure** [1][8]:
+```json
+{
+  "id": "apc_...",
+  "type": "apply_patch_call",
+  "call_id": "call_Rjsqzz96C5xzPb0jUWJFRTNW",
+  "status": "completed",
+  "operation": {
+    "type": "update_file",
+    "path": "lib/fib.py",
+    "diff": "@@\n-def fib(n):\n+def fibonacci(n):\n..."
+  },
+  "created_by": null
+}
+```
+
+**Operation types** (discriminated union on `operation.type`) [1]:
+- `create_file`: `{type: "create_file", path: string, diff: string}` — full file V4A diff
+- `update_file`: `{type: "update_file", path: string, diff: string}` — V4A diff
+- `delete_file`: `{type: "delete_file", path: string}` — no diff field
+
+**Status values:** `"in_progress"`, `"completed"` [1]
+
+**Output type** (ResponseApplyPatchToolCallOutput) [1]:
+```json
+{
+  "id": "apc_out_...",
+  "type": "apply_patch_call_output",
+  "call_id": "call_abc",
+  "status": "completed",
+  "output": null,
+  "created_by": null
+}
+```
+
+**Output fields** [1]:
+- `status`: `"completed"` or `"failed"`
+- `output`: `string | null` — optional error message (e.g., "Error: File not found at path 'lib/baz.py'")
+
+#### 34.9 MCP tools (mcp_list_tools, mcp_call, mcp_approval_request)
+
+**Three distinct item types** for MCP tools [1]:
+
+**34.9.1 mcp_list_tools (McpListTools)**
+
+```json
+{
+  "id": "mcp_lt_...",
+  "type": "mcp_list_tools",
+  "server_label": "my_server",
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get current weather",
+      "input_schema": {...},
+      "annotations": {...}
+    }
+  ],
+  "error": null
+}
+```
+
+**Fields** [1]:
+- `id`: string
+- `type`: always `"mcp_list_tools"`
+- `server_label`: string (required)
+- `tools`: array of `McpListToolsTool` objects with `name`, `input_schema` (required), `description`, `annotations` (optional)
+- `error`: `string | null` — error message if server could not list tools
+
+**34.9.2 mcp_call (McpCall)**
+
+```json
+{
+  "id": "mcp_c_...",
+  "type": "mcp_call",
+  "name": "get_weather",
+  "server_label": "my_server",
+  "arguments": "{\"city\": \"San Francisco\"}",
+  "status": "completed",
+  "output": "The weather in San Francisco is 65F and sunny.",
+  "error": null,
+  "approval_request_id": null
+}
+```
+
+**Fields** [1]:
+- `id`: string
+- `type`: always `"mcp_call"`
+- `name`: string (required, tool name)
+- `server_label`: string (required, MCP server label)
+- `arguments`: string (required, JSON string of arguments)
+- `status`: `"in_progress"`, `"completed"`, `"incomplete"`, `"calling"`, `"failed"` (optional)
+- `output`: `string | null` — output from the tool call
+- `error`: `string | null` — error from the tool call
+- `approval_request_id`: `string | null` — for MCP approval flow
+
+**34.9.3 mcp_approval_request (McpApprovalRequest)**
+
+```json
+{
+  "id": "mcp_ar_...",
+  "type": "mcp_approval_request",
+  "name": "delete_files",
+  "server_label": "my_server",
+  "arguments": "{\"path\": \"/important/data\"}"
+}
+```
+
+**Fields** [1]:
+- `id`: string
+- `type`: always `"mcp_approval_request"`
+- `name`: string (required, tool name)
+- `server_label`: string (required)
+- `arguments`: string (required, JSON string of arguments)
+
+#### 34.10 tool_search_call (ResponseToolSearchCall) and tool_search_output (ResponseToolSearchOutputItem)
+
+**Note:** These types are defined in the SDK but are NOT part of the `ResponseOutputItem` union in the current version. They may appear as separate item types.
+
+**34.10.1 tool_search_call** [1]:
+```json
+{
+  "id": "ts_...",
+  "type": "tool_search_call",
+  "execution": "client",
+  "call_id": "call_abc123",
+  "status": "completed",
+  "arguments": {
+    "goal": "Find the shipping ETA tool for order_42."
+  },
+  "created_by": null
+}
+```
+
+**Fields** [1]:
+- `id`: string
+- `type`: always `"tool_search_call"`
+- `execution`: `"server"` or `"client"`
+- `call_id`: `string | null` — null for server execution
+- `status`: `"in_progress"`, `"completed"`, `"incomplete"`
+- `arguments`: `object` (required, search arguments)
+
+**34.10.2 tool_search_output** [1]:
+```json
+{
+  "id": "tso_...",
+  "type": "tool_search_output",
+  "execution": "server",
+  "call_id": null,
+  "status": "completed",
+  "tools": [
+    {
+      "type": "namespace",
+      "name": "crm",
+      "tools": [
+        {"type": "function", "name": "list_open_orders", ...}
+      ]
+    }
+  ],
+  "created_by": null
+}
+```
+
+**Fields** [1]:
+- `id`: string
+- `type`: always `"tool_search_output"`
+- `execution`: `"server"` or `"client"`
+- `call_id`: `string | null`
+- `status`: `"in_progress"`, `"completed"`, `"incomplete"`
+- `tools`: array of `Tool` objects (namespaces containing function definitions)
+
+### Reference
+- [1] OpenAI Python SDK type definitions (auto-generated from OpenAPI spec) — https://github.com/openai/openai-python/tree/main/src/openai/types/responses/ (specifically: `response_output_item.py`, `response_code_interpreter_tool_call.py`, `response_function_web_search.py`, `response_file_search_tool_call.py`, `response_computer_tool_call.py`, `response_function_shell_tool_call.py`, `response_function_shell_tool_call_output.py`, `response_apply_patch_tool_call.py`, `response_apply_patch_tool_call_output.py`, `response_tool_search_call.py`, `response_tool_search_output_item.py`, `response_computer_tool_call_output_item.py`)
+- [2] OpenAI Web search guide — https://developers.openai.com/api/docs/guides/tools-web-search
+- [3] OpenAI File search guide — https://developers.openai.com/api/docs/guides/tools-file-search
+- [4] OpenAI Computer use guide — https://developers.openai.com/api/docs/guides/tools-computer-use
+- [5] OpenAI Image generation guide — https://developers.openai.com/api/docs/guides/tools-image-generation
+- [6] OpenAI Shell tool guide — https://developers.openai.com/api/docs/guides/tools-shell
+- [7] OpenAI Local shell guide — https://developers.openai.com/api/docs/guides/tools-local-shell
+- [8] OpenAI Apply patch guide — https://developers.openai.com/api/docs/guides/tools-apply-patch
+
+## 35. Built-in tool conversion design: schema-less tool type → Anthropic custom tool
+
+### Description
+How should the proxy handle OpenAI Responses API built-in tool types when they appear in the request's `tools` array? Specifically: what schema to register, how response output items map back, and whether parameters can be perfectly forwarded.
+
+### Result
+All built-in tool types are converted to Anthropic custom tools (`type: "custom"`) with derived `input_schema`. The response direction uniformly returns `function_call` for all built-in tools.
+
+**Why custom tools, not Anthropic native tools:** Anthropic native tools (web_search_20260305, bash_20250124, etc.) [1] carry server-side execution semantics — the Anthropic API executes them and returns results inline. In a proxy context, the downstream client owns tool execution. Custom tools let the model generate `tool_use` blocks that the proxy converts to Responses API `function_call` items.
+
+**Why `function_call` for all tools, not native built-in output types:** Round-trip consistency requires that tool registration → tool call → tool result form a closed loop where `tool_use.input` is preserved exactly. `function_call.arguments` serializes `tool_use.input` as a JSON string — lossless, no reconstruction needed. Native built-in output types (e.g., `web_search_call`) mix model input with execution metadata (`status`, `id`) and some don't preserve model input at all (`image_generation_call` has `result` but no `prompt` field) [2]. Using `function_call` guarantees: schema ↔ `tool_use.input` ↔ `function_call.arguments` ↔ `tool_use.input` consistency with zero reconstruction logic.
+
+**Schema structure requirement:** Both Anthropic native tools and OpenAI built-in tools are schema-less [1][2]. The derived schema mirrors the nested structure of the corresponding output item's call parameters:
+- Tools with `action` wrapper (web_search, computer_use, shell, local_shell): schema top-level = `action` object
+- Tools with `operation` wrapper (apply_patch): schema top-level = `operation` object
+- Tools with flat call fields (file_search, code_interpreter, mcp_call, tool_search): schema top-level = flat fields
+
+**Perfect forwarding:** The model's `tool_use.input` is serialized as `function_call.arguments` (JSON string). On subsequent turns, `function_call.arguments` is parsed back to `tool_use.input`. Zero loss, zero reconstruction.
+
+**Tool config fields (dropped):** Built-in tools carry configuration (e.g., `web_search.search_context_size`, `file_search.vector_store_ids`, `computer_use_preview.display_width`) that controls OpenAI server-side behavior. These have no Anthropic equivalent and are dropped during conversion.
+
+### Reference
+- [1] Entry #33 — Anthropic native tool types
+- [2] Entry #34 — OpenAI built-in tool output item structures (source for derived input_schema)
+
+---
+
+## 36. OpenAI Responses API `{"type": "mcp"}` tool: exact field structure, discovery flow, and output items
+
+### Description
+What is the exact field structure of `{"type": "mcp", ...}` in the Responses API `tools` array? How does MCP tool discovery work (does OpenAI connect to MCP servers server-side)? What output item types does the MCP tool produce? And what is the relationship between `{"type": "mcp"}` in the request and `mcp_call`/`mcp_list_tools` output items?
+
+### Result
+
+**Field structure — remote MCP server variant:**
+```json
+{
+  "type": "mcp",
+  "server_label": "dmcp",
+  "server_description": "A Dungeons and Dragons MCP server.",
+  "server_url": "https://dmcp-server.deno.dev/sse",
+  "require_approval": "never",
+  "allowed_tools": ["roll"],
+  "authorization": "<OAuth token>",
+  "defer_loading": false
+}
+```
+
+**Field structure — connector variant (built-in MCP wrappers for third-party services):**
+```json
+{
+  "type": "mcp",
+  "server_label": "google_calendar",
+  "connector_id": "connector_googlecalendar",
+  "authorization": "ya29.A0AS3H6...",
+  "require_approval": "never"
+}
+```
+
+Available connector IDs: `connector_dropbox`, `connector_gmail`, `connector_googlecalendar`, `connector_googledrive`, `connector_microsoftteams`, `connector_outlookcalendar`, `connector_outlookemail`, `connector_sharepoint` [1].
+
+**Field descriptions:**
+| Field | Required | Description |
+|-------|----------|-------------|
+| `type` | Yes | Must be `"mcp"` |
+| `server_label` | Yes | User-defined label identifying the MCP server (used in output items) |
+| `server_url` | No* | URL of the remote MCP server (Streamable HTTP or HTTP/SSE transport). Required for remote servers, mutually exclusive with `connector_id` |
+| `server_description` | No | Description to help the model understand the server's purpose |
+| `connector_id` | No* | ID of a built-in connector. Mutually exclusive with `server_url` |
+| `require_approval` | No | Controls tool approval: `"never"`, `"always"`, or `{"never": {"tool_names": ["tool1"]}}` for per-tool granularity. Default requires approval for all tools |
+| `allowed_tools` | No | Allowlist of tool names the model can use. Omit to allow all |
+| `authorization` | No | OAuth token for the MCP server or connector. Not stored by OpenAI — must be sent with every request |
+| `defer_loading` | No | If `true`, tools are not loaded at request start. Model uses `tool_search` to discover tools on demand |
+
+**MCP tool discovery flow (server-side):** When a request includes `{"type": "mcp", "server_url": "..."}`, OpenAI's servers connect to the specified MCP server endpoint, call `tools/list`, and register all discovered tools in the response context. The discovered tools are cached in the context — if `previous_response_id` is used to continue the conversation, `mcp_list_tools` is not re-fetched. When `defer_loading: true` is set, tools are not loaded initially; instead, the model uses `tool_search` to discover tools on demand [1][2].
+
+**This is a hosted tool — OpenAI's servers handle MCP execution server-side.** The caller does not connect to the MCP server. A format-only proxy CANNOT handle `{"type": "mcp"}` because the MCP tool execution happens on OpenAI's infrastructure [1].
+
+**Output item types produced by the MCP tool flow:**
+
+1. `mcp_list_tools` — produced after tool discovery, contains available tools:
+```json
+{
+  "id": "mcpl_68a6102a4968819c8177b05584dd627b0679e572a900e618",
+  "type": "mcp_list_tools",
+  "server_label": "dmcp",
+  "tools": [
+    {
+      "annotations": null,
+      "description": "Given a string of text describing a dice roll...",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"diceRollExpression": {"type": "string"}},
+        "required": ["diceRollExpression"],
+        "additionalProperties": false
+      },
+      "name": "roll"
+    }
+  ]
+}
+```
+
+2. `mcp_call` — produced when the model invokes an MCP tool:
+```json
+{
+  "id": "mcp_68a6102d8948819c9b1490d36d5ffa4a0679e572a900e618",
+  "type": "mcp_call",
+  "approval_request_id": null,
+  "arguments": "{\"diceRollExpression\":\"2d4 + 1\"}",
+  "error": null,
+  "name": "roll",
+  "output": "4",
+  "server_label": "dmcp"
+}
+```
+
+3. `mcp_approval_request` — produced when tool requires human approval (based on `require_approval` setting):
+```json
+{
+  "id": "mcpr_68a619e1d82c8190b50c1ccba7ad18ef0d2d23a86136d339",
+  "type": "mcp_approval_request",
+  "arguments": "{\"diceRollExpression\":\"2d4 + 1\"}",
+  "name": "roll",
+  "server_label": "dmcp"
+}
+```
+
+4. `mcp_approval_response` — input item sent by the client to approve/reject:
+```json
+{
+  "type": "mcp_approval_response",
+  "approve": true,
+  "approval_request_id": "mcpr_682d498e3bd4819196a0ce1664f8e77b04ad1e533afccbfa"
+}
+```
+
+**Relationship between `{"type": "mcp"}` and output items:** The `{"type": "mcp"}` tool in the request tells OpenAI's servers to connect to the MCP server at `server_url`. The server then: (a) connects and calls `tools/list`, emitting `mcp_list_tools`; (b) when the model decides to use a tool, emits `mcp_call` after executing it server-side; (c) if approval is required, emits `mcp_approval_request` and waits for `mcp_approval_response` input before executing [1][2].
+
+### Reference
+- [1] OpenAI "Use MCP tools and connectors" guide — https://developers.openai.com/api/docs/guides/tools-connectors-mcp
+- [2] OpenAI Cookbook "Connecting to MCP servers" guide — https://cookbook.openai.com/examples/mcp/mcp_tool
+
+---
+
+## 37. Codex CLI MCP tool wire format: `{"type": "namespace"}` wrapping (not `{"type": "mcp"}`)
+
+### Description
+Does Codex CLI use the public `{"type": "mcp"}` tool type on the wire, or does it use a different mechanism? This is critical for the proxy design because the wire format determines what the proxy actually receives and must convert.
+
+### Result
+
+**Codex CLI does NOT use `{"type": "mcp"}` on the wire.** Instead, it wraps MCP tools using a `{"type": "namespace"}` tool type that is a proprietary ChatGPT-backend extension, NOT part of the public Responses API spec [1][2].
+
+**Wire format (what Codex sends to the backend):**
+```json
+{
+  "type": "namespace",
+  "name": "mcp__memory__",
+  "tools": [
+    {
+      "type": "function",
+      "name": "read_entities",
+      "parameters": {
+        "type": "object",
+        "properties": {...},
+        "required": [...]
+      }
+    },
+    ...
+  ]
+}
+```
+
+The backend responds with:
+```json
+{
+  "type": "function_call",
+  "id": "fc_...",
+  "call_id": "call_...",
+  "name": "read_entities",
+  "namespace": "mcp__memory__",
+  "arguments": "{...}",
+  "status": "completed"
+}
+```
+
+Codex uses the `namespace` field in `function_call` response items to route the call to the correct MCP server. It does NOT use tool name prefixes for routing — the `namespace` field is the routing mechanism [2].
+
+**Why this matters for the proxy:**
+
+1. **The `{"type": "namespace"}` type is proprietary** — only the ChatGPT websocket backend understands it. Custom backends (llama.cpp, LM Studio, DeepSeek, Ollama) cannot handle it — tools get silently dropped or rejected [1].
+
+2. **Codex issue #23186** tracks this problem: when using custom `model_providers.X` with `wire_api = "responses"` and transport `responses_http`, the `namespace` type is sent but not understood by non-ChatGPT backends. The proposed fix is to flatten namespace tools into top-level `{"type": "function", "function": {"name": "mcp__<server>__<tool>", "parameters": {...}}}` [1].
+
+3. **For our proxy:** We will receive `{"type": "namespace", "name": "mcp__<server>__", "tools": [...]}` in the request tools array (not `{"type": "mcp"}`). The proxy must flatten these into Anthropic custom tools with names like `mcp__<server>__<tool>`. On the response path, the proxy must reconstruct the `namespace` field in `function_call` items so Codex can route tool calls to the correct MCP server. This is already described in the spec's MCP Namespace Handling section [3].
+
+4. **`{"type": "mcp"}` is irrelevant for Codex proxy scenarios** — Codex never sends it. The `{"type": "mcp"}` type in the public Responses API is a hosted tool where OpenAI's servers handle MCP execution server-side [36]. Codex handles MCP execution client-side and therefore uses the namespace-based approach instead.
+
+**How existing implementations handle this:**
+
+- **Codex CLI** [2]: Uses `{"type": "namespace"}` wrapping natively. The MCP handler in `codex-rs/core/src/tools/handlers/mcp.rs` registers tools with the session, and `codex-rs/core/src/session/mcp.rs` packages them as namespace tools for the Responses API request. The `responses_api.rs` tool serialization handles the namespace wrapping.
+
+- **Proposed Codex fix (issue #23186)** [1]: Flatten into top-level function tools with `mcp__<server>__<tool>` naming convention. This would make tools compatible with any Responses API backend but loses the namespace-based routing that Codex relies on.
+
+- **Our proxy design (spec section "MCP Namespace Handling")** [3]: Takes the namespace tools from the request, flattens them into Anthropic custom tools with composite names, maintains a registry for round-trip reconstruction, and emits `function_call` items with the `namespace` field on the response path. This preserves Codex's routing mechanism while converting to/from Anthropic's format.
+
+### Reference
+- [1] Codex CLI issue #23186 — "MCP tools silently dropped with custom backends" — https://github.com/openai/codex/issues/23186
+- [2] Codex CLI source code: `codex-rs/core/src/tools/handlers/mcp.rs`, `codex-rs/core/src/session/mcp.rs`, `codex-rs/tools/src/responses_api.rs` — https://github.com/openai/codex
+- [3] Design spec "MCP Namespace Handling" section — `docs/superpowers/specs/2026-05-13-codex-conv-design.md`
+- [4] Entry #36 — OpenAI Responses API `{"type": "mcp"}` tool field structure
