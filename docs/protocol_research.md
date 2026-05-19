@@ -604,7 +604,8 @@ Which fields from each API have NO meaningful equivalent on the other side and m
 | `n` | Forced to `1` | Number of response choices. Removed from Responses API spec (was in Chat Completions). Codex never sends it. Anthropic always returns a single response | OpenAI [1] |
 | `metadata.*` (non-`user_id` keys) | Stripped | Anthropic `metadata` only supports `user_id` (string, max 256 chars). OpenAI `metadata` accepts arbitrary key-value pairs. Only `user_id` is forwarded | OpenAI [1], Anthropic [2] |
 | `service_tier` (`"flex"`, `"priority"`, `"scale"`) | Omitted from Anthropic request | These OpenAI service tiers have no Anthropic equivalent. `"auto"` and `"default"` map to Anthropic `"auto"` and `"standard_only"`. The three unmappable tiers are silently dropped | OpenAI [1], Anthropic [2], entry #19 |
-| `text` (format configuration) | Ignored (stripped) | OpenAI structured output configuration (`{format: {type: "json_schema", schema: ...}}`). Anthropic uses `output_config.format` for the same purpose but with a different schema structure. Codex never sends `text.format` | OpenAI [1], Anthropic [2] |
+| `text.format` (JSON schema output) | Converted to `output_config.format` | OpenAI `text.format` with `type: "json_schema"` maps to Anthropic `output_config.format`. Only `schema` is forwarded — `name` and `strict` have no Anthropic equivalent (Anthropic enforces schema compliance by default). See spec `text.format` → `output_config.format` Mapping section | OpenAI [1], Anthropic [2], entry #38 |
+| `text.verbosity` | Ignored (stripped) | OpenAI output verbosity control (`"low"/"medium"/"high"`). Anthropic has no equivalent parameter | OpenAI [1] |
 | `user` | Ignored (stripped) | OpenAI end-user identifier. While Anthropic has `metadata.user_id`, the `user` field from OpenAI is a different mechanism. If `metadata.user_id` is present, that takes precedence. Codex does not send `user` | OpenAI [1] |
 | Built-in tool types (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`) | Rejected with 400 | These are Responses API built-in tool types (not function-type). Anthropic has no equivalent for web search/file search/code interpreter as built-in tools. Codex never sends these (uses only function-type tools) | OpenAI [1], entry #14 |
 | Input `reasoning.content` field | Not forwarded | OpenAI reasoning items can carry a `content` field (array of `{type: "reasoning_text", text}` for raw reasoning text from GPT-OSS models). Anthropic has no raw reasoning text concept — only `thinking` (summary) and `redacted_thinking`. The proxy maps `summary` only | OpenAI [1], entry #9 |
@@ -648,7 +649,7 @@ These Anthropic request fields exist in the API but Codex CLI never generates th
 | `container` | Container lifecycle management. Codex doesn't use Anthropic containers | Anthropic [2] |
 | `inference_geo` | Geographic inference routing. Codex doesn't send this | Anthropic [2] |
 | `mcp_servers` | Anthropic native MCP support (proxy handles MCP at the Codex level via namespace flattening) | Anthropic [2] |
-| `output_config.format` | Anthropic structured output. Codex doesn't request structured output format | Anthropic [2] |
+| `output_config.format` | Mapped from `text.format` when present. Codex sends `text.format` with JSON schema for structured output (name: `"codex_output_schema"`) | Anthropic [2], entry #38 |
 | `tools[].cache_control` | Anthropic cache breakpoint on tool definitions. Codex may send `cache_control` on content, but not specifically on tool definitions | Anthropic [2] |
 | `tools[].type` | Anthropic `custom` tool type. Proxy always generates `custom` type | Anthropic [2] |
 | `tools[].allowed_callers` | Anthropic tool access control. Not applicable in proxy context | Anthropic [2] |
@@ -1884,3 +1885,45 @@ Codex uses the `namespace` field in `function_call` response items to route the 
 - [2] Codex CLI source code: `codex-rs/core/src/tools/handlers/mcp.rs`, `codex-rs/core/src/session/mcp.rs`, `codex-rs/tools/src/responses_api.rs` — https://github.com/openai/codex
 - [3] Design spec "MCP Namespace Handling" section — `docs/superpowers/specs/2026-05-13-codex-conv-design.md`
 - [4] Entry #36 — OpenAI Responses API `{"type": "mcp"}` tool field structure
+
+---
+
+## 38. Comprehensive spec audit: missing conversion coverage
+
+### Description
+Full audit of the design spec against latest Anthropic Messages API, OpenAI Responses API, and Codex CLI source code to identify missing conversion coverage. Goal: maximize feature conversion support without introducing non-conversion-essential behavioral logic.
+
+### Result
+
+Verified against official sources. The following gaps were identified and fixed:
+
+**`output_config` and `thinking.display` confirmed real** [1][2][3]:
+- `output_config` is a top-level Anthropic request parameter with `effort` and `format` sub-fields, documented at `/api/messages/create`
+- `thinking.display` is a request parameter accepting `"summarized"` and `"omitted"`, documented at Extended Thinking docs
+
+**New conversion mappings added:**
+1. `{"type": "custom"}` tool type — Codex uses this for freeform tools (e.g., apply_patch with Lark grammar). Mapped to Anthropic custom tool with derived `input_schema` [4]
+2. `{"type": "computer"}` and `{"type": "web_search_preview"}` — GA/preview variants of existing types. Same schema mapping [5]
+3. `text.format` → `output_config.format` — Codex sends `text.format` with `type: "json_schema"`, `name: "codex_output_schema"`, and a JSON schema for structured output. Anthropic's `output_config.format` only accepts `type` and `schema` — `name` and `strict` have no Anthropic equivalent. Verified against OpenAI Python SDK (`ResponseFormatTextJSONSchemaConfig`), Anthropic Python SDK (`JSONOutputFormatParam` with only `type` + `schema`), and Codex CLI source (`TextFormat` struct in `common.rs`) [4][5][6][7]
+4. `tool_search_output` input item — tool discovery metadata. Dropped (tools already registered in current request) [4]
+5. `mcp_tool_call_output` input item — Codex-specific variant for MCP tool results. Mapped same as `function_call_output` [4]
+6. Unknown input items — Codex uses `#[serde(other)]` catch-all. Proxy drops with warning log [4]
+7. `usage.total_tokens` — computed as `input_tokens + output_tokens` in response [5]
+8. `response.completed` response object — added `object`, `created_at`, `completed_at`, `model`, `metadata`, `parallel_tool_calls`, `tool_choice`, `instructions` fields [5]
+9. `input_file` content block — dropped (Anthropic `document` block has different schema) [1]
+10. `incomplete_details.reason: "content_filter"` — documented as not producible from Anthropic signals [5]
+
+**Dropped fields documented (13 new entries):** `user`, `safety_identifier`, `max_tool_calls`, `top_logprobs`, `background`, `conversation`, `context_management`, `prompt`, `prompt_cache_retention`, `verbosity` (top-level), `stream_options`, `reasoning.generate_summary` [5]
+
+**Non-gaps verified:**
+- `custom_tool_call_input.delta` SSE event — not needed because Codex maps both it and `function_call_arguments.delta` to the same `ToolCallInputDelta` handler [4]
+- `success` field on `function_call_output` — `skip_serializing_if None` means present only when explicitly set; mapping is correct when present [4]
+
+### Reference
+- [1] Anthropic Messages API: Create a Message — https://platform.claude.com/docs/en/api/messages/create
+- [2] Anthropic Extended Thinking — https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+- [3] Anthropic Adaptive Thinking — https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+- [4] Codex CLI source code: `codex-rs/codex-api/src/common.rs`, `codex-rs/protocol/src/models.rs`, `codex-rs/tools/src/tool_spec.rs`, `codex-rs/codex-api/src/sse/responses.rs` — https://github.com/openai/codex
+- [5] OpenAI Responses API — https://developers.openai.com/api/reference/responses/
+- [6] OpenAI Python SDK: `ResponseFormatTextJSONSchemaConfig` — https://github.com/openai/openai-python/blob/master/src/openai/types/responses/response_format_text_json_schema_config.py (flat structure with `name`, `schema`, `strict` as siblings of `type`)
+- [7] Anthropic Python SDK: `JSONOutputFormatParam` — https://github.com/anthropics/anthropic-sdk-python/blob/master/src/anthropic/types/json_output_format_param.py (only `type` and `schema`, no `name` or `strict`)

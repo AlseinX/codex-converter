@@ -184,6 +184,8 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `max_output_tokens` | `max_tokens` | Field name differs |
 | `metadata` | `metadata` | Forward `user_id`, strip other keys |
 | `service_tier` | `service_tier` | Value mapping, see Unsupported Features section |
+| `text.format` | `output_config.format` | See `text.format` → `output_config.format` Mapping below |
+| `text.verbosity` | — | Ignored (stripped). Anthropic has no verbosity control |
 
 #### Upstream HTTP Headers
 
@@ -291,6 +293,18 @@ The `instructions` string is wrapped: `"instructions text"` → `[{"type": "text
 
 Omit `system` parameter entirely if both `instructions` and system input items are empty.
 
+#### `text.format` → `output_config.format` Mapping
+
+Codex sends `text.format` when requesting structured JSON output. Both APIs use a flat structure, but Anthropic has fewer fields:
+
+| OpenAI `text.format` | Anthropic `output_config.format` | Notes |
+|---|---|---|
+| `{"type": "text"}` | Omit `output_config.format` | Default plain text — no format constraint |
+| `{"type": "json_object"}` | `{"type": "json_object"}` | Direct match (older JSON mode) |
+| `{"type": "json_schema", "name": "...", "schema": {...}, "strict": bool}` | `{"type": "json_schema", "schema": {...}}` | Forward `schema` only. `name` and `strict` have no Anthropic equivalent — Anthropic enforces schema compliance by default |
+
+Codex's `create_text_param_for_request` constructs `text.format` with `type: "json_schema"`, `name: "codex_output_schema"`, and a user-provided JSON schema. The `name` and `strict` fields are dropped during conversion — Anthropic's `output_config.format` only accepts `type` and `schema`.
+
 #### Input Items → Messages
 
 | Responses API input item | Anthropic message |
@@ -306,6 +320,9 @@ Omit `system` parameter entirely if both `instructions` and system input items a
 | `{"type":"compaction","encrypted_content":"..."}` | Dropped — opaque OpenAI context management data, no Anthropic equivalent |
 | `{"type":"context_compaction","encrypted_content":"..."}` | Dropped — same as `compaction` |
 | `{"type":"compaction_trigger"}` | Dropped — same as `compaction` |
+| `{"type":"tool_search_output","call_id":"...","status":"...","execution":"...","tools":[...]}` | Dropped — tool discovery metadata from a previous tool search. The relevant tools have already been registered in the current request's `tools` array. No Anthropic equivalent |
+| `{"type":"mcp_tool_call_output","call_id":"...","output":{...}}` | Same mapping as `function_call_output`: `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"<output as JSON string>"}]}`. Codex-specific variant for MCP tool results (uses `CallToolResult` from the MCP library instead of `FunctionCallOutputPayload`). The `output` is an object, not a string — serialize to JSON string for `tool_result.content`. Uses `call_id` for ID lookup in the same bidirectional map |
+| Unknown input item types | Dropped with warning log. Codex uses `#[serde(other)]` catch-all for unknown items. The proxy follows the same behavior — unknown types are consumed and discarded to maintain forward compatibility with future API additions |
 | Built-in tool history items (`web_search_call`, `file_search_call`, `code_interpreter_call`, `computer_call`, `computer_call_output`, `image_generation_call`, `shell_call`, `shell_call_output`, `local_shell_call`, `apply_patch_call`, `apply_patch_call_output`, `mcp_call`, `tool_search_call`) | See Built-in Tool Conversion → Input Direction section for per-type mapping |
 
 Key details:
@@ -331,6 +348,7 @@ Key details:
 | `{"type":"input_text","text":"..."}` | `{"type":"text","text":"..."}` |
 | `{"type":"input_image","image_url":"..."}` | `{"type":"image","source":{"type":"url","url":"..."}}` |
 | `{"type":"input_image","image_url":{"url":"data:image/png;base64,..."}}` | `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}` |
+| `{"type":"input_file","file_url":"..."}` | Dropped — Anthropic has no generic file input content block type. Anthropic supports `document` blocks for PDF/text files, but the schema differs significantly from OpenAI's `input_file`. Codex does not currently send `input_file` items |
 
 #### `cache_control` Handling (Reference: LiteLLM)
 
@@ -370,6 +388,8 @@ tool_use → function_call details:
 | `refusal` | `"completed"` (model declined to generate content) |
 | `model_context_window_exceeded` | `"incomplete"`, `incomplete_details.reason: "max_output_tokens"`. Emits `response.incomplete` event. Available on Sonnet 4.5+ by default; earlier models need beta header |
 
+Note: The Responses API defines `incomplete_details.reason: "content_filter"` as a valid value. Anthropic does not have a distinct "content filter" stop reason — content filtering manifests as `refusal` stop reason (mapped to `"completed"`) or as a streaming `error` event. If Anthropic returns a streaming error due to content policy, the proxy maps it through the standard error handling path (`response.failed`). If a need arises to distinguish content filter from other errors in the future, the error message text can be inspected, but the proxy does not fabricate `incomplete_details.reason: "content_filter"` since no Anthropic signal produces it.
+
 #### Usage Mapping
 
 | Anthropic | Responses API |
@@ -378,6 +398,7 @@ tool_use → function_call details:
 | `usage.output_tokens` | `usage.output_tokens` |
 | `usage.cache_creation_input_tokens` | Included in `usage.input_tokens` (no separate field in Responses API) |
 | `usage.cache_read_input_tokens` | `usage.input_tokens_details.cached_tokens` |
+| *(computed)* | `usage.total_tokens` = `input_tokens` + `output_tokens` |
 
 `cache_creation_input_tokens` represents cache write cost (future savings), `cache_read_input_tokens` represents cache hits (current savings). Only cache reads map to `cached_tokens` — this matches the semantic meaning of "tokens served from cache." Cache creation tokens are folded into `input_tokens` total. Reference: CLIProxyAPI Chat Completions path uses the same mapping.
 
@@ -475,6 +496,28 @@ Response IDs are passed through from Anthropic where possible:
 | Function call output | Proxy-generated | `fc_{sequential}` |
 
 Codex CLI treats all IDs as opaque strings with no format validation. Reference: CLIProxyAPI passes Anthropic `msg_...` IDs directly.
+
+#### Response Object Structure
+
+The `response.completed` and `response.incomplete` events carry a full response object. Fields included:
+
+| Field | Source | Notes |
+|---|---|---|
+| `id` | Anthropic `message_start.message.id` | Passthrough |
+| `object` | Fixed `"response"` | Responses API type discriminator |
+| `created_at` | Proxy-generated | Unix timestamp at `response.created` emission |
+| `completed_at` | Proxy-generated | Unix timestamp at `response.completed` emission |
+| `model` | Request `model` field | Echo back the model the client sent in the request. Anthropic returns its own `model` field in the response, but it may differ from the request (e.g., sub-version routing). The proxy uses the request model to avoid confusion |
+| `status` | Mapped from `stop_reason` | See Stop Reason → Status table |
+| `output` | Accumulated during streaming | All output items generated during the request |
+| `usage` | Mapped from Anthropic `usage` | See Usage Mapping table |
+| `incomplete_details` | Conditional | Only present when `status: "incomplete"`, with `reason: "max_output_tokens"` |
+| `metadata` | `null` | Proxy does not store metadata |
+| `parallel_tool_calls` | From request | Echo back request value |
+| `tool_choice` | From request | Echo back request value |
+| `instructions` | From request | Echo back request value |
+
+Fields omitted from the response object: `temperature`, `top_p`, `max_output_tokens`, `reasoning`, `text`, `previous_response_id`, `truncation`, `store`, `stream`, `stream_options`, `user` — these are request-only fields that the Responses API echoes back for stateless replay, but the proxy's response object does not need them since Codex maintains its own state.
 
 #### SSE Wire Format Examples
 
@@ -608,10 +651,21 @@ The following Responses API features have no Anthropic equivalent and are handle
 | `include` | Ignored (stripped) | Requests encrypted reasoning content. Anthropic returns thinking content inline via `thinking` blocks, not via `include` |
 | `truncation` | Ignored (stripped) | Input context truncation control. Codex never sends this field. Anthropic naturally errors on context overflow (equivalent to `"disabled"` behavior) |
 | `n` | Ignored (forced `1`) | Not in Responses API spec (removed from Chat Completions). Codex never sends it. Anthropic always returns single response |
-| Built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`, `local_shell`, `shell`, `apply_patch`, `mcp`, `tool_search`) | Converted to Anthropic custom tools with derived `input_schema` | See Built-in Tool Conversion section. All tools are the client's tools — the proxy converts format only |
-| `text.verbosity` | Ignored (stripped) | OpenAI output verbosity control (`"low"/"medium"/"high"`). Anthropic has no equivalent parameter |
+| Built-in tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`, `local_shell`, `shell`, `apply_patch`, `mcp`, `tool_search`, `custom`) | Converted to Anthropic custom tools with derived `input_schema` | See Built-in Tool Conversion section. All tools are the client's tools — the proxy converts format only |
 | `client_metadata` | Ignored (stripped) | OpenAI telemetry field containing installation ID and W3C trace context. Anthropic has no equivalent |
 | `prompt_cache_key` | Ignored (stripped) | OpenAI server-side response caching key (set to thread ID). Anthropic has no server-side storage |
+| `user` | Ignored (stripped) | Deprecated in favor of `safety_identifier`. Use `metadata.user_id` for user identification. Anthropic uses `metadata.user_id` directly |
+| `safety_identifier` | Ignored (stripped) | OpenAI abuse detection identifier. Anthropic has no per-request safety identifier |
+| `max_tool_calls` | Ignored (stripped) | OpenAI limit on built-in tool calls per response. Anthropic has no equivalent |
+| `top_logprobs` | Ignored (stripped) | OpenAI log probability reporting. Anthropic has no logprobs feature in Messages API |
+| `background` | Ignored (stripped) | OpenAI async/background mode. Proxy handles requests synchronously |
+| `conversation` | Ignored (stripped) | OpenAI conversation-scoped requests (alternative to `input`). Codex uses `input` array |
+| `context_management` | Ignored (stripped) | OpenAI context compaction config. Anthropic handles context differently |
+| `prompt` | Ignored (stripped) | OpenAI prompt template reference. Codex uses `input` array directly |
+| `prompt_cache_retention` | Ignored (stripped) | OpenAI prompt cache retention policy. Related to `prompt_cache_key` |
+| `verbosity` (top-level) | Ignored (stripped) | OpenAI top-level verbosity control. Redundant with `text.verbosity`. Anthropic has no equivalent |
+| `stream_options` | Ignored (stripped) | OpenAI streaming options (e.g., `include_usage`). Proxy controls streaming behavior internally |
+| `reasoning.generate_summary` | Ignored (stripped) | Deprecated field. Replaced by `reasoning.summary`. Codex uses `reasoning.summary` |
 
 #### Forwarded Fields (with mapping)
 
@@ -660,6 +714,9 @@ Each OpenAI built-in tool type in the `tools` array is converted to an Anthropic
 | `{"type": "apply_patch", ...}` | `{"type": "custom", "name": "apply_patch", "input_schema": {...}}` | Schema mirrors `apply_patch_call.operation` |
 | `{"type": "mcp", ...}` | **Dropped** (cannot convert) | Server-side hosted tool — OpenAI connects to MCP server and executes calls. A format-only proxy cannot replicate this. Codex does not use this type (uses `{"type": "namespace"}` instead, see MCP Namespace Handling) |
 | `{"type": "tool_search", ...}` | `{"type": "custom", "name": "tool_search", "input_schema": {...}}` | Schema mirrors `tool_search_call.arguments` |
+| `{"type": "custom", ...}` | `{"type": "custom", "name": "<name>", "input_schema": {...}}` | Freeform/custom tools. Two sub-cases: (1) If `parameters` (JSON Schema) is present, use it directly as `input_schema`. (2) If only `format` (grammar definition) is present, provide a minimal `input_schema` that accepts the raw grammar string as a single field — the proxy cannot fully convert a Lark grammar to JSON Schema, so the schema captures the grammar input as an opaque string. Codex uses this type for freeform tools (e.g., `apply_patch` with Lark grammar where `format.type: "lark"`) |
+| `{"type": "computer", ...}` | `{"type": "custom", "name": "computer_use", "input_schema": {...}}` | GA version of `computer_use_preview`. Same schema as `computer_use_preview` |
+| `{"type": "web_search_preview", ...}` | `{"type": "custom", "name": "web_search", "input_schema": {...}}` | Preview variant of `web_search`. Same schema as `web_search` |
 
 **Tool config passthrough:** Built-in tools may carry configuration fields (e.g., `web_search.user_location`, `web_search.search_context_size`, `file_search.vector_store_ids`, `computer_use_preview.display_width`, `image_generation.input_image_mask`). These configuration fields have no Anthropic equivalent and are **dropped** during request conversion. They control server-side behavior on OpenAI's infrastructure that is not applicable when proxying to Anthropic. The custom tool schema only captures the parameters the model needs to generate in a tool call.
 
@@ -1109,7 +1166,7 @@ Test the Conversion Task state machine as a whole:
 | Completion | Each stop_reason → correct status mapping, usage mapping |
 | Error paths | Anthropic streaming error → correct error + response.failed + [DONE] sequence |
 | Namespace lifecycle | Flatten + build in request phase → lookup + restore in response phase |
-| Edge cases | Empty content, long tool name truncation+hash, unknown tool, consecutive function_call merge, consecutive function_call_output merge, built-in tool conversion, built-in tool history item mapping |
+| Edge cases | Empty content, long tool name truncation+hash, unknown tool, unknown input item types (dropped with warning), consecutive function_call merge, consecutive function_call_output merge, built-in tool conversion, built-in tool history item mapping, custom tool type registration, text.format → output_config.format, response object field completeness |
 | Config system | Three-way injection priority, Option semantics, defaults |
 | URL routing | Protocol normalization, various upstream paths, invalid path rejection |
 
