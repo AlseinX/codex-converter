@@ -481,41 +481,47 @@ fn convert_input_items(
         }
 
         // Determine the role and content blocks for this input item.
-        let (role, content_blocks) = convert_single_input_item(task, item)?;
+        // A single input item may produce multiple messages (e.g., call-with-result items).
+        let emitted = convert_single_input_item(task, item)?;
 
-        // Skip items that produce no content (dropped types).
-        let role = match role {
-            Some(r) => r,
-            None => continue,
-        };
+        for (role, content_blocks) in emitted {
+            // Skip items that produce no content (dropped types).
+            let role = match role {
+                Some(r) => r,
+                None => continue,
+            };
 
-        // Merge with previous message if same role (alternation enforcement).
-        if let Some(last) = messages.last_mut() {
-            let last_role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if last_role == role {
-                if let Some(arr) = last.get_mut("content").and_then(|v| v.as_array_mut()) {
-                    arr.extend(content_blocks);
+            // Merge with previous message if same role (alternation enforcement).
+            if let Some(last) = messages.last_mut() {
+                let last_role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if last_role == role {
+                    if let Some(arr) = last.get_mut("content").and_then(|v| v.as_array_mut()) {
+                        arr.extend(content_blocks);
+                    }
+                    continue;
                 }
-                continue;
             }
-        }
 
-        messages.push(json!({
-            "role": role,
-            "content": content_blocks,
-        }));
+            messages.push(json!({
+                "role": role,
+                "content": content_blocks,
+            }));
+        }
     }
 
     Ok(Value::Array(messages))
 }
 
-/// Convert a single input item into (role, content_blocks).
+/// Convert a single input item into a list of (role, content_blocks) tuples.
 ///
-/// Returns (None, []) for items that should be dropped.
+/// Most items produce exactly one tuple. Call-with-result items (e.g., file_search_call,
+/// mcp_call) produce two: an assistant tool_use followed by a user tool_result.
+///
+/// Returns an empty Vec for items that should be dropped.
 fn convert_single_input_item(
     task: &mut ConversionTask,
     item: &Value,
-) -> Result<(Option<String>, Vec<Value>), RequestConversionError> {
+) -> Result<Vec<(Option<String>, Vec<Value>)>, RequestConversionError> {
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match item_type {
@@ -527,7 +533,7 @@ fn convert_single_input_item(
                 .to_string();
             let content = item.get("content").cloned().unwrap_or(json!([]));
             let blocks = convert_message_content(&content);
-            Ok((Some(role), blocks))
+            Ok(vec![(Some(role), blocks)])
         }
         "function_call" | "custom_tool_call" => {
             let call_id = item
@@ -567,7 +573,7 @@ fn convert_single_input_item(
                 "input": parsed_input,
             });
 
-            Ok((Some("assistant".to_string()), vec![tool_use]))
+            Ok(vec![(Some("assistant".to_string()), vec![tool_use])])
         }
         "function_call_output" | "custom_tool_call_output" => {
             let call_id = item
@@ -600,7 +606,7 @@ fn convert_single_input_item(
                 "content": content,
             });
 
-            Ok((Some("user".to_string()), vec![tool_result]))
+            Ok(vec![(Some("user".to_string()), vec![tool_result])])
         }
         "mcp_tool_call_output" => {
             let call_id = item
@@ -638,7 +644,7 @@ fn convert_single_input_item(
                 // When false or absent, omit is_error entirely.
             }
 
-            Ok((Some("user".to_string()), vec![tool_result]))
+            Ok(vec![(Some("user".to_string()), vec![tool_result])])
         }
         "reasoning" => {
             let reasoning_id = item
@@ -661,20 +667,436 @@ fn convert_single_input_item(
                 &reasoning_id,
             );
 
-            Ok((Some("assistant".to_string()), vec![block]))
+            Ok(vec![(Some("assistant".to_string()), vec![block])])
         }
-        // Dropped items.
+
+        // =====================================================================
+        // Built-in tool history items (call-only: assistant tool_use)
+        // =====================================================================
+
+        "web_search_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let action = item.get("action").cloned().unwrap_or(json!({}));
+            let toolu_id = task.id_map.insert_call(id);
+            Ok(vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "web_search",
+                    "input": action,
+                })],
+            )])
+        }
+
+        "local_shell_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let action = item.get("action").cloned().unwrap_or(json!({}));
+            let toolu_id = task.id_map.insert_call(id);
+            Ok(vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "local_shell",
+                    "input": action,
+                })],
+            )])
+        }
+
+        "tool_search_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = item.get("arguments").cloned().unwrap_or(json!({}));
+            let toolu_id = task.id_map.insert_call(id);
+            Ok(vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "tool_search",
+                    "input": arguments,
+                })],
+            )])
+        }
+
+        // =====================================================================
+        // Built-in tool history items (call-with-result: assistant + user pair)
+        // =====================================================================
+
+        "file_search_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let queries = item.get("queries").cloned().unwrap_or(json!([]));
+            let results = item.get("results").cloned();
+            let toolu_id = task.id_map.insert_call(id);
+
+            let mut emitted = vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": &toolu_id,
+                    "name": "file_search",
+                    "input": json!({"queries": queries}),
+                })],
+            )];
+
+            // If results are present, emit a user tool_result.
+            if let Some(res) = results {
+                let content_str = serde_json::to_string(&res).unwrap_or_default();
+                emitted.push((
+                    Some("user".to_string()),
+                    vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": &toolu_id,
+                        "content": content_str,
+                    })],
+                ));
+            }
+
+            Ok(emitted)
+        }
+
+        "code_interpreter_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let code = item
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let container_id = item
+                .get("container_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let outputs = item.get("outputs").cloned();
+            let toolu_id = task.id_map.insert_call(id);
+
+            let mut input = json!({"code": code});
+            if let Some(cid) = container_id {
+                input["container_id"] = json!(cid);
+            }
+
+            let mut emitted = vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": &toolu_id,
+                    "name": "code_interpreter",
+                    "input": input,
+                })],
+            )];
+
+            if let Some(out) = outputs {
+                let content_str = serde_json::to_string(&out).unwrap_or_default();
+                emitted.push((
+                    Some("user".to_string()),
+                    vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": &toolu_id,
+                        "content": content_str,
+                    })],
+                ));
+            }
+
+            Ok(emitted)
+        }
+
+        "image_generation_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let revised_prompt = item
+                .get("revised_prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let result = item.get("result").cloned();
+            let toolu_id = task.id_map.insert_call(id);
+
+            let mut emitted = vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": &toolu_id,
+                    "name": "image_generation",
+                    "input": json!({"prompt": revised_prompt}),
+                })],
+            )];
+
+            if let Some(res) = result {
+                let content_str = if res.is_string() {
+                    res.as_str().unwrap_or("").to_string()
+                } else {
+                    serde_json::to_string(&res).unwrap_or_default()
+                };
+                emitted.push((
+                    Some("user".to_string()),
+                    vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": &toolu_id,
+                        "content": content_str,
+                    })],
+                ));
+            }
+
+            Ok(emitted)
+        }
+
+        "mcp_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let server_label = item
+                .get("server_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let raw_args = item
+                .get("arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let output = item.get("output").cloned();
+            let toolu_id = task.id_map.insert_call(id);
+
+            let parsed_input: Value = serde_json::from_str(raw_args).map_err(|e| {
+                RequestConversionError::InvalidRequest(format!(
+                    "failed to parse arguments for mcp_call '{}': {}",
+                    name, e
+                ))
+            })?;
+
+            let composite_name = format!("mcp__{}__{}", server_label, name);
+
+            let mut emitted = vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": &toolu_id,
+                    "name": composite_name,
+                    "input": parsed_input,
+                })],
+            )];
+
+            if let Some(out) = output {
+                let content_str = if out.is_string() {
+                    out.as_str().unwrap_or("").to_string()
+                } else {
+                    serde_json::to_string(&out).unwrap_or_default()
+                };
+                emitted.push((
+                    Some("user".to_string()),
+                    vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": &toolu_id,
+                        "content": content_str,
+                    })],
+                ));
+            }
+
+            Ok(emitted)
+        }
+
+        // =====================================================================
+        // Built-in tool history items (separate call: assistant tool_use)
+        // =====================================================================
+
+        "computer_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let action = item.get("action").cloned().unwrap_or(json!({}));
+            let toolu_id = task.id_map.insert_call(id);
+            Ok(vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "computer_use",
+                    "input": action,
+                })],
+            )])
+        }
+
+        "computer_call_output" => {
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let output = item.get("output").cloned().unwrap_or(json!({}));
+
+            let toolu_id = task
+                .id_map
+                .get_toolu_for_call(&call_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    tracing::warn!(call_id = %call_id, "computer_call_output references unregistered call_id, generating new toolu_id");
+                    let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+                    task.id_map.insert_with_toolu(call_id.clone(), id.clone());
+                    id
+                });
+
+            let content_str = serde_json::to_string(&output).unwrap_or_default();
+            Ok(vec![(
+                Some("user".to_string()),
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": toolu_id,
+                    "content": content_str,
+                })],
+            )])
+        }
+
+        "shell_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let action = item.get("action").cloned().unwrap_or(json!({}));
+            let toolu_id = task.id_map.insert_call(id);
+            Ok(vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "shell",
+                    "input": action,
+                })],
+            )])
+        }
+
+        "shell_call_output" => {
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let output = item.get("output").cloned().unwrap_or(json!([]));
+
+            let toolu_id = task
+                .id_map
+                .get_toolu_for_call(&call_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    tracing::warn!(call_id = %call_id, "shell_call_output references unregistered call_id, generating new toolu_id");
+                    let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+                    task.id_map.insert_with_toolu(call_id.clone(), id.clone());
+                    id
+                });
+
+            let content_str = serde_json::to_string(&output).unwrap_or_default();
+            Ok(vec![(
+                Some("user".to_string()),
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": toolu_id,
+                    "content": content_str,
+                })],
+            )])
+        }
+
+        "apply_patch_call" => {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let operation = item.get("operation").cloned().unwrap_or(json!({}));
+            let toolu_id = task.id_map.insert_call(id);
+            Ok(vec![(
+                Some("assistant".to_string()),
+                vec![json!({
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "apply_patch",
+                    "input": operation,
+                })],
+            )])
+        }
+
+        "apply_patch_call_output" => {
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let output = item.get("output").cloned().unwrap_or(json!(""));
+
+            let toolu_id = task
+                .id_map
+                .get_toolu_for_call(&call_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    tracing::warn!(call_id = %call_id, "apply_patch_call_output references unregistered call_id, generating new toolu_id");
+                    let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+                    task.id_map.insert_with_toolu(call_id.clone(), id.clone());
+                    id
+                });
+
+            let content = content::convert_tool_result_content(&output);
+            Ok(vec![(
+                Some("user".to_string()),
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": toolu_id,
+                    "content": content,
+                })],
+            )])
+        }
+
+        // =====================================================================
+        // Dropped items
+        // =====================================================================
+
         "compaction" | "context_compaction" | "compaction_trigger" => {
             tracing::debug!(item_type = item_type, "dropping compaction-related item");
-            Ok((None, vec![]))
+            Ok(vec![(None, vec![])])
         }
         "tool_search_output" => {
             tracing::debug!("dropping tool_search_output (no Anthropic equivalent)");
-            Ok((None, vec![]))
+            Ok(vec![(None, vec![])])
+        }
+        "mcp_list_tools" => {
+            tracing::debug!("dropping mcp_list_tools (infrastructure metadata, not model-generated call)");
+            Ok(vec![(None, vec![])])
+        }
+        "mcp_approval_request" => {
+            tracing::debug!("dropping mcp_approval_request (approval flow metadata, not model-generated call)");
+            Ok(vec![(None, vec![])])
         }
         _ => {
             tracing::warn!(item_type = item_type, "dropping unknown input item type");
-            Ok((None, vec![]))
+            Ok(vec![(None, vec![])])
         }
     }
 }
@@ -2034,5 +2456,441 @@ mod tests {
         assert_eq!(system[2]["text"], "Third system.");
         // System messages should NOT appear in messages.
         assert_eq!(result["messages"].as_array().unwrap().len(), 0);
+    }
+
+    // =========================================================================
+    // Built-in tool history input items
+    // =========================================================================
+
+    #[test]
+    fn web_search_call_history_item() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Search for Rust"}]},
+                {
+                    "type": "web_search_call",
+                    "id": "ws_abc123",
+                    "status": "completed",
+                    "action": {"type": "search", "queries": ["Rust programming language"]}
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // user message + assistant tool_use
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+
+        let tool_use = &messages[1]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "web_search");
+        assert_eq!(tool_use["input"]["type"], "search");
+        assert_eq!(tool_use["input"]["queries"][0], "Rust programming language");
+
+        // ID map should have ws_abc123 mapped.
+        assert!(task.id_map.get_toolu_for_call("ws_abc123").is_some());
+        let toolu_id = tool_use["id"].as_str().unwrap();
+        assert!(toolu_id.starts_with("toolu_"));
+    }
+
+    #[test]
+    fn shell_call_and_output_pair() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run ls"}]},
+                {
+                    "type": "shell_call",
+                    "id": "sh_001",
+                    "action": {"commands": ["ls -la"]}
+                },
+                {
+                    "type": "shell_call_output",
+                    "call_id": "sh_001",
+                    "output": [{"type": "stdout", "text": "file1.txt\nfile2.txt"}]
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // user, assistant(tool_use), user(tool_result)
+        assert_eq!(messages.len(), 3);
+
+        // shell_call -> assistant tool_use
+        assert_eq!(messages[1]["role"], "assistant");
+        let tool_use = &messages[1]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "shell");
+        assert_eq!(tool_use["input"]["commands"][0], "ls -la");
+
+        // shell_call_output -> user tool_result
+        assert_eq!(messages[2]["role"], "user");
+        let tool_result = &messages[2]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert!(tool_result["content"].is_string());
+
+        // tool_result must reference the same toolu_id as the tool_use.
+        let toolu_id = tool_use["id"].as_str().unwrap();
+        assert_eq!(tool_result["tool_use_id"], toolu_id);
+    }
+
+    #[test]
+    fn computer_call_and_output_pair() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "computer_call",
+                    "id": "comp_001",
+                    "action": {"type": "click", "button": "left", "x": 100, "y": 200}
+                },
+                {
+                    "type": "computer_call_output",
+                    "call_id": "comp_001",
+                    "output": {"type": "screenshot", "image_url": "data:image/png;base64,abc123"}
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // assistant(tool_use) + user(tool_result)
+        assert_eq!(messages.len(), 2);
+
+        // computer_call -> assistant tool_use with name "computer_use"
+        assert_eq!(messages[0]["role"], "assistant");
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "computer_use");
+        assert_eq!(tool_use["input"]["type"], "click");
+        assert_eq!(tool_use["input"]["x"], 100);
+        assert_eq!(tool_use["input"]["y"], 200);
+
+        // computer_call_output -> user tool_result
+        assert_eq!(messages[1]["role"], "user");
+        let tool_result = &messages[1]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+
+        // Verify ID linkage.
+        let toolu_id = tool_use["id"].as_str().unwrap();
+        assert_eq!(tool_result["tool_use_id"], toolu_id);
+    }
+
+    #[test]
+    fn file_search_call_with_results() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "file_search_call",
+                    "id": "fs_001",
+                    "status": "completed",
+                    "queries": ["test query"],
+                    "results": [{"file_id": "f1", "text": "content here"}]
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // Call-with-result produces assistant + user pair.
+        assert_eq!(messages.len(), 2);
+
+        // Assistant tool_use
+        assert_eq!(messages[0]["role"], "assistant");
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "file_search");
+        assert_eq!(tool_use["input"]["queries"][0], "test query");
+
+        // User tool_result with results serialized as JSON string.
+        assert_eq!(messages[1]["role"], "user");
+        let tool_result = &messages[1]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert!(tool_result["content"].is_string());
+
+        // Verify same toolu_id.
+        let toolu_id = tool_use["id"].as_str().unwrap();
+        assert_eq!(tool_result["tool_use_id"], toolu_id);
+    }
+
+    #[test]
+    fn file_search_call_without_results_only_tool_use() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "file_search_call",
+                    "id": "fs_002",
+                    "queries": ["no results query"]
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        // Only assistant tool_use, no user tool_result (results field absent).
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+    }
+
+    #[test]
+    fn code_interpreter_call_with_outputs() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "code_interpreter_call",
+                    "id": "ci_001",
+                    "code": "print('hello')",
+                    "container_id": "ctr_abc",
+                    "outputs": [{"type": "stdout", "text": "hello\n"}]
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["name"], "code_interpreter");
+        assert_eq!(tool_use["input"]["code"], "print('hello')");
+        assert_eq!(tool_use["input"]["container_id"], "ctr_abc");
+    }
+
+    #[test]
+    fn image_generation_call_with_result() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "image_generation_call",
+                    "id": "ig_001",
+                    "result": "base64imagedata",
+                    "revised_prompt": "a cat sitting on a mat"
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["name"], "image_generation");
+        assert_eq!(tool_use["input"]["prompt"], "a cat sitting on a mat");
+
+        let tool_result = &messages[1]["content"][0];
+        assert_eq!(tool_result["content"], "base64imagedata");
+    }
+
+    #[test]
+    fn local_shell_call_history_item() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "local_shell_call",
+                    "id": "lsh_001",
+                    "action": {"type": "exec", "command": ["ls", "-l"], "env": {}}
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "local_shell");
+        assert_eq!(tool_use["input"]["command"][0], "ls");
+    }
+
+    #[test]
+    fn apply_patch_call_and_output_pair() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "apply_patch_call",
+                    "id": "apc_001",
+                    "operation": {"type": "update_file", "path": "lib/fib.py", "diff": "@@ ... @@"}
+                },
+                {
+                    "type": "apply_patch_call_output",
+                    "call_id": "apc_001",
+                    "output": "patch applied successfully"
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["name"], "apply_patch");
+        assert_eq!(tool_use["input"]["type"], "update_file");
+        assert_eq!(tool_use["input"]["path"], "lib/fib.py");
+
+        let tool_result = &messages[1]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["content"], "patch applied successfully");
+
+        // Verify ID linkage.
+        let toolu_id = tool_use["id"].as_str().unwrap();
+        assert_eq!(tool_result["tool_use_id"], toolu_id);
+    }
+
+    #[test]
+    fn mcp_call_history_item() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "mcp_call",
+                    "id": "mcp_c_001",
+                    "name": "search",
+                    "server_label": "memory",
+                    "arguments": "{\"query\": \"test\"}",
+                    "output": "found results"
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // assistant tool_use + user tool_result
+        assert_eq!(messages.len(), 2);
+
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["name"], "mcp__memory__search");
+        assert_eq!(tool_use["input"]["query"], "test");
+
+        let tool_result = &messages[1]["content"][0];
+        assert_eq!(tool_result["content"], "found results");
+    }
+
+    #[test]
+    fn tool_search_call_history_item() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "id": "ts_001",
+                    "arguments": {"goal": "find a file editing tool"}
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "tool_search");
+        assert_eq!(tool_use["input"]["goal"], "find a file editing tool");
+    }
+
+    // =========================================================================
+    // Dropped built-in tool history items
+    // =========================================================================
+
+    #[test]
+    fn mcp_list_tools_dropped() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "mcp_list_tools", "id": "mcp_lt_001", "server_label": "memory", "tools": []},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "mcp_list_tools should be dropped");
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn mcp_approval_request_dropped() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "mcp_approval_request", "id": "mcp_ar_001", "name": "delete_all", "arguments": "{}"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "mcp_approval_request should be dropped");
+    }
+
+    // =========================================================================
+    // Built-in tool history alternation merge
+    // =========================================================================
+
+    #[test]
+    fn builtin_tool_history_merges_with_adjacent_same_role() {
+        // A function_call followed by a web_search_call should merge into one assistant message.
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "function_call", "call_id": "call_001", "name": "tool_a", "arguments": "{}"},
+                {
+                    "type": "web_search_call",
+                    "id": "ws_001",
+                    "status": "completed",
+                    "action": {"type": "search", "queries": ["test"]}
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // Both are assistant role -> merged into one message with 2 content blocks.
+        assert_eq!(messages.len(), 1, "consecutive assistant items should merge");
+        assert_eq!(messages[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn shell_call_output_unregistered_call_id_generates_toolu() {
+        // shell_call_output with no preceding shell_call should still work
+        // (generates a new toolu_id for the unregistered call_id).
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {
+                    "type": "shell_call_output",
+                    "call_id": "sh_orphan",
+                    "output": [{"type": "stdout", "text": "result"}]
+                }
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let tool_result = &messages[0]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert!(tool_result["tool_use_id"].as_str().unwrap().starts_with("toolu_"));
     }
 }
