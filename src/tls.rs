@@ -38,16 +38,16 @@ pub fn build_upstream_tls_config(
         builder = builder.tls_built_in_root_certs(config.use_system_roots);
     }
 
-    // Load extra CA certificates.
-    // Note: when extra_ca_certs is provided alongside use_system_roots, reqwest's
-    // built-in system root loading handles system certs, and extra certs can be
-    // loaded via a custom tls config. For now, extra CA cert files are validated
-    // (ensuring they parse correctly) so that misconfigurations surface early.
+    // Load extra CA certificates and add them to the reqwest client.
     for cert_path in &config.extra_ca_certs {
         let pem = std::fs::read(cert_path)?;
         let certs: Vec<_> = rustls_pemfile::certs(&mut &pem[..]).collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
             return Err(format!("no certificates found in {}", cert_path).into());
+        }
+        for cert in certs {
+            let reqwest_cert = reqwest::Certificate::from_der(cert.as_ref())?;
+            builder = builder.add_root_certificate(reqwest_cert);
         }
     }
 
