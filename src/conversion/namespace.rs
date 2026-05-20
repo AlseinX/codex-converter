@@ -29,8 +29,13 @@ impl NamespaceRegistry {
 
     /// Register a flattened tool name with its original components.
     pub fn register(&mut self, flat_name: String, namespace: String, tool_name: String) {
-        self.entries
-            .insert(flat_name, NamespaceEntry { namespace, tool_name });
+        self.entries.insert(
+            flat_name,
+            NamespaceEntry {
+                namespace,
+                tool_name,
+            },
+        );
     }
 
     /// Look up a flattened tool name to get its original components.

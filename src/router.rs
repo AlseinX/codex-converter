@@ -1,9 +1,9 @@
+use axum::body::Body;
 use axum::extract::{Request, State};
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
-use axum::body::Body;
-use axum::http::StatusCode;
 
 /// Parsed route information extracted from the request URL.
 #[derive(Debug, Clone)]
@@ -158,6 +158,9 @@ mod tests {
     #[test]
     fn upstream_messages_url_includes_v1() {
         let route = RouteInfo::parse("/https/api.anthropic.com/responses").unwrap();
-        assert_eq!(route.upstream_messages_url(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            route.upstream_messages_url(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 }

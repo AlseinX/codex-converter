@@ -26,16 +26,14 @@ impl IdMap {
     /// Returns the generated toolu_id.
     pub fn insert_call(&mut self, call_id: String) -> String {
         let toolu_id = format!("toolu_{}", Uuid::new_v4().simple());
-        self.call_to_toolu
-            .insert(call_id.clone(), toolu_id.clone());
+        self.call_to_toolu.insert(call_id.clone(), toolu_id.clone());
         self.toolu_to_call.insert(toolu_id.clone(), call_id);
         toolu_id
     }
 
     /// Register a mapping with an explicit toolu_id (for built-in tool IDs like ws_xxx -> toolu_ws_xxx).
     pub fn insert_with_toolu(&mut self, call_id: String, toolu_id: String) {
-        self.call_to_toolu
-            .insert(call_id.clone(), toolu_id.clone());
+        self.call_to_toolu.insert(call_id.clone(), toolu_id.clone());
         self.toolu_to_call.insert(toolu_id, call_id);
     }
 

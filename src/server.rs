@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::router::{AppState, build_router};
+use crate::router::{build_router, AppState};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -8,7 +8,9 @@ use tokio::time::Duration;
 /// Run the HTTP/HTTPS server until a shutdown signal is received.
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = config.server.listen.parse()?;
-    let state = AppState { config: config.clone() };
+    let state = AppState {
+        config: config.clone(),
+    };
     let app = build_router(state);
 
     if config.server.tls.is_enabled() {

@@ -1,6 +1,6 @@
 use crate::config::LogConfig;
 use tracing::Level;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// Initialize the logging system based on config.
 pub fn init(log_config: &LogConfig) {
@@ -9,9 +9,7 @@ pub fn init(log_config: &LogConfig) {
     // Console layer.
     if let Some(ref console) = log_config.console {
         let filter = level_filter(&console.level);
-        let console_layer = fmt::layer()
-            .with_target(true)
-            .with_filter(filter);
+        let console_layer = fmt::layer().with_target(true).with_filter(filter);
         layers.push(console_layer.boxed());
     }
 
@@ -50,9 +48,7 @@ pub fn init(log_config: &LogConfig) {
         return;
     }
 
-    tracing_subscriber::registry()
-        .with(layers)
-        .init();
+    tracing_subscriber::registry().with(layers).init();
 }
 
 /// Convert a string level name to a tracing LevelFilter.

@@ -25,10 +25,9 @@ impl Default for AppConfig {
 impl AppConfig {
     /// Load config from YAML file, falling back to defaults for missing fields.
     pub fn from_yaml_file(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
-        let cfg: AppConfig = serde_yaml::from_str(&content)
-            .map_err(ConfigError::Yaml)?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+        let cfg: AppConfig = serde_yaml::from_str(&content).map_err(ConfigError::Yaml)?;
         Ok(cfg)
     }
 
@@ -57,8 +56,8 @@ impl AppConfig {
                     value.split(',').map(|s| s.trim().to_string()).collect();
             }
             "upstream.tls.use_system_roots" => {
-                self.upstream.tls.use_system_roots = parse_bool_option(value)
-                    .ok_or_else(|| ConfigError::Parse {
+                self.upstream.tls.use_system_roots =
+                    parse_bool_option(value).ok_or_else(|| ConfigError::Parse {
                         key: key.to_string(),
                         value: value.to_string(),
                         expected: "bool",
@@ -272,18 +271,34 @@ fn parse_bool_option(value: &str) -> Option<bool> {
 pub enum ConfigError {
     Io(std::path::PathBuf, std::io::Error),
     Yaml(serde_yaml::Error),
-    UnknownKey { key: String },
-    Parse { key: String, value: String, expected: &'static str },
+    UnknownKey {
+        key: String,
+    },
+    Parse {
+        key: String,
+        value: String,
+        expected: &'static str,
+    },
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Io(path, e) => write!(f, "failed to read config file {}: {}", path.display(), e),
+            ConfigError::Io(path, e) => {
+                write!(f, "failed to read config file {}: {}", path.display(), e)
+            }
             ConfigError::Yaml(e) => write!(f, "YAML parse error: {}", e),
             ConfigError::UnknownKey { key } => write!(f, "unknown config key: {}", key),
-            ConfigError::Parse { key, value, expected } => {
-                write!(f, "invalid value for {}: expected {}, got '{}'", key, expected, value)
+            ConfigError::Parse {
+                key,
+                value,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "invalid value for {}: expected {}, got '{}'",
+                    key, expected, value
+                )
             }
         }
     }

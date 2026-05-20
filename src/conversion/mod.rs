@@ -97,7 +97,10 @@ mod tests {
             "mcp__memory__".to_string(),
             "search".to_string(),
         );
-        let entry = task.namespace_registry.lookup("mcp__memory__search").unwrap();
+        let entry = task
+            .namespace_registry
+            .lookup("mcp__memory__search")
+            .unwrap();
         assert_eq!(entry.namespace, "mcp__memory__");
         assert_eq!(entry.tool_name, "search");
     }
@@ -122,7 +125,8 @@ mod tests {
         assert!(task.id_map.len() == 0);
         assert!(task.namespace_registry.len() == 0);
         // Verify the shared cache reference
-        task.signature_cache.insert("rs_test".to_string(), "sig123".to_string());
+        task.signature_cache
+            .insert("rs_test".to_string(), "sig123".to_string());
         assert_eq!(cache.get("rs_test"), Some("sig123".to_string()));
     }
 }

@@ -20,23 +20,27 @@ pub fn convert_user_content(input: &Value) -> Option<Value> {
             let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
             json!({"type": "text", "text": text})
         }
-        "input_image" => {
-            convert_input_image(obj)?
-        }
+        "input_image" => convert_input_image(obj)?,
         "input_file" => {
             // Anthropic has no generic file input. Drop silently.
             tracing::debug!("dropping input_file content block (no Anthropic equivalent)");
             return None;
         }
         other => {
-            tracing::warn!(content_type = other, "dropping unknown user content block type");
+            tracing::warn!(
+                content_type = other,
+                "dropping unknown user content block type"
+            );
             return None;
         }
     };
 
     // Pass through cache_control if present.
     if let Some(cc) = obj.get("cache_control") {
-        block.as_object_mut().unwrap().insert("cache_control".to_string(), cc.clone());
+        block
+            .as_object_mut()
+            .unwrap()
+            .insert("cache_control".to_string(), cc.clone());
     }
 
     Some(block)

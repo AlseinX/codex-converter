@@ -30,12 +30,10 @@ async fn main() {
 
     // Step 1: Load base config from file or defaults.
     let mut config = match &cli.config_file {
-        Some(path) => {
-            AppConfig::from_yaml_file(path).unwrap_or_else(|e| {
-                eprintln!("Error loading config file {}: {}", path.display(), e);
-                std::process::exit(1);
-            })
-        }
+        Some(path) => AppConfig::from_yaml_file(path).unwrap_or_else(|e| {
+            eprintln!("Error loading config file {}: {}", path.display(), e);
+            std::process::exit(1);
+        }),
         None => AppConfig::default(),
     };
 
@@ -55,10 +53,7 @@ async fn main() {
     // Step 4: Apply CLI -C overrides (highest priority).
     for item in &cli.config_items {
         let (key, value) = item.split_once('=').unwrap_or_else(|| {
-            eprintln!(
-                "Invalid config item format: '{}'. Expected key=value",
-                item
-            );
+            eprintln!("Invalid config item format: '{}'. Expected key=value", item);
             std::process::exit(1);
         });
         if let Err(e) = config.apply_cli(key.trim(), value.trim()) {
@@ -111,10 +106,7 @@ mod tests {
     #[test]
     fn cli_parse_config_file() {
         let cli = Cli::try_parse_from(["codex-conv", "-c", "/etc/codex-conv.yaml"]).unwrap();
-        assert_eq!(
-            cli.config_file,
-            Some(PathBuf::from("/etc/codex-conv.yaml"))
-        );
+        assert_eq!(cli.config_file, Some(PathBuf::from("/etc/codex-conv.yaml")));
     }
 
     #[test]
@@ -177,12 +169,8 @@ mod tests {
 
     #[test]
     fn cli_listen_long_form_config_file() {
-        let cli =
-            Cli::try_parse_from(["codex-conv", "--config-file", "/tmp/conv.yaml"]).unwrap();
-        assert_eq!(
-            cli.config_file,
-            Some(PathBuf::from("/tmp/conv.yaml"))
-        );
+        let cli = Cli::try_parse_from(["codex-conv", "--config-file", "/tmp/conv.yaml"]).unwrap();
+        assert_eq!(cli.config_file, Some(PathBuf::from("/tmp/conv.yaml")));
     }
 
     #[test]

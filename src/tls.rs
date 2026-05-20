@@ -10,8 +10,7 @@ pub fn load_server_tls(
     let key_pem = std::fs::read(&config.key)?;
 
     let certs: Vec<rustls::pki_types::CertificateDer<'_>> =
-        rustls_pemfile::certs(&mut &cert_pem[..])
-            .collect::<Result<Vec<_>, _>>()?;
+        rustls_pemfile::certs(&mut &cert_pem[..]).collect::<Result<Vec<_>, _>>()?;
 
     let key = rustls_pemfile::private_key(&mut &key_pem[..])?
         .ok_or("no private key found in key file")?;
@@ -46,8 +45,7 @@ pub fn build_upstream_tls_config(
     // (ensuring they parse correctly) so that misconfigurations surface early.
     for cert_path in &config.extra_ca_certs {
         let pem = std::fs::read(cert_path)?;
-        let certs: Vec<_> = rustls_pemfile::certs(&mut &pem[..])
-            .collect::<Result<Vec<_>, _>>()?;
+        let certs: Vec<_> = rustls_pemfile::certs(&mut &pem[..]).collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
             return Err(format!("no certificates found in {}", cert_path).into());
         }
