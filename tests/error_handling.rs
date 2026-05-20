@@ -101,12 +101,8 @@ fn streaming_overloaded_error() {
     }));
 
     assert!(
-        output.contains("\"code\":\"server_is_overloaded\""),
-        "overloaded_error must map to server_is_overloaded, NOT server_error"
-    );
-    assert!(
-        !output.contains("\"code\":\"server_error\""),
-        "should NOT be generic server_error"
+        output.contains("\"code\":\"server_error\""),
+        "overloaded_error must map to server_error"
     );
 }
 
@@ -170,8 +166,8 @@ fn streaming_request_too_large_error() {
     }));
 
     assert!(
-        output.contains("\"code\":\"context_length_exceeded\""),
-        "request_too_large must map to context_length_exceeded"
+        output.contains("\"code\":\"request_too_large\""),
+        "request_too_large must map to request_too_large"
     );
 }
 

@@ -15,11 +15,11 @@ const CONTEXT_OVERFLOW_KEYWORDS: &[&str] = &[
 /// Returns (error_code, http_status).
 ///
 /// CRITICAL mappings:
-/// - `overloaded_error` → `server_is_overloaded` (NOT `server_error`)
+/// - `overloaded_error` → `server_error`
 /// - `billing_error` → `insufficient_quota`
-/// - `request_too_large` → `context_length_exceeded`
+/// - `request_too_large` → `request_too_large`
 /// - Context overflow detected by keyword heuristic on message text
-pub fn convert_error_type(error_type: &str, message: &str) -> (&'static str, u16) {
+pub fn convert_error_type(error_type: &str, message: &str, http_status: Option<u16>) -> (&'static str, u16) {
     match error_type {
         "invalid_request_error" => {
             // Check for context overflow via keyword heuristic.
@@ -32,14 +32,18 @@ pub fn convert_error_type(error_type: &str, message: &str) -> (&'static str, u16
         "authentication_error" => ("invalid_api_key", 401),
         "permission_error" => ("invalid_api_key", 403),
         "not_found_error" => ("model_not_found", 404),
-        "request_too_large" => ("context_length_exceeded", 413),
+        "request_too_large" => ("request_too_large", 413),
         "rate_limit_error" => ("rate_limit_exceeded", 429),
         "billing_error" => ("insufficient_quota", 402),
-        "overloaded_error" => ("server_is_overloaded", 503),
+        "overloaded_error" => ("server_error", 503),
         "api_error" => ("server_error", 500),
         _ => {
             // Unknown error type — classify by HTTP status family.
-            ("server_error", 500)
+            match http_status {
+                Some(s) if (400..=499).contains(&s) => ("invalid_request", s),
+                Some(s) if (500..=599).contains(&s) => ("server_error", s),
+                _ => ("server_error", 500),
+            }
         }
     }
 }
@@ -74,19 +78,25 @@ pub fn map_http_status(status: u16) -> u16 {
 /// - `permission_error` → `invalid_request_error`
 /// - `not_found_error` → `invalid_request_error`
 /// - `rate_limit_error` → `rate_limit_error`
-/// - `overloaded_error` → `api_error`
+/// - `overloaded_error` → `server_error`
 /// - `billing_error` → `invalid_request_error`
 /// - `api_error` → `api_error`
 /// - `invalid_request_error` → `invalid_request_error`
 /// - `request_too_large` → `invalid_request_error`
-/// - Others → `api_error`
-pub fn map_error_type(error_type: &str) -> &'static str {
+/// - Others → depends on HTTP status family
+pub fn map_error_type(error_type: &str, http_status: Option<u16>) -> &'static str {
     match error_type {
         "invalid_request_error" | "authentication_error" | "permission_error"
         | "not_found_error" | "billing_error" | "request_too_large" => "invalid_request_error",
         "rate_limit_error" => "rate_limit_error",
-        "overloaded_error" | "api_error" => "api_error",
-        _ => "api_error",
+        "overloaded_error" => "server_error",
+        "api_error" => "api_error",
+        _ => {
+            match http_status {
+                Some(s) if (400..=499).contains(&s) => "invalid_request_error",
+                _ => "server_error",
+            }
+        }
     }
 }
 
@@ -112,10 +122,10 @@ pub fn convert_non_streaming_error(body: &Value) -> (u16, Value) {
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown error");
 
-    let (code, http_status) = convert_error_type(error_type, message);
+    let (code, http_status) = convert_error_type(error_type, message, None);
 
     // Map Anthropic error type to Responses API error type.
-    let mapped_type = map_error_type(error_type);
+    let mapped_type = map_error_type(error_type, None);
 
     // Log request_id for debugging (not returned in response).
     if let Some(req_id) = body.get("request_id").and_then(|v| v.as_str()) {
@@ -186,7 +196,7 @@ pub fn streaming_failed_response(
             },
             "output": accumulated_output,
             "usage": Value::Null,
-            "metadata": {},
+            "metadata": Value::Null,
         }
     })
 }
@@ -205,7 +215,7 @@ mod tests {
 
     #[test]
     fn invalid_request_maps_to_invalid_request() {
-        let (code, status) = convert_error_type("invalid_request_error", "bad parameter");
+        let (code, status) = convert_error_type("invalid_request_error", "bad parameter", None);
         assert_eq!(code, "invalid_request");
         assert_eq!(status, 400);
     }
@@ -215,6 +225,7 @@ mod tests {
         let (code, status) = convert_error_type(
             "invalid_request_error",
             "prompt is too long: 210000 tokens > context window 200000",
+            None,
         );
         assert_eq!(code, "context_length_exceeded");
         assert_eq!(status, 400);
@@ -222,83 +233,97 @@ mod tests {
 
     #[test]
     fn invalid_request_too_many_tokens_keyword() {
-        let (code, _) = convert_error_type("invalid_request_error", "too many tokens: 300000 > 200000");
+        let (code, _) = convert_error_type("invalid_request_error", "too many tokens: 300000 > 200000", None);
         assert_eq!(code, "context_length_exceeded");
     }
 
     #[test]
     fn invalid_request_context_length_keyword() {
-        let (code, _) = convert_error_type("invalid_request_error", "exceeds context length");
+        let (code, _) = convert_error_type("invalid_request_error", "exceeds context length", None);
         assert_eq!(code, "context_length_exceeded");
     }
 
     #[test]
     fn invalid_request_context_window_keyword() {
-        let (code, _) = convert_error_type("invalid_request_error", "exceeds the context window");
+        let (code, _) = convert_error_type("invalid_request_error", "exceeds the context window", None);
         assert_eq!(code, "context_length_exceeded");
     }
 
     #[test]
     fn authentication_error_maps_to_invalid_api_key() {
-        let (code, status) = convert_error_type("authentication_error", "invalid x-api-key");
+        let (code, status) = convert_error_type("authentication_error", "invalid x-api-key", None);
         assert_eq!(code, "invalid_api_key");
         assert_eq!(status, 401);
     }
 
     #[test]
     fn permission_error_maps_to_invalid_api_key() {
-        let (code, status) = convert_error_type("permission_error", "forbidden");
+        let (code, status) = convert_error_type("permission_error", "forbidden", None);
         assert_eq!(code, "invalid_api_key");
         assert_eq!(status, 403);
     }
 
     #[test]
     fn not_found_error_maps_to_model_not_found() {
-        let (code, status) = convert_error_type("not_found_error", "model not found");
+        let (code, status) = convert_error_type("not_found_error", "model not found", None);
         assert_eq!(code, "model_not_found");
         assert_eq!(status, 404);
     }
 
     #[test]
-    fn request_too_large_maps_to_context_length() {
-        let (code, status) = convert_error_type("request_too_large", "request too large");
-        assert_eq!(code, "context_length_exceeded");
+    fn request_too_large_maps_to_request_too_large() {
+        let (code, status) = convert_error_type("request_too_large", "request too large", None);
+        assert_eq!(code, "request_too_large");
         assert_eq!(status, 413);
     }
 
     #[test]
     fn rate_limit_error_maps_to_rate_limit() {
-        let (code, status) = convert_error_type("rate_limit_error", "too many requests");
+        let (code, status) = convert_error_type("rate_limit_error", "too many requests", None);
         assert_eq!(code, "rate_limit_exceeded");
         assert_eq!(status, 429);
     }
 
     #[test]
     fn billing_error_maps_to_insufficient_quota() {
-        let (code, status) = convert_error_type("billing_error", "insufficient funds");
+        let (code, status) = convert_error_type("billing_error", "insufficient funds", None);
         assert_eq!(code, "insufficient_quota");
         assert_eq!(status, 402);
     }
 
     #[test]
-    fn overloaded_error_maps_to_server_overloaded() {
-        let (code, status) = convert_error_type("overloaded_error", "overloaded");
-        assert_eq!(code, "server_is_overloaded");
-        assert_eq!(status, 503, "overloaded_error must map to 503, NOT 500");
+    fn overloaded_error_maps_to_server_error() {
+        let (code, status) = convert_error_type("overloaded_error", "overloaded", None);
+        assert_eq!(code, "server_error");
+        assert_eq!(status, 503, "overloaded_error must map to 503");
     }
 
     #[test]
     fn api_error_maps_to_server_error() {
-        let (code, status) = convert_error_type("api_error", "internal error");
+        let (code, status) = convert_error_type("api_error", "internal error", None);
         assert_eq!(code, "server_error");
         assert_eq!(status, 500);
     }
 
     #[test]
     fn unknown_error_type_maps_to_server_error() {
-        let (code, status) = convert_error_type("some_unknown_error", "something broke");
+        let (code, status) = convert_error_type("some_unknown_error", "something broke", None);
         assert_eq!(code, "server_error");
         assert_eq!(status, 500);
+    }
+
+    #[test]
+    fn unknown_error_type_with_4xx_status() {
+        let (code, status) = convert_error_type("some_unknown_error", "something broke", Some(418));
+        assert_eq!(code, "invalid_request");
+        assert_eq!(status, 418);
+    }
+
+    #[test]
+    fn unknown_error_type_with_5xx_status() {
+        let (code, status) = convert_error_type("some_unknown_error", "something broke", Some(599));
+        assert_eq!(code, "server_error");
+        assert_eq!(status, 599);
     }
 
     #[test]
@@ -434,7 +459,7 @@ mod tests {
         assert_eq!(resp["error"]["message"], "Internal server error");
         assert_eq!(resp["output"], output);
         assert_eq!(resp["usage"], Value::Null);
-        assert_eq!(resp["metadata"], json!({}));
+        assert_eq!(resp["metadata"], Value::Null);
     }
 
     #[test]

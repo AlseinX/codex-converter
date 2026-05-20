@@ -62,6 +62,14 @@ pub struct StreamingState {
     signature_store: Vec<(String, String)>,
 }
 
+/// Return current Unix timestamp in seconds.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl StreamingState {
     pub fn new(
         response_id: String,
@@ -567,11 +575,12 @@ impl StreamingState {
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
+            "completed_at": now_secs(),
             "status": "failed",
             "error": {"code": code, "message": message},
             "output": self.output_items,
             "usage": Value::Null,
-            "metadata": {},
+            "metadata": Value::Null,
         });
 
         vec![
@@ -601,10 +610,10 @@ fn convert_streaming_error_code(error_type: &str, message: &str) -> &'static str
         "authentication_error" => "invalid_api_key",
         "permission_error" => "invalid_api_key",
         "not_found_error" => "model_not_found",
-        "request_too_large" => "context_length_exceeded",
+        "request_too_large" => "request_too_large",
         "rate_limit_error" => "rate_limit_exceeded",
         "billing_error" => "insufficient_quota",
-        "overloaded_error" => "server_is_overloaded",
+        "overloaded_error" => "server_error",
         _ => "server_error",
     }
 }
@@ -1196,6 +1205,13 @@ mod tests {
         assert_eq!(parsed["response"]["status"], "failed");
         assert_eq!(parsed["response"]["error"]["code"], "server_error");
         assert_eq!(parsed["response"]["id"], "msg_test");
+        // Verify completed_at is present and non-zero (Rs6)
+        assert!(
+            parsed["response"]["completed_at"].as_u64().unwrap() > 0,
+            "response.failed must include completed_at"
+        );
+        // Verify metadata is null (Rs1)
+        assert_eq!(parsed["response"]["metadata"], Value::Null);
     }
 
     #[test]
