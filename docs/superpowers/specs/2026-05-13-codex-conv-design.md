@@ -310,6 +310,7 @@ Codex's `create_text_param_for_request` constructs `text.format` with `type: "js
 | Responses API input item | Anthropic message |
 |---|---|
 | `{"type":"message","role":"user","content":[...]}` | `{"role":"user","content":[...]}` |
+| `{"type":"message","role":"developer","content":[...]}` | `{"role":"user","content":[...]}` | Codex sends a `developer` role for system-level instructions (permissions, skills). Anthropic has no `developer` role — map to `user`. Research [39] |
 | `{"type":"message","role":"system","content":[...]}` | Extracted to top-level `system` |
 | `{"type":"message","role":"assistant","content":[...]}` | `{"role":"assistant","content":[...]}` |
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
@@ -479,8 +480,11 @@ message_delta (stop_reason, usage)
 message_stop
   → response.completed OR response.incomplete      (completed for normal end, incomplete for max_tokens)
 
-[DONE]                                                  (terminal marker)
+<upstream closes connection>                         (Anthropic closes after message_stop, no explicit [DONE])
+→ proxy sends [DONE]                                 (proxy-generated terminal marker)
 ```
+
+**Anthropic stream termination:** The Anthropic Messages API does not send an explicit `data: [DONE]` marker. Instead, the server closes the HTTP connection after `message_stop`. The proxy must generate the `[DONE]` marker for the downstream client. When the SSE connection closes after a `message_stop` was received, this is normal — not an error. Research [40]
 
 Multiple tool_use blocks in one response: each converted to independent `function_call` output item with its own `output_index`.
 

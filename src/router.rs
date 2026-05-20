@@ -353,15 +353,48 @@ async fn handle_responses(
                     // Connection established, nothing to do.
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "SSE stream error from upstream");
-                    // If we never got a message_start, the upstream likely returned an error.
-                    // Emit a downstream error event.
-                    let _ = tx
-                        .send(Ok(axum::body::Bytes::from(
-                            "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Upstream stream error\"}\n\n",
-                        )))
-                        .await;
-                    let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
+                    // "Stream ended" is normal — Anthropic closes the connection after
+                    // message_stop without a [DONE] marker. Only treat unexpected
+                    // errors as real errors.
+                    let err_str = e.to_string();
+                    if err_str.contains("Stream ended") {
+                        tracing::debug!("upstream SSE stream ended normally");
+                    } else if streaming_state.is_some() {
+                        // We already got message_start — the stream was partially
+                        // delivered.  StreamingState::handle_error will produce
+                        // error + response.failed + Done events.
+                        tracing::error!(error = %e, "SSE stream error from upstream (mid-stream)");
+                        let state = streaming_state.as_mut().unwrap();
+                        let error_val = serde_json::json!({
+                            "type": "api_error",
+                            "message": format!("Upstream stream error: {}", e)
+                        });
+                        let events = state.process_event(
+                            crate::sse::anthropic::AnthropicEvent::Error { error: error_val },
+                        );
+                        for r_event in events {
+                            if matches!(r_event, ResponsesEvent::Done) {
+                                done_sent = true;
+                                let _ = tx
+                                    .send(Ok(axum::body::Bytes::from(format_done())))
+                                    .await;
+                            } else {
+                                let sse_str = format_responses_event(&r_event);
+                                let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
+                            }
+                        }
+                    } else {
+                        // Never got message_start — the upstream likely returned a
+                        // non-streaming error (e.g. 4xx/5xx) before any SSE events.
+                        tracing::error!(error = %e, "SSE stream error from upstream (no message_start)");
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from(
+                                "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Upstream stream error\"}\n\n",
+                            )))
+                            .await;
+                        let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
+                        done_sent = true;
+                    }
                     break;
                 }
             }

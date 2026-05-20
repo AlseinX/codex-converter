@@ -1927,3 +1927,76 @@ Verified against official sources. The following gaps were identified and fixed:
 - [5] OpenAI Responses API — https://developers.openai.com/api/reference/responses/
 - [6] OpenAI Python SDK: `ResponseFormatTextJSONSchemaConfig` — https://github.com/openai/openai-python/blob/master/src/openai/types/responses/response_format_text_json_schema_config.py (flat structure with `name`, `schema`, `strict` as siblings of `type`)
 - [7] Anthropic Python SDK: `JSONOutputFormatParam` — https://github.com/anthropics/anthropic-sdk-python/blob/master/src/anthropic/types/json_output_format_param.py (only `type` and `schema`, no `name` or `strict`)
+
+---
+
+## 39. Codex CLI "developer" role in input messages
+
+### Description
+During integration testing against a live Anthropic API backend, requests were rejected with 422 Unprocessable Entity. Investigation revealed that Codex CLI sends messages with `role: "developer"` in the Responses API input, which the Anthropic Messages API does not accept.
+
+### Result
+Codex CLI v0.130.0 sends a `developer` role message as the first input item, containing system-level instructions (permissions, skills, etc.). The Anthropic Messages API only accepts `user`, `assistant`, and `system` roles. The proxy must map `developer` → `user` during request conversion.
+
+Verified by inspecting the converted request body in proxy debug logs: the first message had `role: "developer"` which caused 422 from upstream. After mapping to `user`, the request was accepted.
+
+This mapping is safe because:
+1. The `developer` role is a Codex CLI concept for separating system instructions from user content
+2. Anthropic's `system` field already handles top-level system instructions
+3. The `developer` message content is forwarded as a user message, which Anthropic processes normally
+
+### Reference
+- [1] Codex CLI v0.130.0 source code — developer role usage in request construction
+- [2] Anthropic Messages API — supported roles: https://platform.claude.com/docs/en/api/messages
+
+---
+
+## 40. Anthropic SSE stream termination behavior (no [DONE] marker)
+
+### Description
+During integration testing, the `reqwest-eventsource` library reported errors on every request with "Stream ended". Investigation was needed to determine if this was a real error or normal behavior.
+
+### Result
+The Anthropic Messages API SSE stream terminates by simply closing the HTTP connection after the `message_stop` event. Unlike OpenAI's API which sends an explicit `data: [DONE]` marker, Anthropic does not send any terminal marker. The `reqwest-eventsource` library interprets this connection close as an error ("Stream ended"), but it is actually normal behavior.
+
+The proxy must handle this gracefully:
+- When EventSource yields `Err("Stream ended")` AND a StreamingState exists (meaning message_start was received), treat it as normal stream termination
+- Only emit error events when the stream ends BEFORE receiving message_start (indicating an actual upstream error like 4xx/5xx)
+
+This was confirmed by comparing direct `curl` requests to the upstream (which complete normally) with the EventSource behavior.
+
+### Reference
+- [1] Anthropic Streaming Messages docs — https://platform.claude.com/docs/en/build-with-claude/streaming
+- [2] reqwest-eventsource crate — https://docs.rs/reqwest-eventsource/0.6
+
+---
+
+## 41. Codex CLI tool registration: confirmed tools in practice
+
+### Description
+During integration testing, the exact set of tools Codex CLI registers in the Responses API request was captured, along with confirmation that `apply_patch` is called as a native function tool.
+
+### Result
+Codex CLI v0.130.0 registers these 12 tools in the `tools` array:
+1. `exec_command` — shell execution
+2. `write_stdin` — stdin pipe to running process
+3. `update_plan` — plan tracking
+4. `request_user_input` — user interaction
+5. `apply_patch` — file editing (function tool with freeform grammar)
+6. `web_search` — web search
+7. `view_image` — image viewing
+8. `spawn_agent` — agent spawning
+9. `send_input` — agent input
+10. `resume_agent` — agent resume
+11. `wait_agent` — agent wait
+12. `close_agent` — agent close
+
+The `apply_patch` tool is confirmed to be called as a native function tool (NOT via exec_command workaround). Proxy logs showed the tool_use history building up with both `exec_command` (for file reads) and `apply_patch` (for actual edits):
+- Request 1: `tool_uses=[]` (initial prompt)
+- Request 2: `tool_uses=["exec_command"]` (read file)
+- Request 3: `tool_uses=["exec_command", "apply_patch"]` (read file, apply patch)
+- Subsequent requests: additional tool calls for verification
+
+### Reference
+- [1] Codex CLI v0.130.0 — proxy debug logs captured during integration testing
+- [2] Codex CLI source code: `codex-rs/tools/src/tool_spec.rs` — https://github.com/openai/codex
