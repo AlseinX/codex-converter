@@ -5,7 +5,7 @@ use std::collections::HashMap;
 ///
 /// Maps flattened tool names (e.g., "mcp__memory__search") to their
 /// original (namespace, tool_name) components.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NamespaceRegistry {
     /// flat_name -> (namespace, tool_name)
     entries: HashMap<String, NamespaceEntry>,
