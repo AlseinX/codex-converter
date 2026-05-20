@@ -45,28 +45,24 @@ async fn run_tls(
     config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls_config = crate::tls::load_server_tls(&config.server.tls)?;
-    let listener = TcpListener::bind(addr).await?;
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+
     tracing::info!(%addr, "listening (HTTPS)");
 
-    let shutdown = shutdown_signal();
     let timeout = Duration::from_secs(config.server.shutdown_timeout);
+    let handle = axum_server::Handle::new();
 
-    let _acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let graceful = axum::serve(listener, app).with_graceful_shutdown(shutdown);
+    // Spawn shutdown signal watcher.
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(timeout));
+    });
 
-    // TODO: Wire TLS acceptor into the connection loop.
-    // Currently serves plain HTTP on the TLS port — TLS handshake
-    // will be integrated in Task 5+ when request forwarding is implemented.
-    tokio::select! {
-        result = graceful => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "server error");
-            }
-        }
-        _ = tokio::time::sleep(timeout) => {
-            tracing::warn!(?timeout, "shutdown timed out, forcing close");
-        }
-    }
+    axum_server::bind_rustls(addr, rustls_config)
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await?;
 
     tracing::info!("shutdown complete");
     Ok(())

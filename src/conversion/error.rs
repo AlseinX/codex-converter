@@ -58,11 +58,35 @@ fn is_context_overflow(message: &str) -> bool {
 /// - Unknown 5XX → 500
 pub fn map_http_status(status: u16) -> u16 {
     match status {
-        400 | 401 | 402 | 403 | 404 | 413 | 429 | 500 => status,
+        400 | 401 | 402 | 403 | 404 | 429 | 500 => status,
+        413 => 400,
         529 => 503,
         400..=499 => 400, // Unknown 4XX → 400
         500..=599 => 500, // Unknown 5XX → 500
         _ => 500,
+    }
+}
+
+/// Map an Anthropic error type to a Responses API error type.
+///
+/// Mapping rules:
+/// - `authentication_error` → `invalid_request_error`
+/// - `permission_error` → `invalid_request_error`
+/// - `not_found_error` → `invalid_request_error`
+/// - `rate_limit_error` → `rate_limit_error`
+/// - `overloaded_error` → `api_error`
+/// - `billing_error` → `invalid_request_error`
+/// - `api_error` → `api_error`
+/// - `invalid_request_error` → `invalid_request_error`
+/// - `request_too_large` → `invalid_request_error`
+/// - Others → `api_error`
+pub fn map_error_type(error_type: &str) -> &'static str {
+    match error_type {
+        "invalid_request_error" | "authentication_error" | "permission_error"
+        | "not_found_error" | "billing_error" | "request_too_large" => "invalid_request_error",
+        "rate_limit_error" => "rate_limit_error",
+        "overloaded_error" | "api_error" => "api_error",
+        _ => "api_error",
     }
 }
 
@@ -90,6 +114,9 @@ pub fn convert_non_streaming_error(body: &Value) -> (u16, Value) {
 
     let (code, http_status) = convert_error_type(error_type, message);
 
+    // Map Anthropic error type to Responses API error type.
+    let mapped_type = map_error_type(error_type);
+
     // Log request_id for debugging (not returned in response).
     if let Some(req_id) = body.get("request_id").and_then(|v| v.as_str()) {
         tracing::debug!(request_id = req_id, "Anthropic error request_id");
@@ -98,7 +125,7 @@ pub fn convert_non_streaming_error(body: &Value) -> (u16, Value) {
     let responses_body = json!({
         "error": {
             "message": message,
-            "type": error_type,
+            "type": mapped_type,
             "param": Value::Null,
             "code": code,
         }
@@ -297,7 +324,7 @@ mod tests {
         assert_eq!(map_http_status(402), 402);
         assert_eq!(map_http_status(403), 403);
         assert_eq!(map_http_status(404), 404);
-        assert_eq!(map_http_status(413), 413);
+        assert_eq!(map_http_status(413), 400, "413 must map to 400");
         assert_eq!(map_http_status(429), 429);
         assert_eq!(map_http_status(500), 500);
     }

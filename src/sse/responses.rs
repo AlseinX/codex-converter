@@ -15,6 +15,11 @@ pub enum ResponsesEvent {
         created_at: u64,
         model: String,
     },
+    ResponseInProgress {
+        response_id: String,
+        created_at: u64,
+        model: String,
+    },
 
     // -- Output item events --
     OutputItemAdded {
@@ -100,6 +105,9 @@ pub enum ResponsesEvent {
         code: String,
         message: String,
     },
+
+    // -- Terminal marker --
+    Done,
 }
 
 impl ResponsesEvent {
@@ -125,6 +133,25 @@ impl ResponsesEvent {
                     }
                 });
                 ("response.created".to_string(), data.to_string())
+            }
+
+            ResponsesEvent::ResponseInProgress {
+                response_id,
+                created_at,
+                model,
+            } => {
+                let data = json!({
+                    "type": "response.in_progress",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": created_at,
+                        "model": model,
+                        "status": "in_progress",
+                        "output": [],
+                    }
+                });
+                ("response.in_progress".to_string(), data.to_string())
             }
 
             ResponsesEvent::OutputItemAdded { output_index, item } => {
@@ -336,6 +363,11 @@ impl ResponsesEvent {
                 });
                 ("error".to_string(), data.to_string())
             }
+
+            // Done is a special marker -- to_sse returns the [DONE] data payload.
+            // The caller should use format_done() for wire format, but this allows
+            // it to be mixed into the event stream.
+            ResponsesEvent::Done => ("done".to_string(), "[DONE]".to_string())
         }
     }
 }
@@ -649,6 +681,11 @@ mod tests {
                 created_at: 0,
                 model: "m".into(),
             },
+            ResponsesEvent::ResponseInProgress {
+                response_id: "msg_01".into(),
+                created_at: 0,
+                model: "m".into(),
+            },
             ResponsesEvent::OutputItemAdded {
                 output_index: 0,
                 item: json!({}),
@@ -720,9 +757,15 @@ mod tests {
                 code: "x".into(),
                 message: "x".into(),
             },
+            ResponsesEvent::Done,
         ];
         for evt in &events {
             let (_, data) = evt.to_sse();
+            // Done is not JSON -- skip parsing.
+            if matches!(evt, ResponsesEvent::Done) {
+                assert_eq!(data, "[DONE]");
+                continue;
+            }
             let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
             assert!(
                 parsed.get("sequence_number").is_none(),

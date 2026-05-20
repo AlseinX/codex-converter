@@ -154,6 +154,11 @@ impl StreamingState {
                 created_at: self.created_at,
                 model: self.model.clone(),
             },
+            ResponsesEvent::ResponseInProgress {
+                response_id: self.response_id.clone(),
+                created_at: self.created_at,
+                model: self.model.clone(),
+            },
         ]
     }
 
@@ -577,6 +582,7 @@ impl StreamingState {
             ResponsesEvent::ResponseFailed {
                 response: response_obj,
             },
+            ResponsesEvent::Done,
         ]
     }
 }

@@ -186,11 +186,13 @@ fn error_event_then_failed_then_done_sequence() {
         error: json!({"type": "api_error", "message": "Internal server error"}),
     });
 
-    // Must produce exactly 2 events: error + response.failed.
-    assert_eq!(events.len(), 2, "error must produce exactly error + response.failed");
+    // Must produce exactly 3 events: error + response.failed + Done.
+    assert_eq!(events.len(), 3, "error must produce exactly error + response.failed + Done");
 
     let (t0, _) = events[0].to_sse();
     let (t1, _) = events[1].to_sse();
     assert_eq!(t0, "error", "first event must be error");
     assert_eq!(t1, "response.failed", "second event must be response.failed");
+    // Third event is the Done terminal marker.
+    assert!(matches!(events[2], codex_conv::sse::responses::ResponsesEvent::Done));
 }

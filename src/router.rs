@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
@@ -64,6 +64,27 @@ impl RouteInfo {
     }
 }
 
+/// Extract the API key from the Authorization header.
+///
+/// Accepts both `Bearer <key>` (case-insensitive prefix) and raw `<key>`.
+/// Returns `None` if the header is missing or the extracted key is empty.
+fn extract_api_key(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("authorization")?.to_str().ok()?;
+    let key = if let Some(stripped) = value.strip_prefix("Bearer ") {
+        stripped
+    } else if let Some(stripped) = value.strip_prefix("bearer ") {
+        stripped
+    } else {
+        value
+    };
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Shared application state passed to all handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -74,7 +95,7 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Catch-all route that accepts any path ending in /responses.
-        .route("/*path", post(handle_responses))
+        .route("/{*path}", post(handle_responses))
         .with_state(state)
 }
 
@@ -83,6 +104,22 @@ async fn handle_responses(
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Response<Body>, (StatusCode, axum::Json<serde_json::Value>)> {
+    // Extract API key from Authorization header.
+    let api_key = extract_api_key(req.headers()).ok_or_else(|| {
+        tracing::warn!("missing or empty Authorization header");
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": "Missing or invalid Authorization header",
+                    "type": "authentication_error",
+                    "param": null,
+                    "code": "invalid_api_key"
+                }
+            })),
+        )
+    })?;
+
     let path = req.uri().path().to_string();
     let route_info = RouteInfo::parse(&path).ok_or_else(|| {
         tracing::warn!(path = %path, "invalid route path");
@@ -99,10 +136,16 @@ async fn handle_responses(
         )
     })?;
 
-    tracing::debug!(path = %path, upstream = %route_info.upstream_base_url, "routed request");
+    tracing::debug!(
+        path = %path,
+        upstream = %route_info.upstream_base_url,
+        "routed request"
+    );
 
     // TODO (Task 5+): Create ConversionTask and delegate.
-    let _ = (state, route_info);
+    // The api_key will be forwarded as x-api-key to Anthropic when
+    // request forwarding is wired up.
+    let _ = (state, route_info, api_key);
     Ok(Response::builder()
         .status(StatusCode::NOT_IMPLEMENTED)
         .body(Body::from("not yet implemented"))
@@ -162,5 +205,118 @@ mod tests {
             route.upstream_messages_url(),
             "https://api.anthropic.com/v1/messages"
         );
+    }
+
+    // --- API key extraction tests ---
+
+    use axum::http::header::AUTHORIZATION;
+
+    #[test]
+    fn extract_api_key_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer sk-test-123".parse().unwrap());
+        let key = extract_api_key(&headers).unwrap();
+        assert_eq!(key, "sk-test-123");
+    }
+
+    #[test]
+    fn extract_api_key_lowercase_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "bearer sk-lowercase".parse().unwrap());
+        let key = extract_api_key(&headers).unwrap();
+        assert_eq!(key, "sk-lowercase");
+    }
+
+    #[test]
+    fn extract_api_key_raw_token_no_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "sk-raw-token".parse().unwrap());
+        let key = extract_api_key(&headers).unwrap();
+        assert_eq!(key, "sk-raw-token");
+    }
+
+    #[test]
+    fn extract_api_key_missing_header_returns_none() {
+        let headers = HeaderMap::new();
+        assert!(extract_api_key(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_api_key_empty_bearer_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert!(extract_api_key(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_api_key_empty_value_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "".parse().unwrap());
+        assert!(extract_api_key(&headers).is_none());
+    }
+
+    // --- Handler-level 401 tests using a test router ---
+
+    use axum::body::Body as AxumBody;
+    use tower::ServiceExt;
+
+    fn test_app() -> axum::Router {
+        use crate::config::AppConfig;
+        let state = AppState {
+            config: AppConfig::default(),
+        };
+        build_router(state)
+    }
+
+    #[tokio::test]
+    async fn handler_returns_401_when_no_auth_header() {
+        let app = test_app();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/https/api.anthropic.com/responses")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handler_returns_401_when_empty_bearer() {
+        let app = test_app();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/https/api.anthropic.com/responses")
+            .header("authorization", "Bearer ")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handler_passes_auth_with_bearer_token() {
+        let app = test_app();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/https/api.anthropic.com/responses")
+            .header("authorization", "Bearer sk-valid-key")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // 501 NOT_IMPLEMENTED means auth passed (handler reached forwarding stub)
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn handler_passes_auth_with_raw_token() {
+        let app = test_app();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/https/api.anthropic.com/responses")
+            .header("authorization", "sk-raw-key")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }

@@ -23,7 +23,9 @@ hex = "0.4"
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+tower = "0.5"
