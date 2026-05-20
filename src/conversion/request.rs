@@ -77,15 +77,29 @@ pub fn convert_request(
     }
 
     // Temperature: pass through only when thinking not enabled.
+    // Clamp to 0–1 range (Anthropic range). Spec: values >1 must be clamped to 1.
     if !thinking_cfg.thinking_enabled {
         if let Some(temp) = obj.get("temperature") {
-            result["temperature"] = temp.clone();
+            if let Some(temp_val) = temp.as_f64() {
+                result["temperature"] = json!(temp_val.clamp(0.0, 1.0));
+            } else {
+                result["temperature"] = temp.clone();
+            }
         }
     }
 
-    // top_p: pass through.
+    // top_p: pass through with clamping when thinking enabled.
+    // Spec: when thinking enabled, clamp to 0.95–1.0 range.
     if let Some(top_p) = obj.get("top_p") {
-        result["top_p"] = top_p.clone();
+        if let Some(tp_val) = top_p.as_f64() {
+            if thinking_cfg.thinking_enabled {
+                result["top_p"] = json!(tp_val.clamp(0.95, 1.0));
+            } else {
+                result["top_p"] = json!(tp_val);
+            }
+        } else {
+            result["top_p"] = top_p.clone();
+        }
     }
 
     // max_output_tokens -> max_tokens.
@@ -547,6 +561,16 @@ fn convert_single_input_item(
                 .unwrap_or("")
                 .to_string();
 
+            // Namespace restoration: if function_call has a namespace field, reconstruct
+            // the full namespaced tool name (mcp__{server}__{tool}) for Anthropic.
+            // Matches NamespaceRegistry::flatten_and_register: trim trailing underscores, then join with __.
+            let full_name = if let Some(ns) = item.get("namespace").and_then(|v| v.as_str()) {
+                let trimmed = ns.trim_end_matches('_');
+                format!("{}__{}", trimmed, name)
+            } else {
+                name
+            };
+
             // Parse arguments from JSON string.
             let raw_args = match item_type {
                 "function_call" => item
@@ -569,7 +593,7 @@ fn convert_single_input_item(
             let tool_use = json!({
                 "type": "tool_use",
                 "id": toolu_id,
-                "name": name,
+                "name": full_name,
                 "input": parsed_input,
             });
 
@@ -590,8 +614,6 @@ fn convert_single_input_item(
                 .get_toolu_for_call(&call_id)
                 .cloned()
                 .unwrap_or_else(|| {
-                    // If the call_id was not registered (e.g., function_call was in a previous
-                    // turn), generate a new toolu_id for it.
                     tracing::warn!(call_id = %call_id, "function_call_output references unregistered call_id, generating new toolu_id");
                     let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
                     task.id_map.insert_with_toolu(call_id.clone(), id.clone());
@@ -600,11 +622,18 @@ fn convert_single_input_item(
 
             let content = content::convert_tool_result_content(&output);
 
-            let tool_result = json!({
+            let mut tool_result = json!({
                 "type": "tool_result",
                 "tool_use_id": toolu_id,
                 "content": content,
             });
+
+            // Map success → is_error: success: false → is_error: true; true/absent → omit.
+            if let Some(success) = item.get("success").and_then(|v| v.as_bool()) {
+                if !success {
+                    tool_result["is_error"] = json!(true);
+                }
+            }
 
             Ok(vec![(Some("user".to_string()), vec![tool_result])])
         }
@@ -2892,5 +2921,100 @@ mod tests {
         let tool_result = &messages[0]["content"][0];
         assert_eq!(tool_result["type"], "tool_result");
         assert!(tool_result["tool_use_id"].as_str().unwrap().starts_with("toolu_"));
+    }
+
+    // =========================================================================
+    // Fix R1: Temperature clamping
+    // =========================================================================
+
+    #[test]
+    fn temperature_clamped_above_1() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "temperature": 1.5,
+            "input": []
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        assert_eq!(result["temperature"], 1.0);
+    }
+
+    // =========================================================================
+    // Fix R2: top_p clamping when thinking enabled
+    // =========================================================================
+
+    #[test]
+    fn top_p_clamped_when_thinking_enabled() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "top_p": 0.5,
+            "input": []
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        assert_eq!(result["top_p"], 0.95);
+    }
+
+    // =========================================================================
+    // Fix R3: function_call_output success → is_error mapping
+    // =========================================================================
+
+    #[test]
+    fn function_call_output_success_false_maps_to_is_error() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "function_call", "call_id": "call_001", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_001", "output": "command failed", "success": false}
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        let tool_result = &messages[1]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["is_error"], true);
+    }
+
+    #[test]
+    fn function_call_output_success_true_omits_is_error() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "function_call", "call_id": "call_001", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_001", "output": "command succeeded", "success": true}
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        let tool_result = &messages[1]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert!(
+            tool_result.get("is_error").is_none(),
+            "is_error should be omitted when success is true"
+        );
+    }
+
+    // =========================================================================
+    // Fix R4: function_call namespace restoration
+    // =========================================================================
+
+    #[test]
+    fn function_call_namespace_restoration() {
+        let mut task = make_task();
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "input": [
+                {"type": "function_call", "call_id": "call_001", "name": "search", "namespace": "mcp__memory__", "arguments": "{\"query\":\"test\"}"}
+            ]
+        });
+        let result = convert_request(&mut task, input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "assistant");
+        let tool_use = &messages[0]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "mcp__memory__search");
     }
 }
