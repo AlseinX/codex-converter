@@ -113,12 +113,6 @@ data: [DONE]"#;
     // Verify terminal event.
     assert!(output_sse.contains("event: response.completed"), "must emit response.completed");
 
-    // When stop_reason is tool_use, end_turn must be false.
-    assert!(
-        output_sse.contains("\"end_turn\":false"),
-        "end_turn must be false when stop_reason is tool_use"
-    );
-
     // Accumulated arguments in done event.
     assert!(
         output_sse.contains("\"arguments\":\"{\\\"query\\\":\\\"test\\\"}\""),

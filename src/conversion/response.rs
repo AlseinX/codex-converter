@@ -542,11 +542,6 @@ impl StreamingState {
             response_obj["incomplete_details"] = json!({"reason": "max_output_tokens"});
         }
 
-        // end_turn: false only when stop_reason is tool_use, omit otherwise.
-        if stop_reason == "tool_use" {
-            response_obj["end_turn"] = json!(false);
-        }
-
         // Echo back request fields.
         response_obj["parallel_tool_calls"] = json!(self.parallel_tool_calls_echo);
         response_obj["tool_choice"] = json!(self.tool_choice_echo);
@@ -576,6 +571,7 @@ impl StreamingState {
             "object": "response",
             "created_at": self.created_at,
             "completed_at": now_secs(),
+            "model": self.model,
             "status": "failed",
             "error": {"code": code, "message": message},
             "output": self.output_items,
@@ -886,40 +882,6 @@ mod tests {
         assert_eq!(
             parsed["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
-        );
-    }
-
-    // --- end_turn only when tool_use ---
-
-    #[test]
-    fn end_turn_false_only_when_tool_use() {
-        let mut state = make_state();
-        state.process_event(AnthropicEvent::MessageStart {
-            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
-        });
-        state.process_event(AnthropicEvent::MessageDelta {
-            delta: json!({"stop_reason": "tool_use", "stop_sequence": null}),
-            usage: json!({"output_tokens": 50}),
-        });
-        let events = state.process_event(AnthropicEvent::MessageStop);
-        let (_, data) = events
-            .iter()
-            .find(|e| {
-                let (t, _) = e.to_sse();
-                t == "response.completed"
-            })
-            .unwrap()
-            .to_sse();
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["response"]["end_turn"], false);
-    }
-
-    #[test]
-    fn end_turn_absent_when_not_tool_use() {
-        let (_, parsed) = run_text_stream("Hello", "end_turn");
-        assert!(
-            parsed["response"].get("end_turn").is_none(),
-            "end_turn should be absent when stop_reason != tool_use"
         );
     }
 

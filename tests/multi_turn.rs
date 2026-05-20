@@ -136,7 +136,6 @@ data: [DONE]"#;
     assert!(output1.contains("response.reasoning_summary_text.delta"));
     assert!(output1.contains("response.function_call_arguments.delta"));
     assert!(output1.contains("event: response.completed"));
-    assert!(output1.contains("\"end_turn\":false"), "tool_use stop must set end_turn false");
     assert!(!output1.contains("SIG_TURN1_ABC"), "signature must not appear in SSE");
 
     // Cache signatures.

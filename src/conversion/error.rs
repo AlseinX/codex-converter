@@ -80,7 +80,7 @@ pub fn map_http_status(status: u16) -> u16 {
 /// - `rate_limit_error` → `rate_limit_error`
 /// - `overloaded_error` → `server_error`
 /// - `billing_error` → `invalid_request_error`
-/// - `api_error` → `api_error`
+/// - `api_error` → `server_error`
 /// - `invalid_request_error` → `invalid_request_error`
 /// - `request_too_large` → `invalid_request_error`
 /// - Others → depends on HTTP status family
@@ -90,7 +90,7 @@ pub fn map_error_type(error_type: &str, http_status: Option<u16>) -> &'static st
         | "not_found_error" | "billing_error" | "request_too_large" => "invalid_request_error",
         "rate_limit_error" => "rate_limit_error",
         "overloaded_error" => "server_error",
-        "api_error" => "api_error",
+        "api_error" => "server_error",
         _ => {
             match http_status {
                 Some(s) if (400..=499).contains(&s) => "invalid_request_error",
