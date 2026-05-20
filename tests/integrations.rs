@@ -255,6 +255,18 @@ async fn exec_command_tool_call() {
     );
 }
 
+/// Verify that the proxy correctly converts apply_patch tool calls from the
+/// OpenAI Responses API format to the Anthropic Messages API format.
+///
+/// This test MUST produce a `file_change` JSONL event, which indicates that
+/// Codex used its built-in `apply_patch` tool. If the result is a
+/// `command_execution` event instead, it means Codex fell back to using
+/// `exec_command` (e.g. `sed`/`echo`) to edit the file — this is a protocol
+/// conversion failure. When apply_patch is not properly converted, Codex
+/// detects the tool failure and retries file editing through an alternative
+/// path. That fallback is evidence that our conversion pipeline broke the
+/// tool call, and this test MUST fail in that case. This requirement is
+/// non-negotiable and must never be relaxed.
 #[tokio::test]
 #[ignore]
 async fn apply_patch_tool_call() {
