@@ -1,0 +1,299 @@
+//! Live integration tests: Codex CLI → proxy → upstream Anthropic API.
+//!
+//! Each test starts its own in-process proxy via `tokio::spawn` and runs
+//! `codex exec` through it. Credentials come from `$HOME/.claude/settings.json`
+//! or environment variables.
+//!
+//! Run with: `cargo test --test integrations -- --ignored --test-threads=1`
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use codex_conv::config::AppConfig;
+use codex_conv::router::{AppState, build_router};
+use tokio::process::Command;
+
+// ---------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------
+
+fn get_credential(settings_key: &str, env_name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(env_name) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".claude/settings.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
+    settings
+        .get("env")
+        .and_then(|e| e.get(settings_key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn api_key() -> String {
+    get_credential("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+        .expect("ANTHROPIC_AUTH_TOKEN not found in ~/.claude/settings.json or env")
+}
+
+fn base_url() -> String {
+    get_credential("ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL")
+        .expect("ANTHROPIC_BASE_URL not found in ~/.claude/settings.json or env")
+}
+
+// ---------------------------------------------------------------------------
+// In-process proxy (one per test)
+// ---------------------------------------------------------------------------
+
+/// Start the proxy on a random port. Returns the listening address.
+/// The server lives as long as the returned `JoinHandle` is not dropped.
+async fn start_proxy() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind proxy listener");
+    let addr = listener.local_addr().unwrap();
+
+    let config = AppConfig::default();
+    let state = AppState { config };
+    let app = build_router(state);
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("proxy server error: {e}");
+        }
+    });
+
+    (addr, handle)
+}
+
+// ---------------------------------------------------------------------------
+// Codex exec helper
+// ---------------------------------------------------------------------------
+
+async fn codex_exec(
+    proxy_addr: SocketAddr,
+    prompt: &str,
+    workdir: Option<&std::path::Path>,
+) -> Vec<String> {
+    // codex sends POST to base_url + "/responses".
+    // Proxy route expects /https/<host>/responses, so base_url = http://proxy/https/<host>.
+    let upstream = base_url();
+    let host = upstream
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let proxy_base = format!("http://{}/https/{host}", proxy_addr);
+
+    let key = api_key();
+    let model = std::env::var("CODEX_CONV_TEST_MODEL").unwrap_or_else(|_| "glm-5.1".to_string());
+
+    let tmpdir;
+    let cwd = match workdir {
+        Some(p) => p.as_os_str().to_owned(),
+        None => {
+            tmpdir = tempfile::tempdir().expect("tempdir");
+            std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(tmpdir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git init failed");
+            tmpdir.path().as_os_str().to_owned()
+        }
+    };
+
+    let output = Command::new("codex")
+        .arg("exec")
+        .arg("--json")
+        .arg("--skip-git-repo-check")
+        .arg("-m")
+        .arg(&model)
+        .arg("-c")
+        .arg("approval_policy=\"never\"")
+        .arg("-c")
+        .arg("sandbox_mode=\"danger-full-access\"")
+        .arg("-c")
+        .arg("model_providers.custom.name=\"test\"")
+        .arg("-c")
+        .arg(format!("model_providers.custom.base_url=\"{proxy_base}\""))
+        .arg("-c")
+        .arg("model_provider=\"custom\"")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("-C")
+        .arg(&cwd)
+        .arg("--ephemeral")
+        .arg("--ignore-user-config")
+        .arg("--ignore-rules")
+        .arg(prompt)
+        .env("OPENAI_API_KEY", &key)
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("failed to spawn codex");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "codex exec failed ({}). stderr: {}",
+            output.status,
+            stderr.chars().take(3000).collect::<String>()
+        );
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// JSONL helpers
+// ---------------------------------------------------------------------------
+
+fn parse_jsonl(lines: &[String]) -> Vec<serde_json::Value> {
+    lines
+        .iter()
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+fn extract_agent_message(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().find_map(|ev| {
+        if ev.get("type").and_then(|t| t.as_str()) != Some("item.completed") {
+            return None;
+        }
+        let item = ev.get("item")?;
+        if item.get("type").and_then(|t| t.as_str()) != Some("agent_message") {
+            return None;
+        }
+        item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+    })
+}
+
+fn has_item_type(events: &[serde_json::Value], ty: &str) -> bool {
+    events.iter().any(|ev| {
+        ev.get("type").and_then(|t| t.as_str()) == Some("item.completed")
+            && ev.get("item")
+                .and_then(|i| i.get("type"))
+                .and_then(|t| t.as_str())
+                == Some(ty)
+    })
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn simple_text_response() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(addr, "Reply with exactly the word PONG and nothing else.", None).await;
+    let events = parse_jsonl(&lines);
+    assert!(!events.is_empty(), "must receive JSONL events");
+
+    let msg = extract_agent_message(&events).expect("must have agent_message");
+    assert!(
+        msg.to_uppercase().contains("PONG"),
+        "agent should say PONG, got: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn exec_command_tool_call() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(addr, "Run the command: echo HELLO_TOOL_TEST", None).await;
+    let events = parse_jsonl(&lines);
+    assert!(
+        has_item_type(&events, "command_execution"),
+        "must have command_execution item"
+    );
+    let msg = extract_agent_message(&events).expect("must have agent_message");
+    assert!(
+        msg.contains("HELLO_TOOL_TEST"),
+        "agent should report command output, got: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn apply_patch_tool_call() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let file_path = tmpdir.path().join("patch_target.txt");
+    std::fs::write(&file_path, "Hello World\n").unwrap();
+
+    let lines = codex_exec(
+        addr,
+        "Replace 'World' with 'Universe' in patch_target.txt using apply_patch",
+        Some(tmpdir.path()),
+    )
+    .await;
+
+    // The model may use apply_patch (file_change) or exec_command to edit.
+    // What matters is the file actually changed.
+    let content = std::fs::read_to_string(&file_path).unwrap();
+    assert!(content.contains("Universe"), "file should say Universe: {content}");
+    assert!(!content.contains("World"), "World should be gone: {content}");
+
+    // Additionally verify that at least one tool was used (not just text).
+    let events = parse_jsonl(&lines);
+    assert!(
+        has_item_type(&events, "command_execution") || has_item_type(&events, "file_change"),
+        "must use at least one tool to edit the file"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn multi_turn_conversation() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(
+        addr,
+        "Run 'uname -a' and then tell me the kernel version number only.",
+        None,
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+    assert!(
+        has_item_type(&events, "command_execution"),
+        "must have command_execution"
+    );
+    let msg = extract_agent_message(&events).expect("must have agent_message");
+    assert!(!msg.is_empty(), "agent must respond");
+}
+
+#[tokio::test]
+#[ignore]
+async fn developer_role_mapped_correctly() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(addr, "Say OK", None).await;
+    let events = parse_jsonl(&lines);
+    assert!(
+        extract_agent_message(&events).is_some(),
+        "must receive response (developer→user mapping works)"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn stream_termination_handled() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(addr, "Say hello", None).await;
+    let events = parse_jsonl(&lines);
+    let has_completed = events
+        .iter()
+        .any(|ev| ev.get("type").and_then(|t| t.as_str()) == Some("turn.completed"));
+    assert!(has_completed, "must have turn.completed (clean stream termination)");
+}
