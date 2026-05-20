@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 
+use crate::conversion::namespace::NamespaceRegistry;
+
 /// Convert a Responses API user content block to an Anthropic content block.
 ///
 /// Supported types:
@@ -128,6 +130,109 @@ pub fn convert_tool_result_content(output: &Value) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Response direction: Anthropic content block → Responses API output item
+// ---------------------------------------------------------------------------
+
+/// Convert an Anthropic content block to a Responses API output item.
+///
+/// Returns `(output_item, reasoning_id)`.
+/// `reasoning_id` is populated only for `thinking` and `redacted_thinking` blocks.
+/// `fc_counter` is incremented for each `tool_use` block to generate sequential `fc_N` IDs.
+///
+/// ID generation:
+/// - reasoning: `rs_{uuid_v4}` (proxy-generated)
+/// - function_call: `fc_{sequential}` with `call_{sequential}` call_id (proxy-generated)
+/// - message: no generated ID (uses response ID from caller)
+pub fn convert_content_block_to_output(
+    block: &Value,
+    namespace_registry: &NamespaceRegistry,
+    _output_index: usize,
+    fc_counter: &mut u64,
+) -> (Value, String) {
+    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match block_type {
+        "text" => {
+            let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let item = json!({
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }]
+            });
+            (item, String::new())
+        }
+        "thinking" => {
+            let thinking_text = block.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+            let reasoning_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
+            let item = json!({
+                "type": "reasoning",
+                "id": &reasoning_id,
+                "summary": [{
+                    "type": "summary_text",
+                    "text": thinking_text,
+                }],
+                // encrypted_content and content fields are OMITTED (not null, not empty).
+            });
+            (item, reasoning_id)
+        }
+        "redacted_thinking" => {
+            let data = block.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            let reasoning_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
+            let item = json!({
+                "type": "reasoning",
+                "id": &reasoning_id,
+                "summary": [],
+                "encrypted_content": data,
+            });
+            (item, reasoning_id)
+        }
+        "tool_use" => {
+            let _toolu_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let input = block.get("input").cloned().unwrap_or(json!({}));
+
+            // Serialize input to JSON string for arguments field.
+            let arguments = serde_json::to_string(&input).unwrap_or_default();
+
+            // Generate sequential IDs.
+            let fc_id = format!("fc_{}", fc_counter);
+            let call_id = format!("call_{}", fc_counter);
+            *fc_counter += 1;
+
+            let mut item = json!({
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": raw_name,
+                "status": "completed",
+                "arguments": arguments,
+            });
+
+            // Check namespace registry for the tool name.
+            if let Some(entry) = namespace_registry.lookup(raw_name) {
+                item["name"] = json!(entry.tool_name);
+                item["namespace"] = json!(entry.namespace);
+            }
+            // Registry miss -> plain function_call without namespace field.
+
+            (item, String::new())
+        }
+        _ => {
+            tracing::warn!(
+                block_type = block_type,
+                "unknown Anthropic content block type in response"
+            );
+            (json!({}), String::new())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +308,123 @@ mod tests {
         let input = json!({"type": "input_video", "url": "..."});
         let result = convert_user_content(&input);
         assert!(result.is_none());
+    }
+
+    // --- Response direction tests ---
+
+    #[test]
+    fn text_to_message_output_item() {
+        let block = json!({"type": "text", "text": "Hello world"});
+        let (item, reasoning_id) =
+            convert_content_block_to_output(&block, &NamespaceRegistry::new(), 0, &mut 0);
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "assistant");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["content"][0]["type"], "output_text");
+        assert_eq!(item["content"][0]["text"], "Hello world");
+        assert_eq!(item["content"][0]["annotations"], json!([]));
+        assert!(reasoning_id.is_empty());
+    }
+
+    #[test]
+    fn thinking_to_reasoning_output_item() {
+        let block = json!({"type": "thinking", "thinking": "Let me analyze..."});
+        let mut fc_counter = 0u64;
+        let (item, reasoning_id) =
+            convert_content_block_to_output(&block, &NamespaceRegistry::new(), 1, &mut fc_counter);
+        assert_eq!(item["type"], "reasoning");
+        assert!(
+            reasoning_id.starts_with("rs_"),
+            "reasoning ID should start with rs_, got {}",
+            reasoning_id
+        );
+        assert_eq!(item["id"], reasoning_id);
+        assert_eq!(item["summary"][0]["type"], "summary_text");
+        assert_eq!(item["summary"][0]["text"], "Let me analyze...");
+        assert!(
+            item.get("encrypted_content").is_none(),
+            "encrypted_content should be absent"
+        );
+        assert!(
+            item.get("content").is_none(),
+            "content field should be absent"
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_to_reasoning_with_encrypted_content() {
+        let block = json!({"type": "redacted_thinking", "data": "ENCRYPTED_BLOB"});
+        let mut fc_counter = 0u64;
+        let (item, reasoning_id) =
+            convert_content_block_to_output(&block, &NamespaceRegistry::new(), 2, &mut fc_counter);
+        assert_eq!(item["type"], "reasoning");
+        assert!(reasoning_id.starts_with("rs_"));
+        assert_eq!(item["encrypted_content"], "ENCRYPTED_BLOB");
+        assert_eq!(item["summary"], json!([]));
+    }
+
+    #[test]
+    fn tool_use_to_function_call_no_namespace() {
+        let reg = NamespaceRegistry::new();
+        // No registration -- tool not in namespace registry.
+        let block = json!({"type": "tool_use", "id": "toolu_01ABC", "name": "exec_command", "input": {"command": "ls"}});
+        let mut fc_counter = 0u64;
+        let (item, _) = convert_content_block_to_output(&block, &reg, 3, &mut fc_counter);
+        assert_eq!(item["type"], "function_call");
+        assert!(
+            item["id"].as_str().unwrap().starts_with("fc_"),
+            "function call ID should start with fc_"
+        );
+        assert!(item["call_id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(item["name"], "exec_command");
+        assert_eq!(item["arguments"], "{\"command\":\"ls\"}");
+        assert!(
+            item.get("namespace").is_none(),
+            "no namespace when not in registry"
+        );
+        assert_eq!(item["status"], "completed");
+        assert_eq!(fc_counter, 1);
+    }
+
+    #[test]
+    fn tool_use_to_function_call_with_namespace() {
+        let mut reg = NamespaceRegistry::new();
+        reg.register(
+            "mcp__memory__search".to_string(),
+            "mcp__memory__".to_string(),
+            "search".to_string(),
+        );
+        let block = json!({"type": "tool_use", "id": "toolu_01ABC", "name": "mcp__memory__search", "input": {"query": "test"}});
+        let mut fc_counter = 0u64;
+        let (item, _) = convert_content_block_to_output(&block, &reg, 4, &mut fc_counter);
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["name"], "search");
+        assert_eq!(item["namespace"], "mcp__memory__");
+        assert_eq!(item["arguments"], "{\"query\":\"test\"}");
+    }
+
+    #[test]
+    fn fc_counter_increments_per_tool_use() {
+        let reg = NamespaceRegistry::new();
+        let block1 = json!({"type": "tool_use", "id": "toolu_01", "name": "a", "input": {}});
+        let block2 = json!({"type": "tool_use", "id": "toolu_02", "name": "b", "input": {}});
+        let mut fc_counter = 0u64;
+        let (item1, _) = convert_content_block_to_output(&block1, &reg, 0, &mut fc_counter);
+        let (item2, _) = convert_content_block_to_output(&block2, &reg, 1, &mut fc_counter);
+        assert_eq!(fc_counter, 2);
+        assert_eq!(item1["id"], "fc_0");
+        assert_eq!(item2["id"], "fc_1");
+    }
+
+    #[test]
+    fn rs_ids_are_unique_uuids() {
+        let block1 = json!({"type": "thinking", "thinking": "a"});
+        let block2 = json!({"type": "thinking", "thinking": "b"});
+        let mut fc_counter = 0u64;
+        let (_, id1) =
+            convert_content_block_to_output(&block1, &NamespaceRegistry::new(), 0, &mut fc_counter);
+        let (_, id2) =
+            convert_content_block_to_output(&block2, &NamespaceRegistry::new(), 1, &mut fc_counter);
+        assert_ne!(id1, id2, "reasoning IDs must be unique");
     }
 }
