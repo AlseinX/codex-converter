@@ -49,3 +49,46 @@ impl SignatureCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_and_retrieve() {
+        let cache = SignatureCache::new(Duration::from_secs(3600));
+        cache.insert("rs_001".to_string(), "sig_abc".to_string());
+        assert_eq!(cache.get("rs_001"), Some("sig_abc".to_string()));
+    }
+
+    #[test]
+    fn expired_entry_returns_none() {
+        let cache = SignatureCache::new(Duration::from_millis(1));
+        cache.insert("rs_001".to_string(), "sig_abc".to_string());
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(cache.get("rs_001"), None);
+    }
+
+    #[test]
+    fn missing_entry_returns_none() {
+        let cache = SignatureCache::new(Duration::from_secs(3600));
+        assert_eq!(cache.get("rs_nonexistent"), None);
+    }
+
+    #[test]
+    fn overwrite_existing() {
+        let cache = SignatureCache::new(Duration::from_secs(3600));
+        cache.insert("rs_001".to_string(), "sig_old".to_string());
+        cache.insert("rs_001".to_string(), "sig_new".to_string());
+        assert_eq!(cache.get("rs_001"), Some("sig_new".to_string()));
+    }
+
+    #[test]
+    fn multiple_entries_independent() {
+        let cache = SignatureCache::new(Duration::from_secs(3600));
+        cache.insert("rs_001".to_string(), "sig_a".to_string());
+        cache.insert("rs_002".to_string(), "sig_b".to_string());
+        assert_eq!(cache.get("rs_001"), Some("sig_a".to_string()));
+        assert_eq!(cache.get("rs_002"), Some("sig_b".to_string()));
+    }
+}
