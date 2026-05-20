@@ -166,7 +166,7 @@ pub fn streaming_error_event(code: &str, message: &str) -> Value {
 /// that were accumulated before the error occurred.
 pub fn streaming_failed_response(
     response_id: &str,
-    _model: &str,
+    model: &str,
     accumulated_output: &[Value],
     error_code: &str,
     error_message: &str,
@@ -177,6 +177,8 @@ pub fn streaming_failed_response(
             "id": response_id,
             "object": "response",
             "created_at": chrono_offset_now_secs(),
+            "completed_at": chrono_offset_now_secs(),
+            "model": model,
             "status": "failed",
             "error": {
                 "code": error_code,
@@ -425,6 +427,8 @@ mod tests {
         assert_eq!(resp["id"], "resp_test123");
         assert_eq!(resp["object"], "response");
         assert!(resp["created_at"].as_u64().unwrap() > 0);
+        assert!(resp["completed_at"].as_u64().unwrap() > 0);
+        assert_eq!(resp["model"], "claude-sonnet-4-20250514");
         assert_eq!(resp["status"], "failed");
         assert_eq!(resp["error"]["code"], "server_error");
         assert_eq!(resp["error"]["message"], "Internal server error");

@@ -1,7 +1,6 @@
 use crate::config::AppConfig;
 use crate::router::{build_router, AppState};
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::time::Duration;
 
@@ -25,17 +24,24 @@ async fn run_plain(
     app: axum::Router,
     config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "listening (HTTP)");
 
-    let shutdown = shutdown_signal();
     let timeout = Duration::from_secs(config.server.shutdown_timeout);
+    let handle = axum_server::Handle::new();
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+    // Spawn shutdown signal watcher with timeout, same as run_tls.
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(timeout));
+    });
+
+    axum_server::bind(addr)
+        .handle(handle)
+        .serve(app.into_make_service())
         .await?;
 
-    tracing::info!(?timeout, "shutdown complete");
+    tracing::info!("shutdown complete");
     Ok(())
 }
 

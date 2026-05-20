@@ -23,8 +23,11 @@ pub fn load_server_tls(
 }
 
 /// Build a reqwest TLS client config for upstream connections.
+///
+/// If `proxy` is non-empty, configures the client to use that HTTP proxy.
 pub fn build_upstream_tls_config(
     config: &UpstreamTlsConfig,
+    proxy: &str,
 ) -> Result<reqwest::ClientBuilder, Box<dyn std::error::Error + Send + Sync>> {
     // Install the default crypto provider if not already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -49,6 +52,12 @@ pub fn build_upstream_tls_config(
             let reqwest_cert = reqwest::Certificate::from_der(cert.as_ref())?;
             builder = builder.add_root_certificate(reqwest_cert);
         }
+    }
+
+    // Configure HTTP proxy if provided.
+    if !proxy.is_empty() {
+        tracing::info!(%proxy, "configuring upstream HTTP proxy");
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
 
     Ok(builder)

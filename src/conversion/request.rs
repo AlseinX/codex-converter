@@ -264,27 +264,27 @@ fn convert_builtin_tool(tool_type: &str, tool: &Value) -> Option<Value> {
         "web_search" | "web_search_preview" => json!({
             "type": "object",
             "properties": {
-                "type": {"type": "string", "enum": ["search", "open_page", "find_in_page"]},
-                "query": {"type": "string"},
-                "queries": {"type": "array", "items": {"type": "string"}},
-                "sources": {"type": "array", "items": {"type": "object", "properties": {"type": {"type": "string"}, "url": {"type": "string"}}}},
-                "url": {"type": "string"},
-                "pattern": {"type": "string"}
+                "type": {"type": "string", "enum": ["search", "open_page", "find_in_page"], "description": "Action type"},
+                "query": {"type": "string", "description": "Search query (deprecated, use queries)"},
+                "queries": {"type": "array", "items": {"type": "string"}, "description": "Search queries (for type=search)"},
+                "sources": {"type": "array", "items": {"type": "object", "properties": {"type": {"type": "string"}, "url": {"type": "string"}}}, "description": "Source URLs (for type=search)"},
+                "url": {"type": "string", "description": "URL (for open_page/find_in_page)"},
+                "pattern": {"type": "string", "description": "Search pattern (for find_in_page)"}
             },
             "required": ["type"]
         }),
         "file_search" => json!({
             "type": "object",
             "properties": {
-                "queries": {"type": "array", "items": {"type": "string"}}
+                "queries": {"type": "array", "items": {"type": "string"}, "description": "Search queries"}
             },
             "required": ["queries"]
         }),
         "code_interpreter" => json!({
             "type": "object",
             "properties": {
-                "code": {"type": "string"},
-                "container_id": {"type": "string"}
+                "code": {"type": "string", "description": "Code to execute"},
+                "container_id": {"type": "string", "description": "Container ID to run code in"}
             },
             "required": ["code"]
         }),
@@ -292,21 +292,21 @@ fn convert_builtin_tool(tool_type: &str, tool: &Value) -> Option<Value> {
             "type": "object",
             "properties": {
                 "type": {"type": "string", "enum": ["screenshot", "click", "double_click", "drag", "keypress", "move", "scroll", "type", "wait"]},
-                "button": {"type": "string", "enum": ["left", "right", "wheel", "back", "forward"]},
-                "x": {"type": "integer"},
-                "y": {"type": "integer"},
-                "text": {"type": "string"},
-                "keys": {"type": "array", "items": {"type": "string"}},
-                "path": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}}},
-                "scroll_x": {"type": "integer"},
-                "scroll_y": {"type": "integer"}
+                "button": {"type": "string", "enum": ["left", "right", "wheel", "back", "forward"], "description": "Mouse button (click)"},
+                "x": {"type": "integer", "description": "X coordinate"},
+                "y": {"type": "integer", "description": "Y coordinate"},
+                "text": {"type": "string", "description": "Text to type (type)"},
+                "keys": {"type": "array", "items": {"type": "string"}, "description": "Keys (click, double_click, drag, keypress, move, scroll)"},
+                "path": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}}, "description": "Drag path (drag)"},
+                "scroll_x": {"type": "integer", "description": "Horizontal scroll (scroll)"},
+                "scroll_y": {"type": "integer", "description": "Vertical scroll (scroll)"}
             },
             "required": ["type"]
         }),
         "image_generation" => json!({
             "type": "object",
             "properties": {
-                "prompt": {"type": "string"}
+                "prompt": {"type": "string", "description": "Image generation prompt"}
             },
             "required": ["prompt"]
         }),
@@ -314,18 +314,18 @@ fn convert_builtin_tool(tool_type: &str, tool: &Value) -> Option<Value> {
             "type": "object",
             "properties": {
                 "type": {"type": "string", "enum": ["exec"]},
-                "command": {"type": "array", "items": {"type": "string"}},
-                "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                "timeout_ms": {"type": "integer"},
-                "user": {"type": "string"},
-                "working_directory": {"type": "string"}
+                "command": {"type": "array", "items": {"type": "string"}, "description": "Command and arguments"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables"},
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds"},
+                "user": {"type": "string", "description": "User to run as"},
+                "working_directory": {"type": "string", "description": "Working directory"}
             },
             "required": ["type", "command"]
         }),
         "shell" => json!({
             "type": "object",
             "properties": {
-                "commands": {"type": "array", "items": {"type": "string"}},
+                "commands": {"type": "array", "items": {"type": "string"}, "description": "Commands to execute"},
                 "timeout_ms": {"type": "integer"},
                 "max_output_length": {"type": "integer"}
             },
@@ -335,15 +335,15 @@ fn convert_builtin_tool(tool_type: &str, tool: &Value) -> Option<Value> {
             "type": "object",
             "properties": {
                 "type": {"type": "string", "enum": ["create_file", "update_file", "delete_file"]},
-                "path": {"type": "string"},
-                "diff": {"type": "string"}
+                "path": {"type": "string", "description": "File path"},
+                "diff": {"type": "string", "description": "V4A diff content (not needed for delete_file)"}
             },
             "required": ["type", "path"]
         }),
         "tool_search" => json!({
             "type": "object",
             "properties": {
-                "goal": {"type": "string"}
+                "goal": {"type": "string", "description": "Description of the desired tool capability"}
             },
             "required": ["goal"]
         }),

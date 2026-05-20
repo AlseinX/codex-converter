@@ -24,20 +24,54 @@ pub fn init(log_config: &LogConfig) {
             );
         }
 
-        let file_appender = match file_cfg.rotation.as_str() {
-            "hourly" => tracing_appender::rolling::hourly(&dir, "codex-conv.log"),
-            _ => tracing_appender::rolling::daily(&dir, "codex-conv.log"),
-        };
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-        // Guard must be leaked to keep the appender alive for the process lifetime.
-        std::mem::forget(_guard);
-
+        let file_path = dir.join("codex-conv.log");
         let filter = level_filter(&file_cfg.level);
-        let file_layer = fmt::layer()
-            .with_writer(non_blocking)
-            .with_target(true)
-            .with_filter(filter);
-        layers.push(file_layer.boxed());
+
+        // When rotation is "never", use a non-rotating file appender.
+        // Otherwise, use a rolling appender (daily by default, hourly if specified).
+        // Guard is leaked to keep the appender alive for the process lifetime.
+        let file_layer = match file_cfg.rotation.as_str() {
+            "never" => {
+                let file = std::fs::File::create(&file_path).unwrap_or_else(|e| {
+                    eprintln!(
+                        "Warning: could not create log file {}: {}",
+                        file_path.display(),
+                        e
+                    );
+                    panic!("could not create log file {}: {}", file_path.display(), e);
+                });
+                let (non_blocking, _guard) = tracing_appender::non_blocking(file);
+                std::mem::forget(_guard);
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_target(true)
+                    .with_filter(filter.clone())
+                    .boxed()
+            }
+            "hourly" => {
+                let (non_blocking, _guard) = tracing_appender::non_blocking(
+                    tracing_appender::rolling::hourly(&dir, "codex-conv.log"),
+                );
+                std::mem::forget(_guard);
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_target(true)
+                    .with_filter(filter.clone())
+                    .boxed()
+            }
+            _ => {
+                let (non_blocking, _guard) = tracing_appender::non_blocking(
+                    tracing_appender::rolling::daily(&dir, "codex-conv.log"),
+                );
+                std::mem::forget(_guard);
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_target(true)
+                    .with_filter(filter.clone())
+                    .boxed()
+            }
+        };
+        layers.push(file_layer);
     }
 
     if layers.is_empty() {
