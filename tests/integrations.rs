@@ -76,6 +76,45 @@ name = "test"
         )
         .expect("failed to write config.toml");
 
+        // Write models_cache.json with apply_patch_tool_type set so that Codex
+        // registers the ApplyPatchHandler.  Without this, Codex defaults to
+        // apply_patch_tool_type: None and the handler is never registered,
+        // causing "unsupported custom tool call: apply_patch".
+        let model = std::env::var("CODEX_CONV_TEST_MODEL")
+            .unwrap_or_else(|_| "glm-5.1".to_string());
+        let models_cache = serde_json::json!({
+            "fetched_at": "2099-01-01T00:00:00Z",
+            "client_version": "0.130.0",
+            "models": [{
+                "slug": model,
+                "display_name": model,
+                "description": "test model via codex-converter proxy",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [],
+                "shell_type": "shell_command",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 0,
+                "upgrade": null,
+                "base_instructions": "",
+                "supports_reasoning_summaries": false,
+                "support_verbosity": false,
+                "default_verbosity": null,
+                "apply_patch_tool_type": "freeform",
+                "truncation_policy": {"mode": "bytes", "limit": 10000},
+                "supports_parallel_tool_calls": false,
+                "supports_image_detail_original": false,
+                "context_window": 200000,
+                "max_context_window": 200000,
+                "experimental_supported_tools": [],
+            }]
+        });
+        std::fs::write(
+            dir.join("models_cache.json"),
+            serde_json::to_string_pretty(&models_cache).unwrap(),
+        )
+        .expect("failed to write models_cache.json");
+
         dir
     })
 }
@@ -170,10 +209,12 @@ async fn codex_exec(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         panic!(
-            "codex exec failed ({}). stderr: {}",
+            "codex exec failed ({}). stderr: {}\nstdout: {}",
             output.status,
-            stderr.chars().take(3000).collect::<String>()
+            stderr.chars().take(3000).collect::<String>(),
+            stdout.chars().take(5000).collect::<String>()
         );
     }
 

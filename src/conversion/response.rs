@@ -44,6 +44,8 @@ pub struct StreamingState {
     current_fc_call_id: String,
     /// Function call counter for sequential ID generation.
     fc_counter: u64,
+    /// Whether the current tool_use block is a custom_tool_call (freeform tool).
+    current_is_custom: bool,
     /// Tool use info per Anthropic content block index: (toolu_id, fc_id, call_id, raw_name).
     tool_use_map: Vec<(String, String, String, String)>,
     /// Stop reason from message_delta.
@@ -60,6 +62,56 @@ pub struct StreamingState {
     parallel_tool_calls_echo: Option<bool>,
     /// Accumulated signatures keyed by reasoning_id, for writing to cache after stream ends.
     signature_store: Vec<(String, String)>,
+}
+
+/// Convert a patch string to Codex freeform format.
+///
+/// If the input already starts with `*** Begin Patch`, it is returned as-is.
+/// Otherwise, the input is assumed to be unified diff format and is converted.
+fn convert_to_freeform_patch(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.starts_with("*** Begin Patch") {
+        return input.to_string();
+    }
+
+    // Parse unified diff → freeform.
+    let mut out = String::from("*** Begin Patch\n");
+    let mut current_file: Option<String> = None;
+    for line in trimmed.lines() {
+        if let Some(path) = line.strip_prefix("--- a/") {
+            // --- a/path: note the file (use the --- side for the path)
+            current_file = Some(path.to_string());
+        } else if let Some(path) = line.strip_prefix("--- ") {
+            current_file = Some(path.to_string());
+        } else if line.starts_with("+++ ") {
+            // +++ b/path or +++ /dev/null: use this path if we haven't seen one
+            let path = line.trim_start_matches("+++ b/")
+                .trim_start_matches("+++ ");
+            if current_file.is_none() {
+                current_file = Some(path.to_string());
+            }
+            if let Some(ref f) = current_file {
+                out.push_str(&format!("*** Update File: {f}\n"));
+            }
+            current_file = None; // consumed
+        } else if line.starts_with("@@") {
+            // Skip hunk header
+        } else if line.starts_with("diff --git") || line.starts_with("index ") {
+            // Skip git diff metadata
+        } else if let Some(rest) = line.strip_prefix('-') {
+            out.push_str(&format!("-{rest}\n"));
+        } else if let Some(rest) = line.strip_prefix('+') {
+            out.push_str(&format!("+{rest}\n"));
+        } else if line.starts_with(' ') {
+            // Context line — include as-is (no prefix)
+            out.push_str(&format!("{}\n", &line[1..]));
+        } else if !line.is_empty() {
+            // Other non-empty line: include as context
+            out.push_str(&format!("{line}\n"));
+        }
+    }
+    out.push_str("*** End Patch\n");
+    out
 }
 
 /// Return current Unix timestamp in seconds.
@@ -94,6 +146,7 @@ impl StreamingState {
             current_reasoning_id: String::new(),
             current_fc_item_id: String::new(),
             current_fc_call_id: String::new(),
+            current_is_custom: false,
             fc_counter: 0,
             tool_use_map: Vec::new(),
             stop_reason: None,
@@ -273,14 +326,31 @@ impl StreamingState {
                         (name.clone(), None)
                     };
 
-                let mut item = json!({
-                    "type": "function_call",
-                    "id": fc_id,
-                    "call_id": call_id,
-                    "name": display_name,
-                    "status": "in_progress",
-                    "arguments": "",
-                });
+                // Freeform tools (injected by the proxy, not originally in Codex tools
+                // array) must use "custom_tool_call" format, not "function_call".
+                // Codex dispatches on the `type` field and only recognizes freeform
+                // tools via `custom_tool_call`.
+                let is_custom_tool_call = name == "apply_patch";
+                self.current_is_custom = is_custom_tool_call;
+
+                let mut item = if is_custom_tool_call {
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": call_id,
+                        "name": display_name,
+                        "status": "in_progress",
+                        "input": "",
+                    })
+                } else {
+                    json!({
+                        "type": "function_call",
+                        "id": fc_id,
+                        "call_id": call_id,
+                        "name": display_name,
+                        "status": "in_progress",
+                        "arguments": "",
+                    })
+                };
                 if let Some(ns) = namespace {
                     item["namespace"] = json!(ns);
                 }
@@ -346,6 +416,11 @@ impl StreamingState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 self.arguments_accumulator.push_str(partial);
+                // For custom_tool_call (freeform tools), accumulate silently
+                // and emit the full input at content_block_stop.
+                if self.current_is_custom {
+                    return vec![];
+                }
                 let output_index = self.output_items.len();
                 vec![ResponsesEvent::FunctionCallArgumentsDelta {
                     output_index,
@@ -434,6 +509,7 @@ impl StreamingState {
                 let args = std::mem::take(&mut self.arguments_accumulator);
                 let fc_id = std::mem::take(&mut self.current_fc_item_id);
                 let call_id = std::mem::take(&mut self.current_fc_call_id);
+                let is_custom = std::mem::replace(&mut self.current_is_custom, false);
 
                 // Get the name and namespace from the tool_use_map.
                 let (name, namespace) = self
@@ -459,25 +535,56 @@ impl StreamingState {
                     })
                     .unwrap_or_else(|| ("unknown".to_string(), None));
 
-                events.push(ResponsesEvent::FunctionCallArgumentsDone {
-                    output_index,
-                    item_id: fc_id.clone(),
-                    arguments: args.clone(),
-                });
+                if is_custom {
+                    // Freeform tools use custom_tool_call format with raw input text.
+                    // 1. Anthropic wraps in JSON: unwrap to raw string.
+                    let raw_input = serde_json::from_str::<Value>(&args)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("patch")
+                                .or_else(|| v.get("input"))
+                                .and_then(|p| p.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or(args);
+                    // 2. Anthropic models often produce unified diff format
+                    //    (--- a/file, +++ b/file, @@ hunk headers).
+                    //    Codex requires its own freeform format
+                    //    (*** Begin Patch, *** Update File, +/- lines, *** End Patch).
+                    let patch = convert_to_freeform_patch(&raw_input);
+                    let mut item = json!({
+                        "type": "custom_tool_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "status": "completed",
+                        "input": patch,
+                    });
+                    if let Some(ns) = namespace {
+                        item["namespace"] = json!(ns);
+                    }
+                    self.output_items.push(item.clone());
+                    events.push(ResponsesEvent::OutputItemDone { output_index, item });
+                } else {
+                    events.push(ResponsesEvent::FunctionCallArgumentsDone {
+                        output_index,
+                        item_id: fc_id.clone(),
+                        arguments: args.clone(),
+                    });
 
-                let mut item = json!({
-                    "type": "function_call",
-                    "id": fc_id,
-                    "call_id": call_id,
-                    "name": name,
-                    "status": "completed",
-                    "arguments": args,
-                });
-                if let Some(ns) = namespace {
-                    item["namespace"] = json!(ns);
+                    let mut item = json!({
+                        "type": "function_call",
+                        "id": fc_id,
+                        "call_id": call_id,
+                        "name": name,
+                        "status": "completed",
+                        "arguments": args,
+                    });
+                    if let Some(ns) = namespace {
+                        item["namespace"] = json!(ns);
+                    }
+                    self.output_items.push(item.clone());
+                    events.push(ResponsesEvent::OutputItemDone { output_index, item });
                 }
-                self.output_items.push(item.clone());
-                events.push(ResponsesEvent::OutputItemDone { output_index, item });
             }
             ActiveBlock::None => {
                 // No active block, nothing to do.

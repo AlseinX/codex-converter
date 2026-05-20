@@ -295,6 +295,7 @@ async fn handle_responses(
                     // Reconstruct raw SSE text for the parser.
                     // reqwest_eventsource::Event::Message provides event (String) and data (String).
                     let raw_chunk = format!("event: {}\ndata: {}\n\n", msg.event, msg.data);
+
                     let anthropic_events = parse_sse_events(&raw_chunk);
 
                     for a_event in anthropic_events {

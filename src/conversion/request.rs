@@ -37,7 +37,14 @@ pub fn convert_request(
     let thinking_cfg = thinking::convert_reasoning(obj.get("reasoning"));
 
     // -- Tools (namespace flattening + function tools) --
-    let tools = convert_tools(task, obj.get("tools"));
+    let raw_tools = obj.get("tools");
+    let mut tools = convert_tools(task, raw_tools);
+
+    // Codex does not include apply_patch in the tools array when the model's
+    // apply_patch_tool_type is "freeform" (the model is expected to know the
+    // tool from base_instructions alone).  OpenAI models handle this natively,
+    // but Anthropic models require an explicit tool definition.  Inject it.
+    inject_apply_patch_tool(&mut tools);
 
     // -- tool_choice --
     let tool_choice = convert_tool_choice(obj.get("tool_choice"), obj.get("parallel_tool_calls"));
@@ -259,6 +266,52 @@ fn convert_tools(task: &mut ConversionTask, tools: Option<&Value>) -> Option<Val
         None
     } else {
         Some(Value::Array(result))
+    }
+}
+
+/// Inject the `apply_patch` tool if it is not already present in the tools array.
+///
+/// When a model's `apply_patch_tool_type` is `"freeform"` (determined by Codex's
+/// model catalog), Codex omits apply_patch from the tools array entirely.  The
+/// model is expected to know how to generate apply_patch calls from
+/// base_instructions alone.  OpenAI models handle this natively, but Anthropic
+/// models require an explicit tool definition to produce `tool_use` blocks.
+fn inject_apply_patch_tool(tools: &mut Option<Value>) {
+    // Check if apply_patch already exists.
+    if let Some(arr) = tools.as_ref().and_then(|v| v.as_array()) {
+        if arr.iter().any(|t| {
+            t.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+        }) {
+            return;
+        }
+    }
+
+    let patch_tool = json!({
+        "type": "custom",
+        "name": "apply_patch",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Patch in Codex freeform format. The FIRST line MUST be exactly '*** Begin Patch'. \
+Then for each file: '*** Update File: <path>' or '*** Add File: <path>' or '*** Delete File: <path>', \
+followed by '-<line to remove>' and '+<line to add>'. End with '*** End Patch'. \
+Example:\n*** Begin Patch\n*** Update File: src/main.py\n-old line\n+new line\n*** End Patch"
+                }
+            },
+            "required": ["input"]
+        }
+    });
+
+    match tools {
+        None => {
+            *tools = Some(Value::Array(vec![patch_tool]));
+        }
+        Some(Value::Array(arr)) => {
+            arr.push(patch_tool);
+        }
+        _ => {}
     }
 }
 
@@ -586,12 +639,20 @@ fn convert_single_input_item(
                 "custom_tool_call" => item.get("input").and_then(|v| v.as_str()).unwrap_or("{}"),
                 _ => "{}",
             };
-            let parsed_input: Value = serde_json::from_str(raw_args).map_err(|e| {
-                RequestConversionError::InvalidRequest(format!(
-                    "failed to parse arguments for call_id '{}': {}",
-                    call_id, e
-                ))
-            })?;
+            let parsed_input: Value = match serde_json::from_str(raw_args) {
+                Ok(v) => v,
+                Err(_) if item_type == "custom_tool_call" => {
+                    // custom_tool_call input is raw text (e.g. freeform patch),
+                    // not JSON.  Wrap it so Anthropic accepts it as a tool_use input.
+                    json!({ "input": raw_args })
+                }
+                Err(e) => {
+                    return Err(RequestConversionError::InvalidRequest(format!(
+                        "failed to parse arguments for call_id '{}': {}",
+                        call_id, e
+                    )));
+                }
+            };
 
             // Register in ID map.
             let toolu_id = task.id_map.insert_call(call_id.clone());
@@ -2042,10 +2103,13 @@ mod tests {
         });
         let result = convert_request(&mut task, input).unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "mcp__memory__search");
-        assert_eq!(tools[0]["type"], "custom");
-        assert!(tools[0]["input_schema"].is_object());
+        // inject_apply_patch_tool adds apply_patch alongside the namespace tool.
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|t| t["name"] == "mcp__memory__search"));
+        assert!(tools.iter().any(|t| t["name"] == "apply_patch"));
+        let ns_tool = tools.iter().find(|t| t["name"] == "mcp__memory__search").unwrap();
+        assert_eq!(ns_tool["type"], "custom");
+        assert!(ns_tool["input_schema"].is_object());
         // Registry should have the mapping.
         let entry = task
             .namespace_registry
@@ -2074,9 +2138,10 @@ mod tests {
         });
         let result = convert_request(&mut task, input).unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "mcp__svr__tool_a");
-        assert_eq!(tools[1]["name"], "mcp__svr__tool_b");
+        // inject_apply_patch_tool adds apply_patch alongside the namespace tools.
+        assert_eq!(tools.len(), 3);
+        assert!(tools.iter().any(|t| t["name"] == "mcp__svr__tool_a"));
+        assert!(tools.iter().any(|t| t["name"] == "mcp__svr__tool_b"));
     }
 
     // =========================================================================
@@ -2124,7 +2189,10 @@ mod tests {
             "input": []
         });
         let result = convert_request(&mut task, input).unwrap();
-        assert!(result.get("tools").is_none());
+        // inject_apply_patch_tool always adds apply_patch when absent.
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "apply_patch");
     }
 
     // =========================================================================
@@ -2287,7 +2355,10 @@ mod tests {
             "input": []
         });
         let result = convert_request(&mut task, input).unwrap();
-        assert!(result.get("tools").is_none());
+        // MCP tools are dropped, but inject_apply_patch_tool still adds apply_patch.
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "apply_patch");
     }
 
     #[test]
@@ -2393,7 +2464,7 @@ mod tests {
         assert_eq!(result["metadata"]["user_id"], "test_user");
         assert_eq!(result["service_tier"], "auto");
         assert_eq!(result["tool_choice"]["type"], "auto");
-        assert!(result["tools"].as_array().unwrap().len() == 1);
+        assert!(result["tools"].as_array().unwrap().len() == 2);
 
         // Verify messages: user, assistant(merged reasoning+tool_use), user(tool_result)
         let messages = result["messages"].as_array().unwrap();
