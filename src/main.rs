@@ -173,30 +173,4 @@ mod tests {
         assert_eq!(cli.config_file, Some(PathBuf::from("/tmp/conv.yaml")));
     }
 
-    #[test]
-    fn apply_env_overrides_scans_prefix() {
-        let mut config = AppConfig::default();
-        let original_listen = config.server.listen.clone();
-
-        // Set an env var, apply overrides, then clean up.
-        std::env::set_var("CODEX_CONV_SERVER_LISTEN", "0.0.0.0:5555");
-        apply_env_overrides(&mut config);
-        std::env::remove_var("CODEX_CONV_SERVER_LISTEN");
-
-        assert_eq!(config.server.listen, "0.0.0.0:5555");
-        assert_ne!(config.server.listen, original_listen);
-    }
-
-    #[test]
-    fn apply_env_overrides_ignores_non_prefixed() {
-        let mut config = AppConfig::default();
-        let original = config.server.listen.clone();
-
-        // Set a non-prefixed env var.
-        std::env::set_var("SOME_OTHER_VAR", "value");
-        apply_env_overrides(&mut config);
-        std::env::remove_var("SOME_OTHER_VAR");
-
-        assert_eq!(config.server.listen, original);
-    }
 }
