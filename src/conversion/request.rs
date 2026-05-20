@@ -545,9 +545,15 @@ fn convert_single_input_item(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Map Responses API roles to Anthropic roles.
+            // "developer" maps to "user" (Anthropic does not have a developer role).
+            let mapped_role = match role.as_str() {
+                "developer" => "user".to_string(),
+                other => other.to_string(),
+            };
             let content = item.get("content").cloned().unwrap_or(json!([]));
             let blocks = convert_message_content(&content);
-            Ok(vec![(Some(role), blocks)])
+            Ok(vec![(Some(mapped_role), blocks)])
         }
         "function_call" | "custom_tool_call" => {
             let call_id = item
