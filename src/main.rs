@@ -24,7 +24,8 @@ struct Cli {
     upstream_tls_extra_ca_certs: Option<String>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     // Step 1: Load base config from file or defaults.
@@ -75,9 +76,11 @@ fn main() {
         "starting codex-conv"
     );
 
-    // Step 6: Start server (Task 4 will fill this in).
-    // For now, just log and exit.
-    tracing::warn!("server not yet implemented (Task 4)");
+    // Step 5: Start server.
+    if let Err(e) = codex_conv::server::run(config).await {
+        tracing::error!(error = %e, "server exited with error");
+        std::process::exit(1);
+    }
 }
 
 /// Scan environment variables with `CODEX_CONV_` prefix and apply overrides.
