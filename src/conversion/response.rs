@@ -1410,6 +1410,319 @@ mod tests {
         assert_eq!(output[0]["content"][0]["text"], "Partial");
     }
 
+    // --- Response completion verification tests (Task 15) ---
+
+    #[test]
+    fn usage_cache_creation_folded_into_input_tokens() {
+        // cache_creation_input_tokens should be folded into input_tokens
+        // (Anthropic includes it in input_tokens already; no separate field in Responses API).
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 100, "output_tokens": 0, "cache_creation_input_tokens": 25}}),
+        });
+        state.process_event(AnthropicEvent::MessageDelta {
+            delta: json!({"stop_reason": "end_turn", "stop_sequence": null}),
+            usage: json!({"output_tokens": 10}),
+        });
+        let events = state.process_event(AnthropicEvent::MessageStop);
+        let (_, data) = events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        }).unwrap().to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let usage = &parsed["response"]["usage"];
+        // cache_creation_input_tokens has no Responses API equivalent -- must not appear.
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+        // reasoning_tokens omitted (Codex uses unwrap_or(0)).
+        assert!(usage.get("output_tokens_details").is_none());
+        assert!(usage.get("reasoning_tokens").is_none());
+    }
+
+    #[test]
+    fn usage_no_cache_read_omits_input_tokens_details() {
+        // When no cache_read_input_tokens, input_tokens_details must be absent entirely.
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 50, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::MessageDelta {
+            delta: json!({"stop_reason": "end_turn", "stop_sequence": null}),
+            usage: json!({"output_tokens": 10}),
+        });
+        let events = state.process_event(AnthropicEvent::MessageStop);
+        let (_, data) = events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        }).unwrap().to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let usage = &parsed["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 50);
+        assert_eq!(usage["output_tokens"], 10);
+        assert_eq!(usage["total_tokens"], 60);
+        assert!(
+            usage.get("input_tokens_details").is_none(),
+            "input_tokens_details should be omitted when no cached tokens"
+        );
+    }
+
+    #[test]
+    fn all_stop_reasons_produce_response_completed() {
+        // CRITICAL: NEVER emit response.incomplete. Every stop_reason must produce
+        // response.completed. Test all known Anthropic stop reasons.
+        let stop_reasons = vec![
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+            "pause_turn",
+            "refusal",
+            "model_context_window_exceeded",
+        ];
+
+        for sr in &stop_reasons {
+            let mut state = make_state();
+            state.process_event(AnthropicEvent::MessageStart {
+                message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+            });
+            state.process_event(AnthropicEvent::MessageDelta {
+                delta: json!({"stop_reason": sr, "stop_sequence": null}),
+                usage: json!({"output_tokens": 5}),
+            });
+            let events = state.process_event(AnthropicEvent::MessageStop);
+
+            // Must have exactly one response.completed event.
+            let completed_count = events.iter().filter(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            }).count();
+            assert_eq!(
+                completed_count, 1,
+                "stop_reason='{}' must produce exactly one response.completed, got {}",
+                sr, completed_count
+            );
+
+            // Must NEVER have response.incomplete.
+            let has_incomplete = events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.incomplete"
+            });
+            assert!(
+                !has_incomplete,
+                "stop_reason='{}' must NEVER produce response.incomplete",
+                sr
+            );
+
+            // Status must be "completed" for all stop reasons.
+            let (_, data) = events.iter().find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            }).unwrap().to_sse();
+            let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(
+                parsed["response"]["status"], "completed",
+                "stop_reason='{}' must have status 'completed', got '{}'",
+                sr, parsed["response"]["status"]
+            );
+        }
+    }
+
+    #[test]
+    fn echo_fields_when_none() {
+        // When parallel_tool_calls and instructions are None, they should still
+        // appear in the response (parallel_tool_calls: null, instructions absent).
+        let mut state = StreamingState::new(
+            "msg_test".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            NamespaceRegistry::new(),
+            1717000000,
+            "required".to_string(),
+            None, // instructions_echo = None
+            None, // parallel_tool_calls_echo = None
+        );
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::MessageDelta {
+            delta: json!({"stop_reason": "end_turn", "stop_sequence": null}),
+            usage: json!({"output_tokens": 5}),
+        });
+        let events = state.process_event(AnthropicEvent::MessageStop);
+        let (_, data) = events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        }).unwrap().to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let resp = &parsed["response"];
+
+        assert_eq!(resp["parallel_tool_calls"], Value::Null);
+        assert_eq!(resp["tool_choice"], "required");
+        // instructions should be absent when None was provided.
+        assert!(resp.get("instructions").is_none());
+    }
+
+    #[test]
+    fn incomplete_details_only_for_max_tokens_and_context_window() {
+        // incomplete_details should ONLY appear for max_tokens and
+        // model_context_window_exceeded. Other stop reasons should not have it.
+        let reasons_with_incomplete = vec!["max_tokens", "model_context_window_exceeded"];
+        let reasons_without_incomplete = vec!["end_turn", "stop_sequence", "tool_use", "pause_turn", "refusal"];
+
+        for sr in &reasons_with_incomplete {
+            let (_, parsed) = run_text_stream("text", sr);
+            assert_eq!(
+                parsed["response"]["incomplete_details"]["reason"], "max_output_tokens",
+                "stop_reason='{}' should have incomplete_details",
+                sr
+            );
+        }
+
+        for sr in &reasons_without_incomplete {
+            let (_, parsed) = run_text_stream("text", sr);
+            assert!(
+                parsed["response"].get("incomplete_details").is_none(),
+                "stop_reason='{}' should NOT have incomplete_details",
+                sr
+            );
+        }
+    }
+
+    #[test]
+    fn response_id_passthrough_from_message_start() {
+        // id field in response.completed must come from Anthropic message_start,
+        // not from the proxy-generated initial value.
+        let mut state = StreamingState::new(
+            "msg_initial".to_string(),
+            "m".to_string(),
+            NamespaceRegistry::new(),
+            1717000000,
+            "auto".to_string(),
+            None,
+            None,
+        );
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_UPSTREAM_PASSTHROUGH", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::MessageDelta {
+            delta: json!({"stop_reason": "end_turn", "stop_sequence": null}),
+            usage: json!({"output_tokens": 5}),
+        });
+        let events = state.process_event(AnthropicEvent::MessageStop);
+        let (_, data) = events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        }).unwrap().to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            parsed["response"]["id"], "msg_UPSTREAM_PASSTHROUGH",
+            "response id must be from Anthropic message_start, not initial value"
+        );
+    }
+
+    #[test]
+    fn model_echo_from_request_not_anthropic() {
+        // model field must echo the request model, NOT Anthropic's response model.
+        let mut state = StreamingState::new(
+            "msg_test".to_string(),
+            "gpt-4o".to_string(), // Request model (what client sent)
+            NamespaceRegistry::new(),
+            1717000000,
+            "auto".to_string(),
+            None,
+            None,
+        );
+        // Anthropic returns its own model name in message_start.
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "claude-sonnet-4-20250514", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::MessageDelta {
+            delta: json!({"stop_reason": "end_turn", "stop_sequence": null}),
+            usage: json!({"output_tokens": 5}),
+        });
+        let events = state.process_event(AnthropicEvent::MessageStop);
+        let (_, data) = events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        }).unwrap().to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            parsed["response"]["model"], "gpt-4o",
+            "model must echo the request model, not Anthropic's response model"
+        );
+    }
+
+    #[test]
+    fn object_field_always_response() {
+        // object field must always be "response" regardless of stop_reason.
+        let (_, parsed) = run_text_stream("text", "end_turn");
+        assert_eq!(parsed["response"]["object"], "response");
+
+        let (_, parsed) = run_text_stream("text", "tool_use");
+        assert_eq!(parsed["response"]["object"], "response");
+
+        let (_, parsed) = run_text_stream("text", "max_tokens");
+        assert_eq!(parsed["response"]["object"], "response");
+    }
+
+    #[test]
+    fn output_order_preserved_in_completed() {
+        // Output items in response.completed must appear in the same order
+        // they were produced during streaming.
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+
+        // Thinking block
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "thinking", "thinking": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "thinking_delta", "thinking": "hmm"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // Text block
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 1,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 1,
+            delta: json!({"type": "text_delta", "text": "answer"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
+
+        // Tool use block
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 2,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "run", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 2,
+            delta: json!({"type": "input_json_delta", "partial_json": "{}"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 2 });
+
+        state.process_event(AnthropicEvent::MessageDelta {
+            delta: json!({"stop_reason": "tool_use", "stop_sequence": null}),
+            usage: json!({"output_tokens": 20}),
+        });
+        let events = state.process_event(AnthropicEvent::MessageStop);
+        let (_, data) = events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        }).unwrap().to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let output = parsed["response"]["output"].as_array().unwrap();
+
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[2]["type"], "function_call");
+    }
+
     // --- context overflow error code mapping ---
 
     #[test]
