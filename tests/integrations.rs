@@ -49,6 +49,37 @@ fn base_url() -> String {
 // In-process proxy (one per test)
 // ---------------------------------------------------------------------------
 
+/// Isolated codex home directory, created once and reused across tests.
+/// Lives at `tests/.codex-test-home/` (gitignored).
+fn codex_test_home() -> &'static PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let dir = PathBuf::from(manifest_dir).join("tests/.codex-test-home");
+        std::fs::create_dir_all(&dir).expect("failed to create codex test home dir");
+
+        // Write auth.json with the API key.
+        let key = api_key();
+        let auth = serde_json::json!({ "OPENAI_API_KEY": key });
+        std::fs::write(dir.join("auth.json"), auth.to_string())
+            .expect("failed to write auth.json");
+
+        // Write minimal config.toml.
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"[model_providers.custom]
+name = "test"
+
+[features]
+"#,
+        )
+        .expect("failed to write config.toml");
+
+        dir
+    })
+}
+
 /// Start the proxy on a random port. Returns the listening address.
 /// The server lives as long as the returned `JoinHandle` is not dropped.
 async fn start_proxy() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -90,6 +121,7 @@ async fn codex_exec(
 
     let key = api_key();
     let model = std::env::var("CODEX_CONV_TEST_MODEL").unwrap_or_else(|_| "glm-5.1".to_string());
+    let codex_home = codex_test_home();
 
     let tmpdir;
     let cwd = match workdir {
@@ -118,8 +150,6 @@ async fn codex_exec(
         .arg("-c")
         .arg("sandbox_mode=\"danger-full-access\"")
         .arg("-c")
-        .arg("model_providers.custom.name=\"test\"")
-        .arg("-c")
         .arg(format!("model_providers.custom.base_url=\"{proxy_base}\""))
         .arg("-c")
         .arg("model_provider=\"custom\"")
@@ -127,9 +157,8 @@ async fn codex_exec(
         .arg("-C")
         .arg(&cwd)
         .arg("--ephemeral")
-        .arg("--ignore-user-config")
-        .arg("--ignore-rules")
         .arg(prompt)
+        .env("CODEX_HOME", codex_home)
         .env("OPENAI_API_KEY", &key)
         .env("NO_PROXY", "localhost,127.0.0.1")
         .stdin(Stdio::null())
@@ -236,23 +265,20 @@ async fn apply_patch_tool_call() {
 
     let lines = codex_exec(
         addr,
-        "Replace 'World' with 'Universe' in patch_target.txt using apply_patch",
+        "Use apply_patch to replace 'World' with 'Universe' in patch_target.txt.",
         Some(tmpdir.path()),
     )
     .await;
+    let events = parse_jsonl(&lines);
 
-    // The model may use apply_patch (file_change) or exec_command to edit.
-    // What matters is the file actually changed.
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must use native apply_patch (file_change), using exec_command is wrong"
+    );
+
     let content = std::fs::read_to_string(&file_path).unwrap();
     assert!(content.contains("Universe"), "file should say Universe: {content}");
     assert!(!content.contains("World"), "World should be gone: {content}");
-
-    // Additionally verify that at least one tool was used (not just text).
-    let events = parse_jsonl(&lines);
-    assert!(
-        has_item_type(&events, "command_execution") || has_item_type(&events, "file_change"),
-        "must use at least one tool to edit the file"
-    );
 }
 
 #[tokio::test]
