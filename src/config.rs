@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Top-level application configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -12,22 +12,12 @@ pub struct AppConfig {
     pub log: LogConfig,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            upstream: UpstreamConfig::default(),
-            log: LogConfig::default(),
-        }
-    }
-}
-
 impl AppConfig {
     /// Load config from YAML file, falling back to defaults for missing fields.
     pub fn from_yaml_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let content =
             std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
-        let cfg: AppConfig = serde_yaml::from_str(&content).map_err(ConfigError::Yaml)?;
+        let cfg: AppConfig = yaml_serde::from_str(&content).map_err(ConfigError::Yaml)?;
         Ok(cfg)
     }
 
@@ -135,19 +125,10 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TlsServerConfig {
     pub cert: String,
     pub key: String,
-}
-
-impl Default for TlsServerConfig {
-    fn default() -> Self {
-        Self {
-            cert: String::new(),
-            key: String::new(),
-        }
-    }
 }
 
 impl TlsServerConfig {
@@ -270,7 +251,7 @@ fn parse_bool_option(value: &str) -> Option<bool> {
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::path::PathBuf, std::io::Error),
-    Yaml(serde_yaml::Error),
+    Yaml(yaml_serde::Error),
     UnknownKey {
         key: String,
     },
@@ -368,7 +349,7 @@ server:
 upstream:
   proxy: "http://proxy:8080"
 "#;
-        let cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: AppConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(cfg.server.listen, "0.0.0.0:1234");
         assert_eq!(cfg.upstream.proxy, "http://proxy:8080");
     }

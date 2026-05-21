@@ -22,6 +22,11 @@ impl IdMap {
         self.call_to_toolu.len()
     }
 
+    /// Returns true if the map contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.call_to_toolu.is_empty()
+    }
+
     /// Register a call_id and generate a new toolu_id for it.
     /// Returns the generated toolu_id.
     pub fn insert_call(&mut self, call_id: String) -> String {

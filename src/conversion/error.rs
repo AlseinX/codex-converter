@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Context overflow keyword detection heuristic.
 /// Anthropic uses `invalid_request_error` for both context overflow and other invalid requests.
@@ -19,7 +19,11 @@ const CONTEXT_OVERFLOW_KEYWORDS: &[&str] = &[
 /// - `billing_error` → `insufficient_quota`
 /// - `request_too_large` → `request_too_large`
 /// - Context overflow detected by keyword heuristic on message text
-pub fn convert_error_type(error_type: &str, message: &str, http_status: Option<u16>) -> (&'static str, u16) {
+pub fn convert_error_type(
+    error_type: &str,
+    message: &str,
+    http_status: Option<u16>,
+) -> (&'static str, u16) {
     match error_type {
         "invalid_request_error" => {
             // Check for context overflow via keyword heuristic.
@@ -51,7 +55,9 @@ pub fn convert_error_type(error_type: &str, message: &str, http_status: Option<u
 /// Detect context overflow from Anthropic error message using keyword heuristic.
 fn is_context_overflow(message: &str) -> bool {
     let lower = message.to_lowercase();
-    CONTEXT_OVERFLOW_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    CONTEXT_OVERFLOW_KEYWORDS
+        .iter()
+        .any(|kw| lower.contains(kw))
 }
 
 /// Map an Anthropic HTTP status code to Responses API status code.
@@ -86,17 +92,19 @@ pub fn map_http_status(status: u16) -> u16 {
 /// - Others → depends on HTTP status family
 pub fn map_error_type(error_type: &str, http_status: Option<u16>) -> &'static str {
     match error_type {
-        "invalid_request_error" | "authentication_error" | "permission_error"
-        | "not_found_error" | "billing_error" | "request_too_large" => "invalid_request_error",
+        "invalid_request_error"
+        | "authentication_error"
+        | "permission_error"
+        | "not_found_error"
+        | "billing_error"
+        | "request_too_large" => "invalid_request_error",
         "rate_limit_error" => "rate_limit_error",
         "overloaded_error" => "server_error",
         "api_error" => "server_error",
-        _ => {
-            match http_status {
-                Some(s) if (400..=499).contains(&s) => "invalid_request_error",
-                _ => "server_error",
-            }
-        }
+        _ => match http_status {
+            Some(s) if (400..=499).contains(&s) => "invalid_request_error",
+            _ => "server_error",
+        },
     }
 }
 
@@ -233,7 +241,11 @@ mod tests {
 
     #[test]
     fn invalid_request_too_many_tokens_keyword() {
-        let (code, _) = convert_error_type("invalid_request_error", "too many tokens: 300000 > 200000", None);
+        let (code, _) = convert_error_type(
+            "invalid_request_error",
+            "too many tokens: 300000 > 200000",
+            None,
+        );
         assert_eq!(code, "context_length_exceeded");
     }
 
@@ -245,7 +257,8 @@ mod tests {
 
     #[test]
     fn invalid_request_context_window_keyword() {
-        let (code, _) = convert_error_type("invalid_request_error", "exceeds the context window", None);
+        let (code, _) =
+            convert_error_type("invalid_request_error", "exceeds the context window", None);
         assert_eq!(code, "context_length_exceeded");
     }
 

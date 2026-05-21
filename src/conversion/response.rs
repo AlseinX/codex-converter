@@ -1,7 +1,7 @@
 use crate::conversion::namespace::NamespaceRegistry;
 use crate::sse::anthropic::AnthropicEvent;
 use crate::sse::responses::ResponsesEvent;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Tracks which type of content block is currently active.
@@ -94,9 +94,9 @@ fn convert_to_freeform_patch(input: &str) -> String {
     }
 
     // Heuristic: only attempt conversion if the input looks like unified diff.
-    let has_diff_markers = trimmed.lines().any(|line| {
-        line.starts_with("--- ") || line.starts_with("diff --git")
-    });
+    let has_diff_markers = trimmed
+        .lines()
+        .any(|line| line.starts_with("--- ") || line.starts_with("diff --git"));
     if !has_diff_markers {
         return input.to_string();
     }
@@ -112,8 +112,7 @@ fn convert_to_freeform_patch(input: &str) -> String {
             current_file = Some(path.to_string());
         } else if line.starts_with("+++ ") {
             // +++ b/path or +++ /dev/null: use this path if we haven't seen one
-            let path = line.trim_start_matches("+++ b/")
-                .trim_start_matches("+++ ");
+            let path = line.trim_start_matches("+++ b/").trim_start_matches("+++ ");
             if current_file.is_none() {
                 current_file = Some(path.to_string());
             }
@@ -129,9 +128,9 @@ fn convert_to_freeform_patch(input: &str) -> String {
             out.push_str(&format!("-{rest}\n"));
         } else if let Some(rest) = line.strip_prefix('+') {
             out.push_str(&format!("+{rest}\n"));
-        } else if line.starts_with(' ') {
+        } else if let Some(stripped) = line.strip_prefix(' ') {
             // Context line — include as-is (no prefix)
-            out.push_str(&format!("{}\n", &line[1..]));
+            out.push_str(&format!("{}\n", stripped));
         } else if !line.is_empty() {
             // Other non-empty line: include as context
             out.push_str(&format!("{line}\n"));
@@ -285,8 +284,14 @@ impl StreamingState {
     fn handle_message_start(&mut self, message: Value) -> Vec<ResponsesEvent> {
         if self.retry_mode {
             if let Some(usage) = message.get("usage") {
-                self.input_tokens += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                self.cache_read_tokens += usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.input_tokens += usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                self.cache_read_tokens += usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
             }
             return vec![];
         }
@@ -472,17 +477,11 @@ impl StreamingState {
     }
 
     fn handle_content_block_delta(&mut self, _index: usize, delta: Value) -> Vec<ResponsesEvent> {
-        let delta_type = delta
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match delta_type {
             "text_delta" => {
-                let text = delta
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let text = delta.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 self.text_accumulator.push_str(text);
                 let output_index = self.output_items.len();
                 vec![ResponsesEvent::OutputTextDelta {
@@ -492,10 +491,7 @@ impl StreamingState {
                 }]
             }
             "thinking_delta" => {
-                let thinking = delta
-                    .get("thinking")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let thinking = delta.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
                 self.thinking_accumulator.push_str(thinking);
                 let output_index = self.output_items.len();
                 vec![ResponsesEvent::ReasoningSummaryTextDelta {
@@ -580,7 +576,8 @@ impl StreamingState {
                 events.push(ResponsesEvent::OutputItemDone { output_index, item });
 
                 // Capture Anthropic-format content block for retry
-                self.anthropic_content_blocks.push(json!({"type": "text", "text": text}));
+                self.anthropic_content_blocks
+                    .push(json!({"type": "text", "text": text}));
             }
             ActiveBlock::Thinking => {
                 let thinking_text = std::mem::take(&mut self.thinking_accumulator);
@@ -614,7 +611,8 @@ impl StreamingState {
                 events.push(ResponsesEvent::OutputItemDone { output_index, item });
 
                 // Capture Anthropic-format content block for retry
-                let mut thinking_block = json!({"type": "thinking", "thinking": thinking_text.clone()});
+                let mut thinking_block =
+                    json!({"type": "thinking", "thinking": thinking_text.clone()});
                 if !signature.is_empty() {
                     thinking_block["signature"] = json!(signature);
                 }
@@ -634,7 +632,8 @@ impl StreamingState {
                 events.push(ResponsesEvent::OutputItemDone { output_index, item });
 
                 // Capture Anthropic-format content block for retry
-                self.anthropic_content_blocks.push(json!({"type": "redacted_thinking", "data": encrypted_content}));
+                self.anthropic_content_blocks
+                    .push(json!({"type": "redacted_thinking", "data": encrypted_content}));
             }
             ActiveBlock::ToolUse => {
                 let args = std::mem::take(&mut self.arguments_accumulator);
@@ -721,7 +720,9 @@ impl StreamingState {
                         } else {
                             // Conversion also failed. Mark invalid for retry.
                             self.apply_patch_invalid = true;
-                            let toolu_id = self.tool_use_map.iter()
+                            let toolu_id = self
+                                .tool_use_map
+                                .iter()
                                 .find(|(_, fid, _, _)| fid == &fc_id)
                                 .map(|(tid, _, _, _)| tid.clone())
                                 .unwrap_or_default();
@@ -729,8 +730,7 @@ impl StreamingState {
                             // Do NOT emit any events. Router will detect flag and trigger retry.
                         }
                     }
-                }
-                else {
+                } else {
                     events.push(ResponsesEvent::FunctionCallArgumentsDone {
                         output_index,
                         item_id: fc_id.clone(),
@@ -753,11 +753,15 @@ impl StreamingState {
                 }
 
                 // Capture Anthropic-format content block for retry
-                let toolu_id = self.tool_use_map.iter()
+                let toolu_id = self
+                    .tool_use_map
+                    .iter()
                     .find(|(_, fid, _, _)| fid == &fc_id)
                     .map(|(tid, _, _, _)| tid.clone())
                     .unwrap_or_default();
-                let raw_name = self.tool_use_map.iter()
+                let raw_name = self
+                    .tool_use_map
+                    .iter()
                     .find(|(_, fid, _, _)| fid == &fc_id)
                     .map(|(_, _, _, n)| n.clone())
                     .unwrap_or_default();
@@ -985,9 +989,10 @@ mod tests {
         all_events.extend(events);
         // Should produce response.created
         assert!(
-            all_events
-                .iter()
-                .any(|e| { let (t, _) = e.to_sse(); t == "response.created" }),
+            all_events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.created"
+            }),
             "should emit response.created"
         );
 
@@ -1048,10 +1053,13 @@ mod tests {
             index: 0,
             content_block: json!({"type": "thinking", "thinking": ""}),
         });
-        assert!(events.iter().any(|e| {
-            let (t, d) = e.to_sse();
-            t == "response.output_item.added" && d.contains("\"reasoning\"")
-        }), "should emit reasoning output_item.added");
+        assert!(
+            events.iter().any(|e| {
+                let (t, d) = e.to_sse();
+                t == "response.output_item.added" && d.contains("\"reasoning\"")
+            }),
+            "should emit reasoning output_item.added"
+        );
         assert!(events.iter().any(|e| {
             let (t, _) = e.to_sse();
             t == "response.reasoning_summary_part.added"
@@ -1270,19 +1278,25 @@ mod tests {
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
 
         // output_text.done should contain accumulated text "Hello world"
-        let done_event = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_text.done"
-        }).unwrap();
+        let done_event = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_text.done"
+            })
+            .unwrap();
         let (_, data) = done_event.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["text"], "Hello world");
 
         // output_item.done should also contain accumulated text
-        let item_done = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.done"
-        }).unwrap();
+        let item_done = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.done"
+            })
+            .unwrap();
         let (_, data) = item_done.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["item"]["content"][0]["text"], "Hello world");
@@ -1302,10 +1316,13 @@ mod tests {
             index: 0,
             content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "tool_a", "input": {}}),
         });
-        let added0 = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.added"
-        }).unwrap();
+        let added0 = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            })
+            .unwrap();
         let (_, data) = added0.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["output_index"], 0);
@@ -1317,10 +1334,13 @@ mod tests {
             index: 1,
             content_block: json!({"type": "tool_use", "id": "toolu_02", "name": "tool_b", "input": {}}),
         });
-        let added1 = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.added"
-        }).unwrap();
+        let added1 = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            })
+            .unwrap();
         let (_, data) = added1.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["output_index"], 1);
@@ -1333,10 +1353,13 @@ mod tests {
             usage: json!({"output_tokens": 50}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let completed = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let output = parsed["response"]["output"].as_array().unwrap();
@@ -1372,10 +1395,13 @@ mod tests {
             index: 0,
             content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "mcp__memory__search", "input": {}}),
         });
-        let added = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.added"
-        }).unwrap();
+        let added = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            })
+            .unwrap();
         let (_, data) = added.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["item"]["name"], "search");
@@ -1438,20 +1464,26 @@ mod tests {
         }));
 
         // Verify error event content
-        let error_evt = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "error"
-        }).unwrap();
+        let error_evt = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "error"
+            })
+            .unwrap();
         let (_, data) = error_evt.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["code"], "server_error");
         assert_eq!(parsed["message"], "Internal server error");
 
         // Verify response.failed content
-        let failed_evt = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.failed"
-        }).unwrap();
+        let failed_evt = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.failed"
+            })
+            .unwrap();
         let (_, data) = failed_evt.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["response"]["status"], "failed");
@@ -1475,10 +1507,13 @@ mod tests {
         let events = state.process_event(AnthropicEvent::Error {
             error: json!({"type": "rate_limit_error", "message": "Too many requests"}),
         });
-        let error_evt = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "error"
-        }).unwrap();
+        let error_evt = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "error"
+            })
+            .unwrap();
         let (_, data) = error_evt.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["code"], "rate_limit_exceeded");
@@ -1493,10 +1528,13 @@ mod tests {
         let events = state.process_event(AnthropicEvent::Error {
             error: json!({"type": "invalid_request_error", "message": "prompt is too long: 210000 tokens > context window 200000"}),
         });
-        let error_evt = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "error"
-        }).unwrap();
+        let error_evt = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "error"
+            })
+            .unwrap();
         let (_, data) = error_evt.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["code"], "context_length_exceeded");
@@ -1670,10 +1708,13 @@ mod tests {
             error: json!({"type": "api_error", "message": "Something went wrong"}),
         });
 
-        let failed = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.failed"
-        }).unwrap();
+        let failed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.failed"
+            })
+            .unwrap();
         let (_, data) = failed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
 
@@ -1699,10 +1740,14 @@ mod tests {
             usage: json!({"output_tokens": 10}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let (_, data) = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap().to_sse();
+        let (_, data) = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap()
+            .to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let usage = &parsed["response"]["usage"];
         // cache_creation_input_tokens has no Responses API equivalent -- must not appear.
@@ -1724,10 +1769,14 @@ mod tests {
             usage: json!({"output_tokens": 10}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let (_, data) = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap().to_sse();
+        let (_, data) = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap()
+            .to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let usage = &parsed["response"]["usage"];
         assert_eq!(usage["input_tokens"], 50);
@@ -1765,10 +1814,13 @@ mod tests {
             let events = state.process_event(AnthropicEvent::MessageStop);
 
             // Must have exactly one response.completed event.
-            let completed_count = events.iter().filter(|e| {
-                let (t, _) = e.to_sse();
-                t == "response.completed"
-            }).count();
+            let completed_count = events
+                .iter()
+                .filter(|e| {
+                    let (t, _) = e.to_sse();
+                    t == "response.completed"
+                })
+                .count();
             assert_eq!(
                 completed_count, 1,
                 "stop_reason='{}' must produce exactly one response.completed, got {}",
@@ -1787,10 +1839,14 @@ mod tests {
             );
 
             // Status must be "completed" for all stop reasons.
-            let (_, data) = events.iter().find(|e| {
-                let (t, _) = e.to_sse();
-                t == "response.completed"
-            }).unwrap().to_sse();
+            let (_, data) = events
+                .iter()
+                .find(|e| {
+                    let (t, _) = e.to_sse();
+                    t == "response.completed"
+                })
+                .unwrap()
+                .to_sse();
             let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
             assert_eq!(
                 parsed["response"]["status"], "completed",
@@ -1821,10 +1877,14 @@ mod tests {
             usage: json!({"output_tokens": 5}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let (_, data) = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap().to_sse();
+        let (_, data) = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap()
+            .to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let resp = &parsed["response"];
 
@@ -1839,7 +1899,13 @@ mod tests {
         // incomplete_details should ONLY appear for max_tokens and
         // model_context_window_exceeded. Other stop reasons should not have it.
         let reasons_with_incomplete = vec!["max_tokens", "model_context_window_exceeded"];
-        let reasons_without_incomplete = vec!["end_turn", "stop_sequence", "tool_use", "pause_turn", "refusal"];
+        let reasons_without_incomplete = vec![
+            "end_turn",
+            "stop_sequence",
+            "tool_use",
+            "pause_turn",
+            "refusal",
+        ];
 
         for sr in &reasons_with_incomplete {
             let (_, parsed) = run_text_stream("text", sr);
@@ -1881,10 +1947,14 @@ mod tests {
             usage: json!({"output_tokens": 5}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let (_, data) = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap().to_sse();
+        let (_, data) = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap()
+            .to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(
             parsed["response"]["id"], "msg_UPSTREAM_PASSTHROUGH",
@@ -1913,10 +1983,14 @@ mod tests {
             usage: json!({"output_tokens": 5}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let (_, data) = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap().to_sse();
+        let (_, data) = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap()
+            .to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(
             parsed["response"]["model"], "gpt-4o",
@@ -1984,10 +2058,14 @@ mod tests {
             usage: json!({"output_tokens": 20}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let (_, data) = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap().to_sse();
+        let (_, data) = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap()
+            .to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let output = parsed["response"]["output"].as_array().unwrap();
 
@@ -2009,17 +2087,11 @@ mod tests {
             "context_length_exceeded"
         );
         assert_eq!(
-            convert_streaming_error_code(
-                "invalid_request_error",
-                "exceeds context window"
-            ),
+            convert_streaming_error_code("invalid_request_error", "exceeds context window"),
             "context_length_exceeded"
         );
         assert_eq!(
-            convert_streaming_error_code(
-                "invalid_request_error",
-                "too many tokens: 300000"
-            ),
+            convert_streaming_error_code("invalid_request_error", "too many tokens: 300000"),
             "context_length_exceeded"
         );
         assert_eq!(
@@ -2160,10 +2232,13 @@ mod tests {
             index: 0,
             content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {}}),
         });
-        assert!(!events.iter().any(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.added"
-        }), "apply_patch OutputItemAdded should be buffered, not emitted");
+        assert!(
+            !events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "apply_patch OutputItemAdded should be buffered, not emitted"
+        );
     }
 
     #[test]
@@ -2181,14 +2256,22 @@ mod tests {
             index: 0,
             delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\""}),
         });
-        assert!(!events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }));
+        assert!(!events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.added"
+        }));
         // Second delta: *** Begin Patch appears
         let events = state.process_event(AnthropicEvent::ContentBlockDelta {
             index: 0,
             delta: json!({"type": "input_json_delta", "partial_json": "*** Begin Patch\\n*** Update File: test.txt\\n-old\\n+new\\n*** End Patch\"}"}),
         });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "buffered OutputItemAdded should be released when *** Begin Patch detected");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "buffered OutputItemAdded should be released when *** Begin Patch detected"
+        );
     }
 
     #[test]
@@ -2206,10 +2289,20 @@ mod tests {
             delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"--- a/test.txt\\n+++ b/test.txt\\n@@ -1 +1 @@\\n-old\\n+new\"}"}),
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "buffered OutputItemAdded should be released for converted patch");
-        assert!(events.iter().any(|e| { let (t, d) = e.to_sse(); t == "response.output_item.done" && d.contains("*** Begin Patch") }),
-            "OutputItemDone should contain converted freeform patch");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "buffered OutputItemAdded should be released for converted patch"
+        );
+        assert!(
+            events.iter().any(|e| {
+                let (t, d) = e.to_sse();
+                t == "response.output_item.done" && d.contains("*** Begin Patch")
+            }),
+            "OutputItemDone should contain converted freeform patch"
+        );
         assert!(!state.is_apply_patch_invalid());
     }
 
@@ -2245,7 +2338,10 @@ mod tests {
         let events = state.process_event(AnthropicEvent::MessageStart {
             message: json!({"id": "msg_RETRY", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 20, "output_tokens": 0}}),
         });
-        assert!(events.is_empty(), "retry message_start should emit no events");
+        assert!(
+            events.is_empty(),
+            "retry message_start should emit no events"
+        );
     }
 
     // --- convert_to_freeform_patch tests ---
@@ -2303,24 +2399,39 @@ mod tests {
         // Context lines (leading space) should be included without the leading space.
         let input = "--- a/file.txt\n+++ b/file.txt\n unchanged\n-old\n+new";
         let result = convert_to_freeform_patch(input);
-        assert!(result.contains("unchanged\n"), "context line should not have leading space");
+        assert!(
+            result.contains("unchanged\n"),
+            "context line should not have leading space"
+        );
         // The output should NOT contain " unchanged" with the space
-        assert!(!result.contains(" unchanged"), "context line prefix space should be stripped");
+        assert!(
+            !result.contains(" unchanged"),
+            "context line prefix space should be stripped"
+        );
     }
 
     #[test]
     fn freeform_hunk_headers_skipped() {
         let input = "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n line1\n-old\n+new";
         let result = convert_to_freeform_patch(input);
-        assert!(!result.contains("@@"), "hunk headers should be removed from output");
+        assert!(
+            !result.contains("@@"),
+            "hunk headers should be removed from output"
+        );
     }
 
     #[test]
     fn freeform_git_index_metadata_skipped() {
         let input = "diff --git a/file.txt b/file.txt\nindex abc123..def456 100644\n--- a/file.txt\n+++ b/file.txt\n-old\n+new";
         let result = convert_to_freeform_patch(input);
-        assert!(!result.contains("index abc123"), "git index line should be removed");
-        assert!(!result.contains("diff --git"), "diff --git line should be removed");
+        assert!(
+            !result.contains("index abc123"),
+            "git index line should be removed"
+        );
+        assert!(
+            !result.contains("diff --git"),
+            "diff --git line should be removed"
+        );
         assert!(result.contains("-old\n"));
         assert!(result.contains("+new\n"));
     }
@@ -2360,8 +2471,14 @@ mod tests {
 -old2
 +new2";
         let result = convert_to_freeform_patch(input);
-        assert!(result.contains("*** Update File: file1.txt\n"), "should have file1 section");
-        assert!(result.contains("*** Update File: file2.txt\n"), "should have file2 section");
+        assert!(
+            result.contains("*** Update File: file1.txt\n"),
+            "should have file1 section"
+        );
+        assert!(
+            result.contains("*** Update File: file2.txt\n"),
+            "should have file2 section"
+        );
         assert!(result.contains("-old1\n"));
         assert!(result.contains("+new1\n"));
         assert!(result.contains("-old2\n"));
@@ -2381,8 +2498,14 @@ mod tests {
         let result = convert_to_freeform_patch(input);
         // The current implementation emits *** Update File: /dev/null
         // because current_file is set by --- /dev/null and +++ doesn't override it.
-        assert!(result.contains("*** Update File:"), "should have an Update File section");
-        assert!(result.contains("+content\n"), "should include added content");
+        assert!(
+            result.contains("*** Update File:"),
+            "should have an Update File section"
+        );
+        assert!(
+            result.contains("+content\n"),
+            "should include added content"
+        );
         assert!(result.starts_with("*** Begin Patch\n"));
         assert!(result.ends_with("*** End Patch\n"));
     }
@@ -2395,9 +2518,14 @@ mod tests {
         // so *** Update File: oldfile.txt is emitted.
         let input = "--- a/oldfile.txt\n+++ /dev/null\n-old content";
         let result = convert_to_freeform_patch(input);
-        assert!(result.contains("*** Update File: oldfile.txt\n"),
-            "should use --- side path for delete");
-        assert!(result.contains("-old content\n"), "should include removed content");
+        assert!(
+            result.contains("*** Update File: oldfile.txt\n"),
+            "should use --- side path for delete"
+        );
+        assert!(
+            result.contains("-old content\n"),
+            "should include removed content"
+        );
     }
 
     #[test]
@@ -2406,8 +2534,10 @@ mod tests {
         // non-empty are included as-is (fall through to the else branch at line 135-138).
         let input = "--- a/file.txt\n+++ b/file.txt\nsome other line\n-old\n+new";
         let result = convert_to_freeform_patch(input);
-        assert!(result.contains("some other line\n"),
-            "unrecognized non-empty lines should be included as-is");
+        assert!(
+            result.contains("some other line\n"),
+            "unrecognized non-empty lines should be included as-is"
+        );
     }
 
     #[test]
@@ -2420,8 +2550,12 @@ mod tests {
         assert!(result.contains("+new\n"));
         // Count lines in output to ensure no extra blank lines from diff body
         let out_lines: Vec<&str> = result.lines().collect();
-        assert!(!out_lines.iter().any(|l| l.is_empty() && !l.starts_with('*')),
-            "empty lines in diff body should be skipped");
+        assert!(
+            !out_lines
+                .iter()
+                .any(|l| l.is_empty() && !l.starts_with('*')),
+            "empty lines in diff body should be skipped"
+        );
     }
 
     #[test]
@@ -2429,7 +2563,10 @@ mod tests {
         // A diff with just headers and no content lines.
         let input = "--- a/file.txt\n+++ b/file.txt";
         let result = convert_to_freeform_patch(input);
-        assert_eq!(result, "*** Begin Patch\n*** Update File: file.txt\n*** End Patch\n");
+        assert_eq!(
+            result,
+            "*** Begin Patch\n*** Update File: file.txt\n*** End Patch\n"
+        );
     }
 
     #[test]
@@ -2439,7 +2576,10 @@ mod tests {
         let result = convert_to_freeform_patch(input);
         // strip_prefix("--- a/") gets "file.txt\t", which includes the tab.
         // This documents the current behavior.
-        assert!(result.contains("file.txt\t"), "trailing whitespace in path is preserved");
+        assert!(
+            result.contains("file.txt\t"),
+            "trailing whitespace in path is preserved"
+        );
     }
 
     #[test]
@@ -2460,7 +2600,10 @@ mod tests {
         // Ensure the ORIGINAL input string (not trimmed) is returned for freeform.
         let input = "\n\n*** Begin Patch\n*** Update File: x\n-old\n+new\n*** End Patch\n\n";
         let result = convert_to_freeform_patch(input);
-        assert_eq!(result, input, "original input with surrounding whitespace must be preserved");
+        assert_eq!(
+            result, input,
+            "original input with surrounding whitespace must be preserved"
+        );
     }
 
     #[test]
@@ -2511,8 +2654,13 @@ fn main() {
             index: 0,
             content_block: json!({"type": "text", "text": ""}),
         });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "new content_block_start should work after prepare_for_retry");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "new content_block_start should work after prepare_for_retry"
+        );
     }
 
     #[test]
@@ -2540,10 +2688,19 @@ fn main() {
             delta: json!({"type": "text_delta", "text": "fresh"}),
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        let done = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.output_text.done" }).unwrap();
+        let done = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_text.done"
+            })
+            .unwrap();
         let (_, data) = done.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["text"], "fresh", "text accumulator should be cleared after prepare_for_retry");
+        assert_eq!(
+            parsed["text"], "fresh",
+            "text accumulator should be cleared after prepare_for_retry"
+        );
     }
 
     #[test]
@@ -2571,7 +2728,13 @@ fn main() {
             delta: json!({"type": "thinking_delta", "thinking": "fresh thinking"}),
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        let done = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.reasoning_summary_text.done" }).unwrap();
+        let done = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.reasoning_summary_text.done"
+            })
+            .unwrap();
         let (_, data) = done.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["text"], "fresh thinking");
@@ -2602,7 +2765,13 @@ fn main() {
             delta: json!({"type": "input_json_delta", "partial_json": "{\"fresh\":true}"}),
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        let done = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.function_call_arguments.done" }).unwrap();
+        let done = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.function_call_arguments.done"
+            })
+            .unwrap();
         let (_, data) = done.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["arguments"], "{\"fresh\":true}");
@@ -2639,7 +2808,10 @@ fn main() {
         state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
         let sigs = state.drain_signatures();
         assert_eq!(sigs.len(), 1);
-        assert_eq!(sigs[0].1, "fresh_sig", "signature accumulator should be cleared after prepare_for_retry");
+        assert_eq!(
+            sigs[0].1, "fresh_sig",
+            "signature accumulator should be cleared after prepare_for_retry"
+        );
     }
 
     #[test]
@@ -2660,8 +2832,13 @@ fn main() {
             index: 0,
             content_block: json!({"type": "tool_use", "id": "toolu_02", "name": "regular_tool", "input": {}}),
         });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "non-custom tool should emit OutputItemAdded immediately after retry reset");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "non-custom tool should emit OutputItemAdded immediately after retry reset"
+        );
     }
 
     #[test]
@@ -2684,13 +2861,21 @@ fn main() {
             usage: json!({"output_tokens": 10}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let completed = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.completed" }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         // stop_reason was reset, new one is end_turn
         assert_eq!(parsed["response"]["status"], "completed");
-        assert!(parsed["response"].get("incomplete_details").is_none(),
-            "end_turn should not have incomplete_details (stop_reason was properly reset)");
+        assert!(
+            parsed["response"].get("incomplete_details").is_none(),
+            "end_turn should not have incomplete_details (stop_reason was properly reset)"
+        );
     }
 
     #[test]
@@ -2713,11 +2898,19 @@ fn main() {
             usage: json!({"output_tokens": 10}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let completed = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.completed" }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["response"]["usage"]["output_tokens"], 10,
-            "output_tokens should be 10 from retry response, not 999+10");
+        assert_eq!(
+            parsed["response"]["usage"]["output_tokens"], 10,
+            "output_tokens should be 10 from retry response, not 999+10"
+        );
     }
 
     #[test]
@@ -2742,8 +2935,13 @@ fn main() {
             index: 0,
             content_block: json!({"type": "tool_use", "id": "toolu_02", "name": "apply_patch", "input": {}}),
         });
-        assert!(!events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "apply_patch should be buffered again after retry (format_confirmed was reset)");
+        assert!(
+            !events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "apply_patch should be buffered again after retry (format_confirmed was reset)"
+        );
     }
 
     #[test]
@@ -2764,7 +2962,10 @@ fn main() {
         state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
         assert!(state.is_apply_patch_invalid());
         state.prepare_for_retry();
-        assert!(!state.is_apply_patch_invalid(), "apply_patch_invalid should be reset to false");
+        assert!(
+            !state.is_apply_patch_invalid(),
+            "apply_patch_invalid should be reset to false"
+        );
     }
 
     #[test]
@@ -2796,11 +2997,20 @@ fn main() {
             index: 0,
             content_block: json!({"type": "text", "text": ""}),
         });
-        let added = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }).unwrap();
+        let added = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            })
+            .unwrap();
         let (_, data) = added.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         // output_index should be 1 because there's 1 item from the first response
-        assert_eq!(parsed["output_index"], 1, "new item should come after preserved output items");
+        assert_eq!(
+            parsed["output_index"], 1,
+            "new item should come after preserved output items"
+        );
     }
 
     #[test]
@@ -2831,7 +3041,10 @@ fn main() {
         state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
         state.prepare_for_retry();
         let captured = state.take_content_block_capture();
-        assert!(captured.is_empty(), "anthropic_content_blocks should be cleared after prepare_for_retry");
+        assert!(
+            captured.is_empty(),
+            "anthropic_content_blocks should be cleared after prepare_for_retry"
+        );
     }
 
     #[test]
@@ -2863,7 +3076,10 @@ fn main() {
         state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
         state.prepare_for_retry();
         let (toolu_id, raw) = state.take_failed_apply_patch_info();
-        assert!(toolu_id.is_empty(), "failed_apply_patch_info should be cleared after prepare_for_retry");
+        assert!(
+            toolu_id.is_empty(),
+            "failed_apply_patch_info should be cleared after prepare_for_retry"
+        );
         assert!(raw.is_empty());
     }
 
@@ -2915,10 +3131,19 @@ fn main() {
             delta: json!({"type": "input_json_delta", "partial_json": "{}"}),
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        let done = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.output_item.done" }).unwrap();
+        let done = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.done"
+            })
+            .unwrap();
         let (_, data) = done.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["item"]["id"], "fc_1", "fc_counter should be preserved across retry");
+        assert_eq!(
+            parsed["item"]["id"], "fc_1",
+            "fc_counter should be preserved across retry"
+        );
         assert_eq!(parsed["item"]["call_id"], "call_1");
     }
 
@@ -2956,16 +3181,28 @@ fn main() {
             usage: json!({"output_tokens": 5}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let completed = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.completed" }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let resp = &parsed["response"];
         // response_id should be preserved from initial response (msg_UPSTREAM, not msg_RETRY)
-        assert_eq!(resp["id"], "msg_UPSTREAM", "response_id should be preserved");
+        assert_eq!(
+            resp["id"], "msg_UPSTREAM",
+            "response_id should be preserved"
+        );
         // model should echo the request model
         assert_eq!(resp["model"], "gpt-4o", "model should be preserved");
         // created_at should be preserved
-        assert_eq!(resp["created_at"], 1717000000, "created_at should be preserved");
+        assert_eq!(
+            resp["created_at"], 1717000000,
+            "created_at should be preserved"
+        );
     }
 
     #[test]
@@ -2984,13 +3221,24 @@ fn main() {
             usage: json!({"output_tokens": 5}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let completed = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.completed" }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let usage = &parsed["response"]["usage"];
-        assert_eq!(usage["input_tokens"], 150, "input_tokens should accumulate: 100 + 50");
-        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 40,
-            "cache_read_tokens should accumulate: 30 + 10");
+        assert_eq!(
+            usage["input_tokens"], 150,
+            "input_tokens should accumulate: 100 + 50"
+        );
+        assert_eq!(
+            usage["input_tokens_details"]["cached_tokens"], 40,
+            "cache_read_tokens should accumulate: 30 + 10"
+        );
     }
 
     // --- Scenario 3: Content capture with invalid apply_patch ---
@@ -3021,12 +3269,19 @@ fn main() {
             delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"not a real patch\"}"}),
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
-        assert!(events.is_empty(), "invalid apply_patch should produce no SSE events");
+        assert!(
+            events.is_empty(),
+            "invalid apply_patch should produce no SSE events"
+        );
         assert!(state.is_apply_patch_invalid());
 
         // Content capture should include BOTH the text block AND the failed apply_patch
         let captured = state.take_content_block_capture();
-        assert_eq!(captured.len(), 2, "should capture both text and failed apply_patch");
+        assert_eq!(
+            captured.len(),
+            2,
+            "should capture both text and failed apply_patch"
+        );
         assert_eq!(captured[0]["type"], "text");
         assert_eq!(captured[0]["text"], "Some text");
         assert_eq!(captured[1]["type"], "tool_use");
@@ -3064,7 +3319,11 @@ fn main() {
         state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
 
         let items = state.output_items();
-        assert_eq!(items.len(), 1, "output_items should only contain the text block, not the invalid apply_patch");
+        assert_eq!(
+            items.len(),
+            1,
+            "output_items should only contain the text block, not the invalid apply_patch"
+        );
         assert_eq!(items[0]["type"], "message");
     }
 
@@ -3118,28 +3377,52 @@ fn main() {
         let events = state.process_event(AnthropicEvent::MessageStart {
             message: json!({"id": "msg_RETRY", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 5, "output_tokens": 0}}),
         });
-        assert!(events.is_empty(), "retry message_start should emit no events");
+        assert!(
+            events.is_empty(),
+            "retry message_start should emit no events"
+        );
 
         // But content events should work normally
         let events = state.process_event(AnthropicEvent::ContentBlockStart {
             index: 0,
             content_block: json!({"type": "text", "text": ""}),
         });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "retry mode should still emit OutputItemAdded for text block");
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.content_part.added" }),
-            "retry mode should still emit ContentPartAdded");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "retry mode should still emit OutputItemAdded for text block"
+        );
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.content_part.added"
+            }),
+            "retry mode should still emit ContentPartAdded"
+        );
 
         let events = state.process_event(AnthropicEvent::ContentBlockDelta {
             index: 0,
             delta: json!({"type": "text_delta", "text": "Retry text"}),
         });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_text.delta" }),
-            "retry mode should still emit OutputTextDelta");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_text.delta"
+            }),
+            "retry mode should still emit OutputTextDelta"
+        );
 
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_text.done" }));
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.done" }));
+        assert!(events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_text.done"
+        }));
+        assert!(events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.done"
+        }));
     }
 
     // --- Scenario 8: Retry-mode valid apply_patch (buffer -> early detection -> release -> done) ---
@@ -3161,7 +3444,10 @@ fn main() {
             content_block: json!({"type": "tool_use", "id": "toolu_retry", "name": "apply_patch", "input": {}}),
         });
         // Should be buffered, no events
-        assert!(!events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }));
+        assert!(!events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.added"
+        }));
 
         // Send freeform patch
         let events = state.process_event(AnthropicEvent::ContentBlockDelta {
@@ -3169,11 +3455,19 @@ fn main() {
             delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"*** Begin Patch\\n*** Update File: a.txt\\n-old\\n+new\\n*** End Patch\"}"}),
         });
         // Should release buffer on *** Begin Patch detection
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "retry mode: buffered apply_patch should be released on *** Begin Patch detection");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "retry mode: buffered apply_patch should be released on *** Begin Patch detection"
+        );
 
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.done" }));
+        assert!(events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.done"
+        }));
         assert!(!state.is_apply_patch_invalid());
     }
 
@@ -3215,11 +3509,19 @@ fn main() {
             usage: json!({"output_tokens": 10}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let completed = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.completed" }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["response"]["usage"]["input_tokens"], 150,
-            "input_tokens should accumulate across retries: 100 + 50 = 150");
+        assert_eq!(
+            parsed["response"]["usage"]["input_tokens"], 150,
+            "input_tokens should accumulate across retries: 100 + 50 = 150"
+        );
     }
 
     // --- Scenario 10: response.completed after retry contains both responses' items ---
@@ -3261,11 +3563,21 @@ fn main() {
             usage: json!({"output_tokens": 5}),
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
-        let completed = events.iter().find(|e| { let (t, _) = e.to_sse(); t == "response.completed" }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         let output = parsed["response"]["output"].as_array().unwrap();
-        assert_eq!(output.len(), 2, "response.completed should contain items from both responses");
+        assert_eq!(
+            output.len(),
+            2,
+            "response.completed should contain items from both responses"
+        );
         // First item from original response
         assert_eq!(output[0]["type"], "message");
         assert_eq!(output[0]["content"][0]["text"], "First");
@@ -3295,7 +3607,10 @@ fn main() {
         // apply_patch_format_confirmed is now true
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
         // Should succeed
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.done" }));
+        assert!(events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.done"
+        }));
 
         // Second apply_patch: invalid format (format_confirmed should be reset to false)
         state.process_event(AnthropicEvent::ContentBlockStart {
@@ -3309,9 +3624,14 @@ fn main() {
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
         // The second apply_patch should be invalid (format_confirmed was reset at content_block_start)
-        assert!(events.is_empty(), "second apply_patch should fail (format_confirmed was reset)");
-        assert!(state.is_apply_patch_invalid(),
-            "second apply_patch should be flagged as invalid (format_confirmed was reset per block)");
+        assert!(
+            events.is_empty(),
+            "second apply_patch should fail (format_confirmed was reset)"
+        );
+        assert!(
+            state.is_apply_patch_invalid(),
+            "second apply_patch should be flagged as invalid (format_confirmed was reset per block)"
+        );
     }
 
     // =========================================================================
@@ -3335,25 +3655,38 @@ fn main() {
             delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"this is garbage not a patch at all\"}"}),
         });
         // No events during delta for apply_patch (buffered)
-        assert!(!events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "delta should not release buffered apply_patch");
+        assert!(
+            !events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "delta should not release buffered apply_patch"
+        );
 
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
 
         // Verify: apply_patch is flagged invalid
-        assert!(state.is_apply_patch_invalid(),
-            "apply_patch should be flagged as invalid");
+        assert!(
+            state.is_apply_patch_invalid(),
+            "apply_patch should be flagged as invalid"
+        );
 
         // Verify: NO events emitted for the invalid apply_patch
-        assert!(events.is_empty(),
-            "invalid apply_patch should emit zero events");
+        assert!(
+            events.is_empty(),
+            "invalid apply_patch should emit zero events"
+        );
 
         // Verify: failed_apply_patch_info has the correct toolu_id
         let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
-        assert_eq!(toolu_id, "toolu_BAD",
-            "failed_apply_patch_info should contain toolu_BAD's toolu_id");
-        assert!(raw_patch.contains("garbage"),
-            "raw patch text should contain the garbage content");
+        assert_eq!(
+            toolu_id, "toolu_BAD",
+            "failed_apply_patch_info should contain toolu_BAD's toolu_id"
+        );
+        assert!(
+            raw_patch.contains("garbage"),
+            "raw patch text should contain the garbage content"
+        );
     }
 
     // =========================================================================
@@ -3389,11 +3722,17 @@ fn main() {
             delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"bad patch 1\"}"}),
         });
         state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
-        assert!(state.is_apply_patch_invalid(), "first apply_patch should be invalid");
+        assert!(
+            state.is_apply_patch_invalid(),
+            "first apply_patch should be invalid"
+        );
 
         // --- Call prepare_for_retry() ---
         state.prepare_for_retry();
-        assert!(!state.is_apply_patch_invalid(), "invalid flag reset after prepare_for_retry");
+        assert!(
+            !state.is_apply_patch_invalid(),
+            "invalid flag reset after prepare_for_retry"
+        );
 
         // --- Retry response: text "Retry" + ANOTHER invalid apply_patch ---
         state.process_event(AnthropicEvent::MessageStart {
@@ -3420,11 +3759,18 @@ fn main() {
             delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"bad patch 2\"}"}),
         });
         state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
-        assert!(state.is_apply_patch_invalid(), "second apply_patch should also be invalid");
+        assert!(
+            state.is_apply_patch_invalid(),
+            "second apply_patch should also be invalid"
+        );
 
         // --- Verify output_items contains "Hello" and "Retry" ---
         let items = state.output_items();
-        assert_eq!(items.len(), 2, "output_items should have both text blocks from both responses");
+        assert_eq!(
+            items.len(),
+            2,
+            "output_items should have both text blocks from both responses"
+        );
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[0]["content"][0]["text"], "Hello");
         assert_eq!(items[1]["type"], "message");
@@ -3432,25 +3778,41 @@ fn main() {
 
         // --- Verify failed_apply_patch_info has the SECOND apply_patch's info ---
         let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
-        assert_eq!(toolu_id, "toolu_SECOND",
-            "failed_apply_patch_info should be from the SECOND (most recent) invalid apply_patch");
-        assert!(raw_patch.contains("bad patch 2"),
-            "raw patch should be from the second invalid apply_patch");
+        assert_eq!(
+            toolu_id, "toolu_SECOND",
+            "failed_apply_patch_info should be from the SECOND (most recent) invalid apply_patch"
+        );
+        assert!(
+            raw_patch.contains("bad patch 2"),
+            "raw patch should be from the second invalid apply_patch"
+        );
 
         // --- Verify anthropic_content_blocks from retry response captured ---
         let captured = state.take_content_block_capture();
         // The retry response had text "Retry" + invalid apply_patch => 2 captured blocks
-        assert!(!captured.is_empty(),
-            "anthropic_content_blocks should have been captured from the retry response");
-        assert!(captured.iter().any(|b| b["type"] == "text" && b["text"] == "Retry"),
-            "captured blocks should include the Retry text block");
+        assert!(
+            !captured.is_empty(),
+            "anthropic_content_blocks should have been captured from the retry response"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|b| b["type"] == "text" && b["text"] == "Retry"),
+            "captured blocks should include the Retry text block"
+        );
 
         // --- Call prepare_for_retry() again (second retry) ---
         state.prepare_for_retry();
-        assert!(!state.is_apply_patch_invalid(), "invalid flag reset for third attempt");
+        assert!(
+            !state.is_apply_patch_invalid(),
+            "invalid flag reset for third attempt"
+        );
         assert!(state.is_retry_mode(), "retry_mode should be true");
-        assert_eq!(state.output_items().len(), 2,
-            "output_items should still be preserved after second prepare_for_retry");
+        assert_eq!(
+            state.output_items().len(),
+            2,
+            "output_items should still be preserved after second prepare_for_retry"
+        );
 
         // --- Verify state is ready for a third attempt ---
         // Stream a valid text block as a third attempt
@@ -3462,20 +3824,34 @@ fn main() {
             content_block: json!({"type": "text", "text": ""}),
         });
         // Should emit events normally (state is ready)
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
-            "third attempt should emit OutputItemAdded for text block");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            }),
+            "third attempt should emit OutputItemAdded for text block"
+        );
 
         state.process_event(AnthropicEvent::ContentBlockDelta {
             index: 0,
             delta: json!({"type": "text_delta", "text": "Third"}),
         });
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
-        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.done" }),
-            "third attempt text block should complete normally");
+        assert!(
+            events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.done"
+            }),
+            "third attempt text block should complete normally"
+        );
 
         // Verify all three responses' text items accumulated
         let items = state.output_items();
-        assert_eq!(items.len(), 3, "output_items should have all three text blocks");
+        assert_eq!(
+            items.len(),
+            3,
+            "output_items should have all three text blocks"
+        );
     }
 
     // =========================================================================
@@ -3516,26 +3892,39 @@ fn main() {
         all_events.extend(stop_events);
 
         // Count OutputItemAdded events
-        let added_count = all_events.iter().filter(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.added"
-        }).count();
+        let added_count = all_events
+            .iter()
+            .filter(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            })
+            .count();
 
-        assert_eq!(added_count, 1,
+        assert_eq!(
+            added_count, 1,
             "OutputItemAdded should be emitted exactly once (from the delta detection), got {}",
-            added_count);
+            added_count
+        );
 
         // OutputItemDone should be emitted at content_block_stop
-        let done_count = all_events.iter().filter(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.done"
-        }).count();
-        assert_eq!(done_count, 1,
+        let done_count = all_events
+            .iter()
+            .filter(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.done"
+            })
+            .count();
+        assert_eq!(
+            done_count, 1,
             "OutputItemDone should be emitted exactly once at content_block_stop, got {}",
-            done_count);
+            done_count
+        );
 
         // No duplicate OutputItemAdded
-        assert!(added_count == 1, "no duplicate OutputItemAdded should exist");
+        assert!(
+            added_count == 1,
+            "no duplicate OutputItemAdded should exist"
+        );
     }
 
     // =========================================================================
@@ -3571,10 +3960,13 @@ fn main() {
         });
 
         // Verify namespace lookup worked on first response
-        let added = start_events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.added"
-        }).unwrap();
+        let added = start_events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            })
+            .unwrap();
         let (_, data) = added.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["item"]["name"], "search");
@@ -3600,16 +3992,23 @@ fn main() {
         });
 
         // Verify namespace lookup still works after retry (at ContentBlockStart)
-        let added = start_events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.added"
-        }).unwrap();
+        let added = start_events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.added"
+            })
+            .unwrap();
         let (_, data) = added.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["item"]["name"], "search",
-            "namespace lookup should still work after retry");
-        assert_eq!(parsed["item"]["namespace"], "mcp__memory__",
-            "namespace should still be resolved correctly after retry");
+        assert_eq!(
+            parsed["item"]["name"], "search",
+            "namespace lookup should still work after retry"
+        );
+        assert_eq!(
+            parsed["item"]["namespace"], "mcp__memory__",
+            "namespace should still be resolved correctly after retry"
+        );
 
         state.process_event(AnthropicEvent::ContentBlockDelta {
             index: 0,
@@ -3618,16 +4017,23 @@ fn main() {
         let stop_events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
 
         // Verify OutputItemDone also has correct namespace after retry
-        let done = stop_events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.output_item.done"
-        }).unwrap();
+        let done = stop_events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.output_item.done"
+            })
+            .unwrap();
         let (_, done_data) = done.to_sse();
         let done_parsed: serde_json::Value = serde_json::from_str(&done_data).unwrap();
-        assert_eq!(done_parsed["item"]["name"], "search",
-            "OutputItemDone should have correct display name after retry");
-        assert_eq!(done_parsed["item"]["namespace"], "mcp__memory__",
-            "OutputItemDone should have correct namespace after retry");
+        assert_eq!(
+            done_parsed["item"]["name"], "search",
+            "OutputItemDone should have correct display name after retry"
+        );
+        assert_eq!(
+            done_parsed["item"]["namespace"], "mcp__memory__",
+            "OutputItemDone should have correct namespace after retry"
+        );
     }
 
     // =========================================================================
@@ -3676,26 +4082,42 @@ fn main() {
         }
 
         // Find positions of text-related events
-        let text_added_pos = event_types.iter().position(|t| t == "response.output_item.added");
-        let text_done_pos = event_types.iter().position(|t| t == "response.output_item.done");
+        let text_added_pos = event_types
+            .iter()
+            .position(|t| t == "response.output_item.added");
+        let text_done_pos = event_types
+            .iter()
+            .position(|t| t == "response.output_item.done");
 
         // Verify text events exist
-        assert!(text_added_pos.is_some(), "should have OutputItemAdded for text block");
-        assert!(text_done_pos.is_some(), "should have OutputItemDone for text block");
+        assert!(
+            text_added_pos.is_some(),
+            "should have OutputItemAdded for text block"
+        );
+        assert!(
+            text_done_pos.is_some(),
+            "should have OutputItemDone for text block"
+        );
 
         // Verify text OutputItemAdded comes before text OutputItemDone
         let added_pos = text_added_pos.unwrap();
         let done_pos = text_done_pos.unwrap();
-        assert!(added_pos < done_pos,
-            "text OutputItemAdded should come before text OutputItemDone");
+        assert!(
+            added_pos < done_pos,
+            "text OutputItemAdded should come before text OutputItemDone"
+        );
 
         // Verify no apply_patch events exist (invalid => no events)
-        let apply_patch_events: Vec<_> = event_types.iter()
+        let apply_patch_events: Vec<_> = event_types
+            .iter()
             .filter(|t| **t == "response.output_item.added" || **t == "response.output_item.done")
             .collect();
         // We should have exactly 2: one added + one done, both for text
-        assert_eq!(apply_patch_events.len(), 2,
-            "should only have text-related added/done events, no apply_patch events");
+        assert_eq!(
+            apply_patch_events.len(),
+            2,
+            "should only have text-related added/done events, no apply_patch events"
+        );
 
         // Verify text output_items are present even though apply_patch was invalid
         let items = state.output_items();
@@ -3733,19 +4155,28 @@ fn main() {
         let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
 
         // The invalid format should be detected via the "input" key fallback
-        assert!(state.is_apply_patch_invalid(),
-            "apply_patch with 'input' key should be flagged as invalid when content is garbage");
+        assert!(
+            state.is_apply_patch_invalid(),
+            "apply_patch with 'input' key should be flagged as invalid when content is garbage"
+        );
 
         // No events should be emitted for invalid apply_patch
-        assert!(events.is_empty(),
-            "invalid apply_patch with 'input' key should emit zero events");
+        assert!(
+            events.is_empty(),
+            "invalid apply_patch with 'input' key should emit zero events"
+        );
 
         // take_failed_apply_patch_info should return content from the "input" key
         let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
-        assert_eq!(toolu_id, "toolu_input_key",
-            "failed_apply_patch_info should have the correct toolu_id");
-        assert!(raw_patch.contains("garbage text"),
-            "raw patch should contain the content extracted from the 'input' key, got: {}", raw_patch);
+        assert_eq!(
+            toolu_id, "toolu_input_key",
+            "failed_apply_patch_info should have the correct toolu_id"
+        );
+        assert!(
+            raw_patch.contains("garbage text"),
+            "raw patch should contain the content extracted from the 'input' key, got: {}",
+            raw_patch
+        );
     }
 
     // =========================================================================
@@ -3812,19 +4243,26 @@ fn main() {
         });
         let events = state.process_event(AnthropicEvent::MessageStop);
 
-        let completed = events.iter().find(|e| {
-            let (t, _) = e.to_sse();
-            t == "response.completed"
-        }).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            })
+            .unwrap();
         let (_, data) = completed.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
 
         // output_tokens should be exactly 25 from the retry response, not accumulated from before
-        assert_eq!(parsed["response"]["usage"]["output_tokens"], 25,
-            "output_tokens should be 25 from retry response only (reset by prepare_for_retry)");
+        assert_eq!(
+            parsed["response"]["usage"]["output_tokens"], 25,
+            "output_tokens should be 25 from retry response only (reset by prepare_for_retry)"
+        );
 
         // input_tokens was preserved (100 from first response, 0 from retry = 100)
-        assert_eq!(parsed["response"]["usage"]["input_tokens"], 100,
-            "input_tokens should be preserved from first response (100)");
+        assert_eq!(
+            parsed["response"]["usage"]["input_tokens"], 100,
+            "input_tokens should be preserved from first response (100)"
+        );
     }
 }

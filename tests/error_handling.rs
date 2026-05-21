@@ -3,8 +3,8 @@
 //! Tests that Anthropic streaming errors are correctly converted to
 //! Responses API error events with the right error codes.
 
-use codex_conv::conversion::response::StreamingState;
 use codex_conv::conversion::namespace::NamespaceRegistry;
+use codex_conv::conversion::response::StreamingState;
 use codex_conv::sse::anthropic::AnthropicEvent;
 use codex_conv::sse::responses::format_responses_event;
 use serde_json::json;
@@ -28,9 +28,7 @@ fn run_error_test(error_json: serde_json::Value) -> String {
         message: json!({"id": "msg_err", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
     });
 
-    let events = state.process_event(AnthropicEvent::Error {
-        error: error_json,
-    });
+    let events = state.process_event(AnthropicEvent::Error { error: error_json });
 
     let mut output_sse = String::new();
     for re in &events {
@@ -41,14 +39,27 @@ fn run_error_test(error_json: serde_json::Value) -> String {
 
 #[test]
 fn streaming_rate_limit_error() {
-    let output = run_error_test(json!({"type": "rate_limit_error", "message": "Too many requests"}));
+    let output =
+        run_error_test(json!({"type": "rate_limit_error", "message": "Too many requests"}));
 
     // Verify: error event + response.failed.
     assert!(output.contains("event: error"), "must emit error event");
-    assert!(output.contains("\"code\":\"rate_limit_exceeded\""), "code must be rate_limit_exceeded");
-    assert!(output.contains("\"message\":\"Too many requests\""), "message must passthrough");
-    assert!(output.contains("event: response.failed"), "must emit response.failed");
-    assert!(output.contains("\"status\":\"failed\""), "status must be failed");
+    assert!(
+        output.contains("\"code\":\"rate_limit_exceeded\""),
+        "code must be rate_limit_exceeded"
+    );
+    assert!(
+        output.contains("\"message\":\"Too many requests\""),
+        "message must passthrough"
+    );
+    assert!(
+        output.contains("event: response.failed"),
+        "must emit response.failed"
+    );
+    assert!(
+        output.contains("\"status\":\"failed\""),
+        "status must be failed"
+    );
 }
 
 #[test]
@@ -62,7 +73,10 @@ fn streaming_context_overflow_error() {
         output.contains("\"code\":\"context_length_exceeded\""),
         "context overflow should map to context_length_exceeded"
     );
-    assert!(output.contains("event: response.failed"), "must emit response.failed");
+    assert!(
+        output.contains("event: response.failed"),
+        "must emit response.failed"
+    );
 }
 
 #[test]
@@ -183,12 +197,22 @@ fn error_event_then_failed_then_done_sequence() {
     });
 
     // Must produce exactly 3 events: error + response.failed + Done.
-    assert_eq!(events.len(), 3, "error must produce exactly error + response.failed + Done");
+    assert_eq!(
+        events.len(),
+        3,
+        "error must produce exactly error + response.failed + Done"
+    );
 
     let (t0, _) = events[0].to_sse();
     let (t1, _) = events[1].to_sse();
     assert_eq!(t0, "error", "first event must be error");
-    assert_eq!(t1, "response.failed", "second event must be response.failed");
+    assert_eq!(
+        t1, "response.failed",
+        "second event must be response.failed"
+    );
     // Third event is the Done terminal marker.
-    assert!(matches!(events[2], codex_conv::sse::responses::ResponsesEvent::Done));
+    assert!(matches!(
+        events[2],
+        codex_conv::sse::responses::ResponsesEvent::Done
+    ));
 }

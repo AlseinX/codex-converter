@@ -4,7 +4,7 @@
 //! `codex exec` through it. Credentials come from `$HOME/.claude/settings.json`
 //! or environment variables.
 //!
-//! Run with: `cargo test --test integrations -- --ignored --test-threads=1`
+//! Run with: `cargo test --test integrations --test-threads=1`
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,10 +19,10 @@ use tokio::process::Command;
 // ---------------------------------------------------------------------------
 
 fn get_credential(settings_key: &str, env_name: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(env_name) {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    if let Ok(v) = std::env::var(env_name)
+        && !v.is_empty()
+    {
+        return Some(v);
     }
     let home = std::env::var("HOME").ok()?;
     let path = PathBuf::from(home).join(".claude/settings.json");
@@ -62,8 +62,7 @@ fn codex_test_home() -> &'static PathBuf {
         // Write auth.json with the API key.
         let key = api_key();
         let auth = serde_json::json!({ "OPENAI_API_KEY": key });
-        std::fs::write(dir.join("auth.json"), auth.to_string())
-            .expect("failed to write auth.json");
+        std::fs::write(dir.join("auth.json"), auth.to_string()).expect("failed to write auth.json");
 
         // Write minimal config.toml.
         std::fs::write(
@@ -80,8 +79,8 @@ name = "test"
         // registers the ApplyPatchHandler.  Without this, Codex defaults to
         // apply_patch_tool_type: None and the handler is never registered,
         // causing "unsupported custom tool call: apply_patch".
-        let model = std::env::var("CODEX_CONV_TEST_MODEL")
-            .unwrap_or_else(|_| "glm-5.1".to_string());
+        let model =
+            std::env::var("CODEX_CONV_TEST_MODEL").unwrap_or_else(|_| "glm-5.1".to_string());
         let models_cache = serde_json::json!({
             "fetched_at": "2099-01-01T00:00:00Z",
             "client_version": "0.130.0",
@@ -246,14 +245,17 @@ fn extract_agent_message(events: &[serde_json::Value]) -> Option<String> {
         if item.get("type").and_then(|t| t.as_str()) != Some("agent_message") {
             return None;
         }
-        item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+        item.get("text")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
     })
 }
 
 fn has_item_type(events: &[serde_json::Value], ty: &str) -> bool {
     events.iter().any(|ev| {
         ev.get("type").and_then(|t| t.as_str()) == Some("item.completed")
-            && ev.get("item")
+            && ev
+                .get("item")
                 .and_then(|i| i.get("type"))
                 .and_then(|t| t.as_str())
                 == Some(ty)
@@ -265,10 +267,14 @@ fn has_item_type(events: &[serde_json::Value], ty: &str) -> bool {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore]
 async fn simple_text_response() {
     let (addr, _proxy) = start_proxy().await;
-    let lines = codex_exec(addr, "Reply with exactly the word PONG and nothing else.", None).await;
+    let lines = codex_exec(
+        addr,
+        "Reply with exactly the word PONG and nothing else.",
+        None,
+    )
+    .await;
     let events = parse_jsonl(&lines);
     assert!(!events.is_empty(), "must receive JSONL events");
 
@@ -280,7 +286,6 @@ async fn simple_text_response() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn exec_command_tool_call() {
     let (addr, _proxy) = start_proxy().await;
     let lines = codex_exec(addr, "Run the command: echo HELLO_TOOL_TEST", None).await;
@@ -309,7 +314,6 @@ async fn exec_command_tool_call() {
 /// tool call, and this test MUST fail in that case. This requirement is
 /// non-negotiable and must never be relaxed.
 #[tokio::test]
-#[ignore]
 async fn apply_patch_tool_call() {
     let (addr, _proxy) = start_proxy().await;
     let tmpdir = tempfile::tempdir().expect("tempdir");
@@ -330,12 +334,17 @@ async fn apply_patch_tool_call() {
     );
 
     let content = std::fs::read_to_string(&file_path).unwrap();
-    assert!(content.contains("Universe"), "file should say Universe: {content}");
-    assert!(!content.contains("World"), "World should be gone: {content}");
+    assert!(
+        content.contains("Universe"),
+        "file should say Universe: {content}"
+    );
+    assert!(
+        !content.contains("World"),
+        "World should be gone: {content}"
+    );
 }
 
 #[tokio::test]
-#[ignore]
 async fn multi_turn_conversation() {
     let (addr, _proxy) = start_proxy().await;
     let lines = codex_exec(
@@ -354,7 +363,6 @@ async fn multi_turn_conversation() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn developer_role_mapped_correctly() {
     let (addr, _proxy) = start_proxy().await;
     let lines = codex_exec(addr, "Say OK", None).await;
@@ -366,7 +374,6 @@ async fn developer_role_mapped_correctly() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn stream_termination_handled() {
     let (addr, _proxy) = start_proxy().await;
     let lines = codex_exec(addr, "Say hello", None).await;
@@ -374,5 +381,8 @@ async fn stream_termination_handled() {
     let has_completed = events
         .iter()
         .any(|ev| ev.get("type").and_then(|t| t.as_str()) == Some("turn.completed"));
-    assert!(has_completed, "must have turn.completed (clean stream termination)");
+    assert!(
+        has_completed,
+        "must have turn.completed (clean stream termination)"
+    );
 }

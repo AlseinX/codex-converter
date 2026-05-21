@@ -1,7 +1,7 @@
+use crate::conversion::ConversionTask;
 use crate::conversion::content;
 use crate::conversion::thinking;
-use crate::conversion::ConversionTask;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Convert a Responses API request body to an Anthropic Messages API request body.
 ///
@@ -85,13 +85,13 @@ pub fn convert_request(
 
     // Temperature: pass through only when thinking not enabled.
     // Clamp to 0–1 range (Anthropic range). Spec: values >1 must be clamped to 1.
-    if !thinking_cfg.thinking_enabled {
-        if let Some(temp) = obj.get("temperature") {
-            if let Some(temp_val) = temp.as_f64() {
-                result["temperature"] = json!(temp_val.clamp(0.0, 1.0));
-            } else {
-                result["temperature"] = temp.clone();
-            }
+    if !thinking_cfg.thinking_enabled
+        && let Some(temp) = obj.get("temperature")
+    {
+        if let Some(temp_val) = temp.as_f64() {
+            result["temperature"] = json!(temp_val.clamp(0.0, 1.0));
+        } else {
+            result["temperature"] = temp.clone();
         }
     }
 
@@ -115,10 +115,10 @@ pub fn convert_request(
     }
 
     // metadata: forward only user_id.
-    if let Some(meta) = obj.get("metadata") {
-        if let Some(user_id) = meta.get("user_id") {
-            result["metadata"] = json!({"user_id": user_id});
-        }
+    if let Some(meta) = obj.get("metadata")
+        && let Some(user_id) = meta.get("user_id")
+    {
+        result["metadata"] = json!({"user_id": user_id});
     }
 
     // service_tier.
@@ -166,10 +166,10 @@ pub fn convert_request(
 fn build_system(instructions: Option<&str>, input: Option<&Value>) -> Option<Value> {
     let mut blocks: Vec<Value> = Vec::new();
 
-    if let Some(text) = instructions {
-        if !text.is_empty() {
-            blocks.push(json!({"type": "text", "text": text}));
-        }
+    if let Some(text) = instructions
+        && !text.is_empty()
+    {
+        blocks.push(json!({"type": "text", "text": text}));
     }
 
     // Extract system messages from input.
@@ -177,17 +177,18 @@ fn build_system(instructions: Option<&str>, input: Option<&Value>) -> Option<Val
         for item in input_arr {
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if item_type == "message" && role == "system" {
-                if let Some(content) = item.get("content") {
-                    if let Some(arr) = content.as_array() {
-                        for block in arr {
-                            if let Some(converted) = content::convert_user_content(block) {
-                                blocks.push(converted);
-                            }
+            if item_type == "message"
+                && role == "system"
+                && let Some(content) = item.get("content")
+            {
+                if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        if let Some(converted) = content::convert_user_content(block) {
+                            blocks.push(converted);
                         }
-                    } else if let Some(text) = content.as_str() {
-                        blocks.push(json!({"type": "text", "text": text}));
                     }
+                } else if let Some(text) = content.as_str() {
+                    blocks.push(json!({"type": "text", "text": text}));
                 }
             }
         }
@@ -278,12 +279,12 @@ fn convert_tools(task: &mut ConversionTask, tools: Option<&Value>) -> Option<Val
 /// models require an explicit tool definition to produce `tool_use` blocks.
 fn inject_apply_patch_tool(tools: &mut Option<Value>) {
     // Check if apply_patch already exists.
-    if let Some(arr) = tools.as_ref().and_then(|v| v.as_array()) {
-        if arr.iter().any(|t| {
-            t.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
-        }) {
-            return;
-        }
+    if let Some(arr) = tools.as_ref().and_then(|v| v.as_array())
+        && arr
+            .iter()
+            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some("apply_patch"))
+    {
+        return;
     }
 
     let patch_tool = json!({
@@ -295,9 +296,9 @@ fn inject_apply_patch_tool(tools: &mut Option<Value>) {
                 "input": {
                     "type": "string",
                     "description": "Patch in Codex freeform format. The FIRST line MUST be exactly '*** Begin Patch'. \
-Then for each file: '*** Update File: <path>' or '*** Add File: <path>' or '*** Delete File: <path>', \
-followed by '-<line to remove>' and '+<line to add>'. End with '*** End Patch'. \
-Example:\n*** Begin Patch\n*** Update File: src/main.py\n-old line\n+new line\n*** End Patch"
+    Then for each file: '*** Update File: <path>' or '*** Add File: <path>' or '*** Delete File: <path>', \
+    followed by '-<line to remove>' and '+<line to add>'. End with '*** End Patch'. \
+    Example:\n*** Begin Patch\n*** Update File: src/main.py\n-old line\n+new line\n*** End Patch"
                 }
             },
             "required": ["input"]
@@ -585,10 +586,12 @@ fn convert_input_items(
 /// mcp_call) produce two: an assistant tool_use followed by a user tool_result.
 ///
 /// Returns an empty Vec for items that should be dropped.
+type RoleMessages = Vec<(Option<String>, Vec<Value>)>;
+
 fn convert_single_input_item(
     task: &mut ConversionTask,
     item: &Value,
-) -> Result<Vec<(Option<String>, Vec<Value>)>, RequestConversionError> {
+) -> Result<RoleMessages, RequestConversionError> {
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match item_type {
@@ -696,10 +699,10 @@ fn convert_single_input_item(
             });
 
             // Map success → is_error: success: false → is_error: true; true/absent → omit.
-            if let Some(success) = item.get("success").and_then(|v| v.as_bool()) {
-                if !success {
-                    tool_result["is_error"] = json!(true);
-                }
+            if let Some(success) = item.get("success").and_then(|v| v.as_bool())
+                && !success
+            {
+                tool_result["is_error"] = json!(true);
             }
 
             Ok(vec![(Some("user".to_string()), vec![tool_result])])
@@ -733,10 +736,10 @@ fn convert_single_input_item(
             });
 
             // Check isError from CallToolResult.
-            if let Some(is_error) = output_obj.get("isError").and_then(|v| v.as_bool()) {
-                if is_error {
-                    tool_result["is_error"] = json!(true);
-                }
+            if let Some(is_error) = output_obj.get("isError").and_then(|v| v.as_bool())
+                && is_error
+            {
+                tool_result["is_error"] = json!(true);
                 // When false or absent, omit is_error entirely.
             }
 
@@ -769,7 +772,6 @@ fn convert_single_input_item(
         // =====================================================================
         // Built-in tool history items (call-only: assistant tool_use)
         // =====================================================================
-
         "web_search_call" => {
             let id = item
                 .get("id")
@@ -830,7 +832,6 @@ fn convert_single_input_item(
         // =====================================================================
         // Built-in tool history items (call-with-result: assistant + user pair)
         // =====================================================================
-
         "file_search_call" => {
             let id = item
                 .get("id")
@@ -1022,7 +1023,6 @@ fn convert_single_input_item(
         // =====================================================================
         // Built-in tool history items (separate call: assistant tool_use)
         // =====================================================================
-
         "computer_call" => {
             let id = item
                 .get("id")
@@ -1173,7 +1173,6 @@ fn convert_single_input_item(
         // =====================================================================
         // Dropped items
         // =====================================================================
-
         "compaction" | "context_compaction" | "compaction_trigger" => {
             tracing::debug!(item_type = item_type, "dropping compaction-related item");
             Ok(vec![(None, vec![])])
@@ -1183,11 +1182,15 @@ fn convert_single_input_item(
             Ok(vec![(None, vec![])])
         }
         "mcp_list_tools" => {
-            tracing::debug!("dropping mcp_list_tools (infrastructure metadata, not model-generated call)");
+            tracing::debug!(
+                "dropping mcp_list_tools (infrastructure metadata, not model-generated call)"
+            );
             Ok(vec![(None, vec![])])
         }
         "mcp_approval_request" => {
-            tracing::debug!("dropping mcp_approval_request (approval flow metadata, not model-generated call)");
+            tracing::debug!(
+                "dropping mcp_approval_request (approval flow metadata, not model-generated call)"
+            );
             Ok(vec![(None, vec![])])
         }
         _ => {
@@ -1440,9 +1443,11 @@ mod tests {
         });
         let result = convert_request(&mut task, input).unwrap();
         assert_eq!(result["tool_choice"]["type"], "auto");
-        assert!(result["tool_choice"]
-            .get("disable_parallel_tool_use")
-            .is_none());
+        assert!(
+            result["tool_choice"]
+                .get("disable_parallel_tool_use")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1457,9 +1462,11 @@ mod tests {
         let result = convert_request(&mut task, input).unwrap();
         assert_eq!(result["tool_choice"]["type"], "none");
         // "none" means no tools -- disable_parallel_tool_use is irrelevant, omit it.
-        assert!(result["tool_choice"]
-            .get("disable_parallel_tool_use")
-            .is_none());
+        assert!(
+            result["tool_choice"]
+                .get("disable_parallel_tool_use")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2107,7 +2114,10 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert!(tools.iter().any(|t| t["name"] == "mcp__memory__search"));
         assert!(tools.iter().any(|t| t["name"] == "apply_patch"));
-        let ns_tool = tools.iter().find(|t| t["name"] == "mcp__memory__search").unwrap();
+        let ns_tool = tools
+            .iter()
+            .find(|t| t["name"] == "mcp__memory__search")
+            .unwrap();
         assert_eq!(ns_tool["type"], "custom");
         assert!(ns_tool["input_schema"].is_object());
         // Registry should have the mapping.
@@ -2972,7 +2982,11 @@ mod tests {
         let messages = result["messages"].as_array().unwrap();
 
         // Both are assistant role -> merged into one message with 2 content blocks.
-        assert_eq!(messages.len(), 1, "consecutive assistant items should merge");
+        assert_eq!(
+            messages.len(),
+            1,
+            "consecutive assistant items should merge"
+        );
         assert_eq!(messages[0]["content"].as_array().unwrap().len(), 2);
     }
 
@@ -2997,7 +3011,12 @@ mod tests {
         assert_eq!(messages[0]["role"], "user");
         let tool_result = &messages[0]["content"][0];
         assert_eq!(tool_result["type"], "tool_result");
-        assert!(tool_result["tool_use_id"].as_str().unwrap().starts_with("toolu_"));
+        assert!(
+            tool_result["tool_use_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("toolu_")
+        );
     }
 
     // =========================================================================

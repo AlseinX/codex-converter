@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::router::{build_router, AppState};
+use crate::router::{AppState, build_router};
 use std::net::SocketAddr;
 use tokio::signal;
 use tokio::time::Duration;

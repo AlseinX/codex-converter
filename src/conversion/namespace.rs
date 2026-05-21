@@ -27,6 +27,11 @@ impl NamespaceRegistry {
         self.entries.len()
     }
 
+    /// Returns true if the registry contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Register a flattened tool name with its original components.
     pub fn register(&mut self, flat_name: String, namespace: String, tool_name: String) {
         self.entries.insert(

@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Responses API SSE events.
 ///
@@ -367,7 +367,7 @@ impl ResponsesEvent {
             // Done is a special marker -- to_sse returns the [DONE] data payload.
             // The caller should use format_done() for wire format, but this allows
             // it to be mixed into the event stream.
-            ResponsesEvent::Done => ("done".to_string(), "[DONE]".to_string())
+            ResponsesEvent::Done => ("done".to_string(), "[DONE]".to_string()),
         }
     }
 }

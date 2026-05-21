@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::conversion::namespace::NamespaceRegistry;
 
@@ -121,7 +121,7 @@ pub fn convert_tool_result_content(output: &Value) -> Value {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|item| convert_user_content(item))
+            .filter_map(convert_user_content)
             .collect();
         Value::Array(blocks)
     } else {

@@ -7,7 +7,7 @@
 use codex_conv::conversion::ConversionTask;
 use codex_conv::conversion::request::convert_request;
 use codex_conv::conversion::response::StreamingState;
-use codex_conv::sse::anthropic::{parse_sse_events, AnthropicEvent};
+use codex_conv::sse::anthropic::{AnthropicEvent, parse_sse_events};
 use codex_conv::sse::responses::format_responses_event;
 use serde_json::json;
 
@@ -111,7 +111,10 @@ data: [DONE]"#;
     );
 
     // Verify terminal event.
-    assert!(output_sse.contains("event: response.completed"), "must emit response.completed");
+    assert!(
+        output_sse.contains("event: response.completed"),
+        "must emit response.completed"
+    );
 
     // Accumulated arguments in done event.
     assert!(

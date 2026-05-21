@@ -1,8 +1,8 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::conversion::response::StreamingState;
 use crate::conversion::SignatureCache;
+use crate::conversion::response::StreamingState;
 
 /// Result of reasoning -> thinking conversion.
 pub struct ThinkingConfig {
@@ -119,10 +119,7 @@ pub fn strip_thinking_blocks(messages: &mut [Value]) {
     for msg in messages.iter_mut() {
         if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
             content.retain(|block| {
-                let block_type = block
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 block_type != "thinking" && block_type != "redacted_thinking"
             });
         }
@@ -276,7 +273,10 @@ mod tests {
                 {"type": "thinking", "thinking": "I thought", "signature": "sig"},
                 {"type": "text", "text": "Hello"}
             ]}
-        ]).as_array().unwrap().clone();
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
         strip_thinking_blocks(&mut messages);
         let content = messages[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -290,7 +290,10 @@ mod tests {
                 {"type": "redacted_thinking", "data": "encrypted_blob"},
                 {"type": "text", "text": "Answer"}
             ]}
-        ]).as_array().unwrap().clone();
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
         strip_thinking_blocks(&mut messages);
         let content = messages[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -305,7 +308,10 @@ mod tests {
                 {"type": "text", "text": "Here is the code"},
                 {"type": "tool_use", "id": "toolu_01", "name": "bash", "input": {"command": "ls"}}
             ]}
-        ]).as_array().unwrap().clone();
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
         strip_thinking_blocks(&mut messages);
         let content = messages[1]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -323,7 +329,10 @@ mod tests {
                 {"type": "text", "text": "step 2"},
                 {"type": "thinking", "thinking": "more reasoning", "signature": "sig2"}
             ]}
-        ]).as_array().unwrap().clone();
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
         strip_thinking_blocks(&mut messages);
         let content = messages[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -342,7 +351,10 @@ mod tests {
     fn strip_thinking_blocks_no_content_field() {
         let mut messages: Vec<Value> = json!([
             {"role": "user", "text": "plain text message"}
-        ]).as_array().unwrap().clone();
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
         strip_thinking_blocks(&mut messages);
         // Should not panic when message has no content array.
     }
@@ -425,7 +437,9 @@ mod tests {
             .iter()
             .find_map(|e| {
                 if let ResponsesEvent::OutputItemDone { item, .. } = e {
-                    item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    item.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }

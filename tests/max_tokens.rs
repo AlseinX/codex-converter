@@ -4,9 +4,9 @@
 //! retryable error, causing an infinite retry loop. The proxy must always emit
 //! response.completed with incomplete_details as informational metadata.
 
-use codex_conv::conversion::response::StreamingState;
 use codex_conv::conversion::namespace::NamespaceRegistry;
-use codex_conv::sse::anthropic::{parse_sse_events, AnthropicEvent};
+use codex_conv::conversion::response::StreamingState;
+use codex_conv::sse::anthropic::{AnthropicEvent, parse_sse_events};
 use codex_conv::sse::responses::format_responses_event;
 
 #[test]

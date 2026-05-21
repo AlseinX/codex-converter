@@ -4,43 +4,25 @@ use serde_json::Value;
 #[derive(Debug)]
 pub enum AnthropicEvent {
     /// `message_start` — contains the initial message object.
-    MessageStart {
-        message: Value,
-    },
+    MessageStart { message: Value },
     /// `content_block_start` — a new content block begins.
-    ContentBlockStart {
-        index: usize,
-        content_block: Value,
-    },
+    ContentBlockStart { index: usize, content_block: Value },
     /// `content_block_delta` — incremental content for current block.
-    ContentBlockDelta {
-        index: usize,
-        delta: Value,
-    },
+    ContentBlockDelta { index: usize, delta: Value },
     /// `content_block_stop` — current content block ended.
-    ContentBlockStop {
-        index: usize,
-    },
+    ContentBlockStop { index: usize },
     /// `message_delta` — stop_reason and output token usage.
-    MessageDelta {
-        delta: Value,
-        usage: Value,
-    },
+    MessageDelta { delta: Value, usage: Value },
     /// `message_stop` — the message is complete.
     MessageStop,
     /// `error` — an error occurred during streaming.
-    Error {
-        error: Value,
-    },
+    Error { error: Value },
     /// `ping` — keep-alive, consumed silently.
     Ping,
     /// `[DONE]` — terminal marker.
     Done,
     /// Unknown event type — preserved for forward compatibility.
-    Unknown {
-        event_type: String,
-        data: Value,
-    },
+    Unknown { event_type: String, data: Value },
 }
 
 /// Parse a raw SSE text stream into a list of AnthropicEvent.
@@ -120,10 +102,7 @@ fn build_event(event_type: Option<&str>, data: &str) -> Option<AnthropicEvent> {
             Some(AnthropicEvent::MessageStart { message })
         }
         "content_block_start" => {
-            let index = parsed
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let content_block = parsed.get("content_block").cloned().unwrap_or(Value::Null);
             Some(AnthropicEvent::ContentBlockStart {
                 index,
@@ -131,18 +110,12 @@ fn build_event(event_type: Option<&str>, data: &str) -> Option<AnthropicEvent> {
             })
         }
         "content_block_delta" => {
-            let index = parsed
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let delta = parsed.get("delta").cloned().unwrap_or(Value::Null);
             Some(AnthropicEvent::ContentBlockDelta { index, delta })
         }
         "content_block_stop" => {
-            let index = parsed
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             Some(AnthropicEvent::ContentBlockStop { index })
         }
         "message_delta" => {
@@ -424,9 +397,18 @@ data: [DONE]"#;
         let events = parse_sse_events(raw);
         assert_eq!(events.len(), 7);
         assert!(matches!(&events[0], AnthropicEvent::MessageStart { .. }));
-        assert!(matches!(&events[1], AnthropicEvent::ContentBlockStart { .. }));
-        assert!(matches!(&events[2], AnthropicEvent::ContentBlockDelta { .. }));
-        assert!(matches!(&events[3], AnthropicEvent::ContentBlockStop { .. }));
+        assert!(matches!(
+            &events[1],
+            AnthropicEvent::ContentBlockStart { .. }
+        ));
+        assert!(matches!(
+            &events[2],
+            AnthropicEvent::ContentBlockDelta { .. }
+        ));
+        assert!(matches!(
+            &events[3],
+            AnthropicEvent::ContentBlockStop { .. }
+        ));
         assert!(matches!(&events[4], AnthropicEvent::MessageDelta { .. }));
         assert!(matches!(&events[5], AnthropicEvent::MessageStop));
         assert!(matches!(&events[6], AnthropicEvent::Done));
@@ -441,7 +423,7 @@ event: message_stop
 data: {"type":"message_stop"}"#;
         let events = parse_sse_events(raw);
         // The malformed event should produce an Unknown variant, message_stop still parsed.
-        assert!(events.len() >= 1);
+        assert!(!events.is_empty());
         assert!(matches!(
             &events[events.len() - 1],
             AnthropicEvent::MessageStop

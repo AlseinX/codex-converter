@@ -1,9 +1,9 @@
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
-use axum::Router;
 use futures::StreamExt;
 use std::pin::Pin;
 use tokio::sync::mpsc;
@@ -42,14 +42,12 @@ impl RouteInfo {
         let after_https = prefix.strip_prefix("/https")?;
 
         // Normalize: strip optional :// or :/ or just /.
-        let host_part = if after_https.starts_with("://") {
-            &after_https[3..]
-        } else if after_https.starts_with(":/") {
-            &after_https[2..]
-        } else if after_https.starts_with('/') {
-            &after_https[1..]
+        let host_part = if let Some(stripped) = after_https.strip_prefix("://") {
+            stripped
+        } else if let Some(stripped) = after_https.strip_prefix(":/") {
+            stripped
         } else {
-            return None;
+            after_https.strip_prefix('/')?
         };
 
         if host_part.is_empty() {
@@ -161,17 +159,26 @@ fn build_retry_body(
 
 /// Type alias for a boxed SSE event stream used by the retry loop.
 type SseStream = Pin<
-    Box<dyn futures::Stream<Item = Result<reqwest_eventsource::Event, reqwest_eventsource::Error>> + Send>,
+    Box<
+        dyn futures::Stream<Item = Result<reqwest_eventsource::Event, reqwest_eventsource::Error>>
+            + Send,
+    >,
 >;
 
 /// Type alias for the factory that creates SSE event streams.
 /// Given the current request body, returns a stream of SSE events (or an error).
 type SseStreamFactory = Box<
-    dyn FnMut(
-        &serde_json::Value,
-    ) -> Result<SseStream, Box<dyn std::error::Error + Send + Sync>>
+    dyn FnMut(&serde_json::Value) -> Result<SseStream, Box<dyn std::error::Error + Send + Sync>>
         + Send,
 >;
+
+/// Echo-back fields extracted from the original request, used during SSE conversion.
+struct EchoFields {
+    model: String,
+    tool_choice: String,
+    instructions: Option<String>,
+    parallel_tool_calls: Option<bool>,
+}
 
 /// Run the streaming SSE conversion with retry support for invalid apply_patch.
 ///
@@ -183,26 +190,20 @@ type SseStreamFactory = Box<
 /// * `tx` - Channel sender for output SSE events to the downstream client
 /// * `initial_body` - The initial Anthropic Messages API request body
 /// * `stream_factory` - Factory that creates SSE event streams from a request body
-/// * `model` - Model name for echo-back
-/// * `tool_choice_echo` - Tool choice for echo-back
-/// * `instructions_echo` - Instructions for echo-back
-/// * `parallel_tool_calls_echo` - Parallel tool calls for echo-back
+/// * `echo` - Echo-back fields from the original request
 /// * `namespace_registry` - Shared namespace registry from request conversion
 /// * `signature_cache` - Shared signature cache
 async fn run_streaming_with_retry(
     tx: mpsc::Sender<Result<axum::body::Bytes, std::convert::Infallible>>,
     initial_body: serde_json::Value,
     mut stream_factory: SseStreamFactory,
-    model: String,
-    tool_choice_echo: String,
-    instructions_echo: Option<String>,
-    parallel_tool_calls_echo: Option<bool>,
+    echo: EchoFields,
     namespace_registry: std::sync::Arc<std::sync::Mutex<crate::conversion::NamespaceRegistry>>,
     signature_cache: std::sync::Arc<crate::conversion::SignatureCache>,
 ) {
     use crate::conversion::response::StreamingState;
-    use crate::sse::anthropic::{parse_sse_events, AnthropicEvent};
-    use crate::sse::responses::{format_done, format_responses_event, ResponsesEvent};
+    use crate::sse::anthropic::{AnthropicEvent, parse_sse_events};
+    use crate::sse::responses::{ResponsesEvent, format_done, format_responses_event};
 
     let mut current_body = initial_body;
     let mut streaming_state: Option<StreamingState> = None;
@@ -218,9 +219,7 @@ async fn run_streaming_with_retry(
                         "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Failed to connect to upstream\"}\n\n",
                     )))
                     .await;
-                let _ = tx
-                    .send(Ok(axum::body::Bytes::from(format_done())))
-                    .await;
+                let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
                 return;
             }
         };
@@ -247,15 +246,15 @@ async fn run_streaming_with_retry(
                                 };
                                 streaming_state = Some(StreamingState::new(
                                     response_id,
-                                    model.clone(),
+                                    echo.model.clone(),
                                     ns_reg,
                                     std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs(),
-                                    tool_choice_echo.clone(),
-                                    instructions_echo.clone(),
-                                    parallel_tool_calls_echo,
+                                    echo.tool_choice.clone(),
+                                    echo.instructions.clone(),
+                                    echo.parallel_tool_calls,
                                 ));
                             } else {
                                 continue;
@@ -277,14 +276,10 @@ async fn run_streaming_with_retry(
                         for r_event in responses_events {
                             if matches!(r_event, ResponsesEvent::Done) {
                                 done_sent = true;
-                                let _ = tx
-                                    .send(Ok(axum::body::Bytes::from(format_done())))
-                                    .await;
+                                let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
                             } else {
                                 let sse_str = format_responses_event(&r_event);
-                                let _ = tx
-                                    .send(Ok(axum::body::Bytes::from(sse_str)))
-                                    .await;
+                                let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
                             }
                         }
                     }
@@ -301,20 +296,17 @@ async fn run_streaming_with_retry(
                             "type": "api_error",
                             "message": format!("Upstream stream error: {}", e)
                         });
-                        let events = state.process_event(
-                            crate::sse::anthropic::AnthropicEvent::Error { error: error_val },
-                        );
+                        let events =
+                            state.process_event(crate::sse::anthropic::AnthropicEvent::Error {
+                                error: error_val,
+                            });
                         for r_event in events {
                             if matches!(r_event, ResponsesEvent::Done) {
                                 done_sent = true;
-                                let _ = tx
-                                    .send(Ok(axum::body::Bytes::from(format_done())))
-                                    .await;
+                                let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
                             } else {
                                 let sse_str = format_responses_event(&r_event);
-                                let _ = tx
-                                    .send(Ok(axum::body::Bytes::from(sse_str)))
-                                    .await;
+                                let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
                             }
                         }
                     } else {
@@ -324,9 +316,7 @@ async fn run_streaming_with_retry(
                                 "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Upstream stream error\"}\n\n",
                             )))
                             .await;
-                        let _ = tx
-                            .send(Ok(axum::body::Bytes::from(format_done())))
-                            .await;
+                        let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
                         done_sent = true;
                     }
                     break;
@@ -346,20 +336,19 @@ async fn run_streaming_with_retry(
         }
 
         // Check if retry is needed.
-        if let Some(state) = streaming_state.as_mut() {
-            if state.is_apply_patch_invalid() {
-                let captured = state.take_content_block_capture();
-                let (toolu_id, _) = state.take_failed_apply_patch_info();
-                let error_msg = format_apply_patch_error();
+        if let Some(state) = streaming_state.as_mut()
+            && state.is_apply_patch_invalid()
+        {
+            let captured = state.take_content_block_capture();
+            let (toolu_id, _) = state.take_failed_apply_patch_info();
+            let error_msg = format_apply_patch_error();
 
-                // Build retry body using current_body (accumulates context across retries).
-                current_body =
-                    build_retry_body(&current_body, captured, &toolu_id, error_msg);
+            // Build retry body using current_body (accumulates context across retries).
+            current_body = build_retry_body(&current_body, captured, &toolu_id, error_msg);
 
-                state.prepare_for_retry();
-                tracing::info!(toolu_id = %toolu_id, "retrying apply_patch with format error feedback");
-                continue 'retry_loop;
-            }
+            state.prepare_for_retry();
+            tracing::info!(toolu_id = %toolu_id, "retrying apply_patch with format error feedback");
+            continue 'retry_loop;
         }
 
         break 'retry_loop;
@@ -367,9 +356,7 @@ async fn run_streaming_with_retry(
 
     // Send final [DONE] only if not already sent.
     if !done_sent {
-        let _ = tx
-            .send(Ok(axum::body::Bytes::from(format_done())))
-            .await;
+        let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
     }
     drop(tx);
 }
@@ -479,13 +466,14 @@ async fn handle_responses(
         .get("instructions")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let parallel_tool_calls_echo = body_json.get("parallel_tool_calls").and_then(|v| v.as_bool());
+    let parallel_tool_calls_echo = body_json
+        .get("parallel_tool_calls")
+        .and_then(|v| v.as_bool());
 
     // -- Step 4: Create ConversionTask and convert request --
-    let mut task =
-        crate::conversion::ConversionTask::new(route_info.upstream_base_url.clone());
-    let anthropic_body =
-        crate::conversion::request::convert_request(&mut task, body_json).map_err(|e| {
+    let mut task = crate::conversion::ConversionTask::new(route_info.upstream_base_url.clone());
+    let anthropic_body = crate::conversion::request::convert_request(&mut task, body_json)
+        .map_err(|e| {
             tracing::error!(error = %e, "request conversion failed");
             (
                 StatusCode::BAD_REQUEST,
@@ -538,8 +526,7 @@ async fn handle_responses(
     let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
 
     // Namespace registry is moved into the streaming task.
-    let namespace_registry =
-        std::sync::Arc::new(std::sync::Mutex::new(task.namespace_registry));
+    let namespace_registry = std::sync::Arc::new(std::sync::Mutex::new(task.namespace_registry));
     let signature_cache = task.signature_cache.clone();
 
     // Spawn a task to consume the upstream SSE stream, with retry support for
@@ -560,10 +547,12 @@ async fn handle_responses(
         tx,
         retry_anthropic_body,
         spawn_factory,
-        model,
-        tool_choice_echo,
-        instructions_echo,
-        parallel_tool_calls_echo,
+        EchoFields {
+            model,
+            tool_choice: tool_choice_echo,
+            instructions: instructions_echo,
+            parallel_tool_calls: parallel_tool_calls_echo,
+        },
         namespace_registry,
         signature_cache,
     ));
@@ -844,7 +833,9 @@ mod tests {
             serde_json::json!({"type": "tool_use", "id": "toolu_c", "name": "shell", "input": {"cmd": "ls"}}),
         ];
         let body = build_retry_body(&original, captured, "toolu_b", "error");
-        let assistant_content = body["messages"].as_array().unwrap()[1]["content"].as_array().unwrap();
+        let assistant_content = body["messages"].as_array().unwrap()[1]["content"]
+            .as_array()
+            .unwrap();
         assert_eq!(assistant_content.len(), 3);
         assert_eq!(assistant_content[0]["id"], "toolu_a");
         assert_eq!(assistant_content[1]["id"], "toolu_b");
@@ -929,7 +920,11 @@ mod tests {
         let user_msg = &messages[2];
         assert_eq!(user_msg["role"], "user");
         let content = user_msg["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1, "User message content must be an array with one block");
+        assert_eq!(
+            content.len(),
+            1,
+            "User message content must be an array with one block"
+        );
     }
 
     #[test]
@@ -940,7 +935,9 @@ mod tests {
             "max_tokens": 1024,
         });
         let body = build_retry_body(&original, vec![], "toolu_err", "some error");
-        let tool_result = &body["messages"].as_array().unwrap()[2]["content"].as_array().unwrap()[0];
+        let tool_result = &body["messages"].as_array().unwrap()[2]["content"]
+            .as_array()
+            .unwrap()[0];
         assert_eq!(tool_result["is_error"], true);
     }
 
@@ -952,7 +949,9 @@ mod tests {
             "max_tokens": 1024,
         });
         let body = build_retry_body(&original, vec![], "toolu_abc123", "err");
-        let tool_result = &body["messages"].as_array().unwrap()[2]["content"].as_array().unwrap()[0];
+        let tool_result = &body["messages"].as_array().unwrap()[2]["content"]
+            .as_array()
+            .unwrap()[0];
         assert_eq!(tool_result["tool_use_id"], "toolu_abc123");
     }
 
@@ -965,7 +964,9 @@ mod tests {
         });
         let error_msg = format_apply_patch_error();
         let body = build_retry_body(&original, vec![], "toolu_1", error_msg);
-        let tool_result = &body["messages"].as_array().unwrap()[2]["content"].as_array().unwrap()[0];
+        let tool_result = &body["messages"].as_array().unwrap()[2]["content"]
+            .as_array()
+            .unwrap()[0];
         let content = tool_result["content"].as_str().unwrap();
         assert!(
             content.contains("apply_patch format not accepted"),
@@ -990,10 +991,15 @@ mod tests {
             serde_json::json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {"patch": "*** Begin Patch\n*** End Patch"}}),
         ];
         let body = build_retry_body(&original, captured, "toolu_01", "bad patch");
-        let assistant_content = body["messages"].as_array().unwrap()[1]["content"].as_array().unwrap();
+        let assistant_content = body["messages"].as_array().unwrap()[1]["content"]
+            .as_array()
+            .unwrap();
         assert_eq!(assistant_content.len(), 3);
         assert_eq!(assistant_content[0]["type"], "thinking");
-        assert_eq!(assistant_content[0]["thinking"], "Let me reason about this...");
+        assert_eq!(
+            assistant_content[0]["thinking"],
+            "Let me reason about this..."
+        );
         assert_eq!(assistant_content[1]["type"], "text");
         assert_eq!(assistant_content[1]["text"], "Here's my answer.");
         assert_eq!(assistant_content[2]["type"], "tool_use");
@@ -1007,11 +1013,12 @@ mod tests {
             "messages": [{"role": "user", "content": "test"}],
             "max_tokens": 1024,
         });
-        let captured = vec![
-            serde_json::json!({"type": "redacted_thinking", "data": "base64encodeddata=="}),
-        ];
+        let captured =
+            vec![serde_json::json!({"type": "redacted_thinking", "data": "base64encodeddata=="})];
         let body = build_retry_body(&original, captured, "toolu_1", "err");
-        let assistant_content = body["messages"].as_array().unwrap()[1]["content"].as_array().unwrap();
+        let assistant_content = body["messages"].as_array().unwrap()[1]["content"]
+            .as_array()
+            .unwrap();
         assert_eq!(assistant_content.len(), 1);
         assert_eq!(assistant_content[0]["type"], "redacted_thinking");
         assert_eq!(assistant_content[0]["data"], "base64encodeddata==");
@@ -1161,39 +1168,62 @@ mod tests {
     fn valid_text_only_sse_events(text: &str) -> Vec<reqwest_eventsource::Event> {
         let msg_id = "msg_test001";
         vec![
-            sse_msg("message_start", serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": msg_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": "claude-sonnet-4-20250514",
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {"input_tokens": 10, "output_tokens": 0}
-                }
-            }).to_string()),
-            sse_msg("content_block_start", serde_json::json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""}
-            }).to_string()),
-            sse_msg("content_block_delta", serde_json::json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text}
-            }).to_string()),
-            sse_msg("content_block_stop", serde_json::json!({
-                "type": "content_block_stop",
-                "index": 0
-            }).to_string()),
-            sse_msg("message_delta", serde_json::json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                "usage": {"output_tokens": 5}
-            }).to_string()),
-            sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()),
+            sse_msg(
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "claude-sonnet-4-20250514",
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 10, "output_tokens": 0}
+                    }
+                })
+                .to_string(),
+            ),
+            sse_msg(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                })
+                .to_string(),
+            ),
+            sse_msg(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text}
+                })
+                .to_string(),
+            ),
+            sse_msg(
+                "content_block_stop",
+                serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": 0
+                })
+                .to_string(),
+            ),
+            sse_msg(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {"output_tokens": 5}
+                })
+                .to_string(),
+            ),
+            sse_msg(
+                "message_stop",
+                serde_json::json!({"type": "message_stop"}).to_string(),
+            ),
         ]
     }
 
@@ -1208,69 +1238,104 @@ mod tests {
         let mut events = Vec::new();
 
         // message_start
-        events.push(sse_msg("message_start", serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": "claude-sonnet-4-20250514",
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": 10, "output_tokens": 0}
-            }
-        }).to_string()));
+        events.push(sse_msg(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-sonnet-4-20250514",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 0}
+                }
+            })
+            .to_string(),
+        ));
 
         let mut block_index = 0;
 
         // Optional text block before the apply_patch
         if let Some(text) = text_before {
-            events.push(sse_msg("content_block_start", serde_json::json!({
-                "type": "content_block_start",
-                "index": block_index,
-                "content_block": {"type": "text", "text": ""}
-            }).to_string()));
-            events.push(sse_msg("content_block_delta", serde_json::json!({
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "text_delta", "text": text}
-            }).to_string()));
-            events.push(sse_msg("content_block_stop", serde_json::json!({
-                "type": "content_block_stop",
-                "index": block_index
-            }).to_string()));
+            events.push(sse_msg(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "text", "text": ""}
+                })
+                .to_string(),
+            ));
+            events.push(sse_msg(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text}
+                })
+                .to_string(),
+            ));
+            events.push(sse_msg(
+                "content_block_stop",
+                serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": block_index
+                })
+                .to_string(),
+            ));
             block_index += 1;
         }
 
         // apply_patch tool_use block (invalid format)
-        events.push(sse_msg("content_block_start", serde_json::json!({
-            "type": "content_block_start",
-            "index": block_index,
-            "content_block": {
-                "type": "tool_use",
-                "id": toolu_id,
-                "name": "apply_patch",
-                "input": {}
-            }
-        }).to_string()));
+        events.push(sse_msg(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "apply_patch",
+                    "input": {}
+                }
+            })
+            .to_string(),
+        ));
         let patch_json = serde_json::json!({"patch": patch_text}).to_string();
-        events.push(sse_msg("content_block_delta", serde_json::json!({
-            "type": "content_block_delta",
-            "index": block_index,
-            "delta": {"type": "input_json_delta", "partial_json": patch_json}
-        }).to_string()));
-        events.push(sse_msg("content_block_stop", serde_json::json!({
-            "type": "content_block_stop",
-            "index": block_index
-        }).to_string()));
+        events.push(sse_msg(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "input_json_delta", "partial_json": patch_json}
+            })
+            .to_string(),
+        ));
+        events.push(sse_msg(
+            "content_block_stop",
+            serde_json::json!({
+                "type": "content_block_stop",
+                "index": block_index
+            })
+            .to_string(),
+        ));
 
-        events.push(sse_msg("message_delta", serde_json::json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
-            "usage": {"output_tokens": 50}
-        }).to_string()));
-        events.push(sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()));
+        events.push(sse_msg(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                "usage": {"output_tokens": 50}
+            })
+            .to_string(),
+        ));
+        events.push(sse_msg(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}).to_string(),
+        ));
 
         events
     }
@@ -1283,47 +1348,70 @@ mod tests {
     ) -> Vec<reqwest_eventsource::Event> {
         let mut events = Vec::new();
 
-        events.push(sse_msg("message_start", serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": "claude-sonnet-4-20250514",
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": 10, "output_tokens": 0}
-            }
-        }).to_string()));
+        events.push(sse_msg(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-sonnet-4-20250514",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 0}
+                }
+            })
+            .to_string(),
+        ));
 
-        events.push(sse_msg("content_block_start", serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "tool_use",
-                "id": toolu_id,
-                "name": "apply_patch",
-                "input": {}
-            }
-        }).to_string()));
+        events.push(sse_msg(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": "apply_patch",
+                    "input": {}
+                }
+            })
+            .to_string(),
+        ));
         let patch_json = serde_json::json!({"patch": patch_text}).to_string();
-        events.push(sse_msg("content_block_delta", serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": patch_json}
-        }).to_string()));
-        events.push(sse_msg("content_block_stop", serde_json::json!({
-            "type": "content_block_stop",
-            "index": 0
-        }).to_string()));
+        events.push(sse_msg(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": patch_json}
+            })
+            .to_string(),
+        ));
+        events.push(sse_msg(
+            "content_block_stop",
+            serde_json::json!({
+                "type": "content_block_stop",
+                "index": 0
+            })
+            .to_string(),
+        ));
 
-        events.push(sse_msg("message_delta", serde_json::json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
-            "usage": {"output_tokens": 30}
-        }).to_string()));
-        events.push(sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()));
+        events.push(sse_msg(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                "usage": {"output_tokens": 30}
+            })
+            .to_string(),
+        ));
+        events.push(sse_msg(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}).to_string(),
+        ));
 
         events
     }
@@ -1354,18 +1442,17 @@ mod tests {
 
     /// Helper: create default retry loop parameters.
     fn default_retry_params() -> (
-        String,
-        String,
-        Option<String>,
-        Option<bool>,
+        EchoFields,
         std::sync::Arc<std::sync::Mutex<crate::conversion::NamespaceRegistry>>,
         std::sync::Arc<SignatureCache>,
     ) {
         (
-            "claude-sonnet-4-20250514".to_string(),
-            "auto".to_string(),
-            None,
-            None,
+            EchoFields {
+                model: "claude-sonnet-4-20250514".to_string(),
+                tool_choice: "auto".to_string(),
+                instructions: None,
+                parallel_tool_calls: None,
+            },
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::conversion::NamespaceRegistry::new(),
             )),
@@ -1378,8 +1465,7 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_valid_response_no_retry() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         let events = valid_text_only_sse_events("Hello world");
 
@@ -1399,7 +1485,12 @@ mod tests {
         let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1437,8 +1528,7 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_invalid_patch_triggers_retry_then_succeeds() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // First call: invalid patch. Second call: valid text response.
         let invalid_events =
@@ -1449,13 +1539,11 @@ mod tests {
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
             call_count += 1;
             if call_count == 1 {
-                let stream =
-                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             } else {
                 assert_eq!(call_count, 2, "should only need 2 calls");
-                let stream =
-                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(valid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             }
         });
@@ -1467,7 +1555,12 @@ mod tests {
         });
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1503,13 +1596,11 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_double_retry_then_succeeds() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         let invalid1 =
             invalid_apply_patch_sse_events("msg_retry1", None, "toolu_bad1", "still bad");
-        let invalid2 =
-            invalid_apply_patch_sse_events("msg_retry2", None, "toolu_bad2", "also bad");
+        let invalid2 = invalid_apply_patch_sse_events("msg_retry2", None, "toolu_bad2", "also bad");
         let valid = valid_text_only_sse_events("Finally works!");
 
         let mut call_count = 0;
@@ -1532,15 +1623,17 @@ mod tests {
         });
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
 
-        assert!(
-            output.contains("data: [DONE]"),
-            "should end with [DONE]"
-        );
+        assert!(output.contains("data: [DONE]"), "should end with [DONE]");
         // Should have text from the third (successful) stream
         assert!(
             sse_output_contains(&output, "response.output_text.delta"),
@@ -1553,17 +1646,20 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_event_source_creation_failure() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
-        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
-            Err("connection refused".into())
-        });
+        let factory: SseStreamFactory =
+            Box::new(move |_body: &serde_json::Value| Err("connection refused".into()));
 
         let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1589,25 +1685,28 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_sse_stream_ends_prematurely() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // Stream that starts with message_start then ends with StreamEnded error.
         // In the retry loop, "Stream ended" is treated as a normal stream end.
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
-            let msg_start = Ok(sse_msg("message_start", serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": "msg_miderr",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": "claude-sonnet-4-20250514",
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {"input_tokens": 10, "output_tokens": 0}
-                }
-            }).to_string()));
+            let msg_start = Ok(sse_msg(
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_miderr",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "claude-sonnet-4-20250514",
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 10, "output_tokens": 0}
+                    }
+                })
+                .to_string(),
+            ));
             let err = reqwest_eventsource::Error::StreamEnded;
             let stream = futures::stream::iter(vec![msg_start, Err(err)]);
             Ok(Box::pin(stream) as SseStream)
@@ -1616,7 +1715,12 @@ mod tests {
         let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1638,14 +1742,11 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_sse_stream_error_before_message_start() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // Stream that errors immediately, before any message_start.
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
-            let err = reqwest_eventsource::Error::InvalidLastEventId(
-                "bad-id".to_string(),
-            );
+            let err = reqwest_eventsource::Error::InvalidLastEventId("bad-id".to_string());
             let stream = futures::stream::iter(vec![Err(err)]);
             Ok(Box::pin(stream) as SseStream)
         });
@@ -1653,7 +1754,12 @@ mod tests {
         let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1670,14 +1776,12 @@ mod tests {
         );
     }
 
-
     // --- Scenario 6: Text forwarded before retry ---
 
     #[tokio::test]
     async fn retry_loop_text_forwarded_before_retry() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // First stream: text "I will fix it" + invalid apply_patch
         let invalid_events = invalid_apply_patch_sse_events(
@@ -1693,12 +1797,10 @@ mod tests {
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
             call_count += 1;
             if call_count == 1 {
-                let stream =
-                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             } else {
-                let stream =
-                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(valid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             }
         });
@@ -1710,7 +1812,12 @@ mod tests {
         });
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1727,10 +1834,7 @@ mod tests {
             "text from retry stream should be forwarded"
         );
         // Should end with [DONE]
-        assert!(
-            output.contains("data: [DONE]"),
-            "should end with [DONE]"
-        );
+        assert!(output.contains("data: [DONE]"), "should end with [DONE]");
 
         // Count response.created events -- should have at least one
         let created_count = count_sse_events(&output, "response.created");
@@ -1745,8 +1849,7 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_valid_apply_patch_no_retry() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // A valid apply_patch (starts with *** Begin Patch) should succeed without retry.
         let valid_patch = "*** Begin Patch\n*** Update File: foo.rs\n-old\n+new\n*** End Patch\n";
@@ -1755,7 +1858,10 @@ mod tests {
         let mut call_count = 0;
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
             call_count += 1;
-            assert_eq!(call_count, 1, "factory should only be called once for valid patch");
+            assert_eq!(
+                call_count, 1,
+                "factory should only be called once for valid patch"
+            );
             let stream = futures::stream::iter(events.clone().into_iter().map(Ok));
             Ok(Box::pin(stream) as SseStream)
         });
@@ -1767,7 +1873,12 @@ mod tests {
         });
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1784,10 +1895,7 @@ mod tests {
             &output[..output.len().min(500)]
         );
         // Should end with [DONE]
-        assert!(
-            output.contains("data: [DONE]"),
-            "should end with [DONE]"
-        );
+        assert!(output.contains("data: [DONE]"), "should end with [DONE]");
         // Should NOT have error events
         assert!(
             !sse_output_contains(&output, "error"),
@@ -1800,8 +1908,7 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_factory_called_exactly_twice() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // First call: invalid patch. Second call: valid text response.
         let invalid_events =
@@ -1816,12 +1923,10 @@ mod tests {
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
             let prev = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if prev == 0 {
-                let stream =
-                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             } else {
-                let stream =
-                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(valid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             }
         });
@@ -1833,14 +1938,20 @@ mod tests {
         });
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
 
         // Factory should have been called exactly 2 times
         assert_eq!(
-            call_count.load(std::sync::atomic::Ordering::SeqCst), 2,
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
             "factory should be called exactly 2 times (once for invalid, once for retry), got: {}",
             call_count.load(std::sync::atomic::Ordering::SeqCst)
         );
@@ -1864,8 +1975,7 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_lazy_state_creation_with_ping_then_message() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // Stream: ping event, then an Open event, then a valid text response.
         // The ping and Open events should be handled without error (no state creation yet),
@@ -1877,39 +1987,62 @@ mod tests {
                 // Open event (handled but no action)
                 reqwest_eventsource::Event::Open,
                 // Now the real message starts
-                sse_msg("message_start", serde_json::json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": "msg_lazy",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": "claude-sonnet-4-20250514",
-                        "stop_reason": null,
-                        "stop_sequence": null,
-                        "usage": {"input_tokens": 10, "output_tokens": 0}
-                    }
-                }).to_string()),
-                sse_msg("content_block_start", serde_json::json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""}
-                }).to_string()),
-                sse_msg("content_block_delta", serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": "Lazy state works"}
-                }).to_string()),
-                sse_msg("content_block_stop", serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": 0
-                }).to_string()),
-                sse_msg("message_delta", serde_json::json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                    "usage": {"output_tokens": 5}
-                }).to_string()),
-                sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()),
+                sse_msg(
+                    "message_start",
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_lazy",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": "claude-sonnet-4-20250514",
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": {"input_tokens": 10, "output_tokens": 0}
+                        }
+                    })
+                    .to_string(),
+                ),
+                sse_msg(
+                    "content_block_start",
+                    serde_json::json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""}
+                    })
+                    .to_string(),
+                ),
+                sse_msg(
+                    "content_block_delta",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "Lazy state works"}
+                    })
+                    .to_string(),
+                ),
+                sse_msg(
+                    "content_block_stop",
+                    serde_json::json!({
+                        "type": "content_block_stop",
+                        "index": 0
+                    })
+                    .to_string(),
+                ),
+                sse_msg(
+                    "message_delta",
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                        "usage": {"output_tokens": 5}
+                    })
+                    .to_string(),
+                ),
+                sse_msg(
+                    "message_stop",
+                    serde_json::json!({"type": "message_stop"}).to_string(),
+                ),
             ];
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream) as SseStream)
@@ -1918,7 +2051,12 @@ mod tests {
         let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -1944,10 +2082,7 @@ mod tests {
         );
 
         // Should end with [DONE]
-        assert!(
-            output.contains("data: [DONE]"),
-            "should end with [DONE]"
-        );
+        assert!(output.contains("data: [DONE]"), "should end with [DONE]");
 
         // Should NOT have error events
         assert!(
@@ -1961,8 +2096,7 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_creation_failure_on_retry_attempt() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // First call succeeds with invalid patch, second call fails
         let invalid_events =
@@ -1972,8 +2106,7 @@ mod tests {
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
             call_count += 1;
             if call_count == 1 {
-                let stream =
-                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             } else {
                 Err("retry connection failed".into())
@@ -1987,7 +2120,12 @@ mod tests {
         });
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
+            sig_cache,
         ));
 
         let output = collect_retry_output(&mut rx).await;
@@ -2008,77 +2146,115 @@ mod tests {
     #[tokio::test]
     async fn retry_loop_signatures_drained_and_cached_across_retry() {
         let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
-        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
-            default_retry_params();
+        let (echo, ns_reg, sig_cache) = default_retry_params();
 
         // Build first stream: thinking block with a known signature, then invalid apply_patch.
         let mut first_events = Vec::new();
 
         // message_start
-        first_events.push(sse_msg("message_start", serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": "msg_sig_test",
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": "claude-sonnet-4-20250514",
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": 10, "output_tokens": 0}
-            }
-        }).to_string()));
+        first_events.push(sse_msg(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_sig_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-sonnet-4-20250514",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 0}
+                }
+            })
+            .to_string(),
+        ));
 
         // thinking block (index 0)
-        first_events.push(sse_msg("content_block_start", serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": ""}
-        }).to_string()));
-        first_events.push(sse_msg("content_block_delta", serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "thinking_delta", "thinking": "I am reasoning"}
-        }).to_string()));
+        first_events.push(sse_msg(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            })
+            .to_string(),
+        ));
+        first_events.push(sse_msg(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "I am reasoning"}
+            })
+            .to_string(),
+        ));
         // signature_delta with known value
-        first_events.push(sse_msg("content_block_delta", serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "signature_delta", "signature": "rs_test_signature_123"}
-        }).to_string()));
-        first_events.push(sse_msg("content_block_stop", serde_json::json!({
-            "type": "content_block_stop",
-            "index": 0
-        }).to_string()));
+        first_events.push(sse_msg(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "rs_test_signature_123"}
+            })
+            .to_string(),
+        ));
+        first_events.push(sse_msg(
+            "content_block_stop",
+            serde_json::json!({
+                "type": "content_block_stop",
+                "index": 0
+            })
+            .to_string(),
+        ));
 
         // invalid apply_patch block (index 1)
-        first_events.push(sse_msg("content_block_start", serde_json::json!({
-            "type": "content_block_start",
-            "index": 1,
-            "content_block": {
-                "type": "tool_use",
-                "id": "toolu_sig_bad",
-                "name": "apply_patch",
-                "input": {}
-            }
-        }).to_string()));
+        first_events.push(sse_msg(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_sig_bad",
+                    "name": "apply_patch",
+                    "input": {}
+                }
+            })
+            .to_string(),
+        ));
         let bad_patch = serde_json::json!({"patch": "not a valid patch"}).to_string();
-        first_events.push(sse_msg("content_block_delta", serde_json::json!({
-            "type": "content_block_delta",
-            "index": 1,
-            "delta": {"type": "input_json_delta", "partial_json": bad_patch}
-        }).to_string()));
-        first_events.push(sse_msg("content_block_stop", serde_json::json!({
-            "type": "content_block_stop",
-            "index": 1
-        }).to_string()));
+        first_events.push(sse_msg(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": bad_patch}
+            })
+            .to_string(),
+        ));
+        first_events.push(sse_msg(
+            "content_block_stop",
+            serde_json::json!({
+                "type": "content_block_stop",
+                "index": 1
+            })
+            .to_string(),
+        ));
 
-        first_events.push(sse_msg("message_delta", serde_json::json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
-            "usage": {"output_tokens": 50}
-        }).to_string()));
-        first_events.push(sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()));
+        first_events.push(sse_msg(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                "usage": {"output_tokens": 50}
+            })
+            .to_string(),
+        ));
+        first_events.push(sse_msg(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}).to_string(),
+        ));
 
         // Second stream: simple valid text response (the retry succeeds)
         let valid_events = valid_text_only_sse_events("Retry successful");
@@ -2087,13 +2263,11 @@ mod tests {
         let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
             call_count += 1;
             if call_count == 1 {
-                let stream =
-                    futures::stream::iter(first_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(first_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             } else {
                 assert_eq!(call_count, 2, "should only need 2 calls");
-                let stream =
-                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                let stream = futures::stream::iter(valid_events.clone().into_iter().map(Ok));
                 Ok(Box::pin(stream) as SseStream)
             }
         });
@@ -2105,7 +2279,11 @@ mod tests {
         });
 
         tokio::spawn(run_streaming_with_retry(
-            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg,
+            tx,
+            initial_body,
+            factory,
+            echo,
+            ns_reg,
             // Clone sig_cache for the spawned task; we retain the original to inspect after.
             sig_cache.clone(),
         ));

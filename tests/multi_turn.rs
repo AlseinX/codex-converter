@@ -5,10 +5,10 @@
 //! from turn 1. Verify the signature cache lookup works correctly and the
 //! cached signature is included in the Anthropic request.
 
-use codex_conv::conversion::{ConversionTask, SignatureCache};
 use codex_conv::conversion::request::convert_request;
 use codex_conv::conversion::response::StreamingState;
-use codex_conv::sse::anthropic::{parse_sse_events, AnthropicEvent};
+use codex_conv::conversion::{ConversionTask, SignatureCache};
+use codex_conv::sse::anthropic::{AnthropicEvent, parse_sse_events};
 use codex_conv::sse::responses::format_responses_event;
 use serde_json::json;
 use std::sync::Arc;
@@ -136,7 +136,10 @@ data: [DONE]"#;
     assert!(output1.contains("response.reasoning_summary_text.delta"));
     assert!(output1.contains("response.function_call_arguments.delta"));
     assert!(output1.contains("event: response.completed"));
-    assert!(!output1.contains("SIG_TURN1_ABC"), "signature must not appear in SSE");
+    assert!(
+        !output1.contains("SIG_TURN1_ABC"),
+        "signature must not appear in SSE"
+    );
 
     // Cache signatures.
     for (id, sig) in state1.drain_signatures() {
@@ -187,7 +190,10 @@ data: [DONE]"#;
     assert!(has_tool_use, "turn 2 must include tool_use from turn 1");
 
     let has_tool_result = has_content_block_of_type(messages2, "tool_result");
-    assert!(has_tool_result, "turn 2 must include tool_result from turn 1");
+    assert!(
+        has_tool_result,
+        "turn 2 must include tool_result from turn 1"
+    );
 
     // Simulate turn 2 Anthropic response (simple text).
     let anthropic_sse2 = r#"event: message_start
@@ -262,7 +268,10 @@ fn multi_turn_with_encrypted_content() {
     let has_redacted = find_content_block_by_type(messages, "redacted_thinking")
         .map(|b| b["data"] == "OPAQUE_TURN1_DATA")
         .unwrap_or(false);
-    assert!(has_redacted, "encrypted_content must produce redacted_thinking block");
+    assert!(
+        has_redacted,
+        "encrypted_content must produce redacted_thinking block"
+    );
 
     // Message alternation must be correct: user, assistant(redacted_thinking+text), user.
     assert_eq!(messages.len(), 3);

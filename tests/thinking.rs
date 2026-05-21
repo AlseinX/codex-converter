@@ -4,10 +4,10 @@
 //! a signature. The signature is cached. Turn 2 sends a follow-up with a reasoning
 //! input item referencing the cached signature.
 
-use codex_conv::conversion::{ConversionTask, SignatureCache};
 use codex_conv::conversion::request::convert_request;
 use codex_conv::conversion::response::StreamingState;
-use codex_conv::sse::anthropic::{parse_sse_events, AnthropicEvent};
+use codex_conv::conversion::{ConversionTask, SignatureCache};
+use codex_conv::sse::anthropic::{AnthropicEvent, parse_sse_events};
 use codex_conv::sse::responses::format_responses_event;
 use serde_json::json;
 use std::sync::Arc;
@@ -159,8 +159,8 @@ data: [DONE]"#;
     let messages = anth_request2["messages"].as_array().unwrap();
 
     // Find the thinking block in the messages.
-    let thinking_block = find_content_block_by_type(messages, "thinking")
-        .expect("should have a thinking block");
+    let thinking_block =
+        find_content_block_by_type(messages, "thinking").expect("should have a thinking block");
 
     assert_eq!(
         thinking_block["signature"], "ErUB_cachesig",
@@ -211,8 +211,8 @@ fn reasoning_no_cache_empty_signature() {
     let result = convert_request(&mut task, request).unwrap();
     let messages = result["messages"].as_array().unwrap();
 
-    let block = find_content_block_by_type(messages, "thinking")
-        .expect("should have thinking block");
+    let block =
+        find_content_block_by_type(messages, "thinking").expect("should have thinking block");
 
     // When no cached signature exists, use empty signature.
     assert_eq!(block["signature"], "");

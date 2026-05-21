@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use codex_conv::config::AppConfig;
 use codex_conv::logging;
@@ -82,10 +84,10 @@ async fn main() {
 fn apply_env_overrides(config: &mut AppConfig) {
     const PREFIX: &str = "CODEX_CONV_";
     for (key, value) in std::env::vars() {
-        if let Some(rest) = key.strip_prefix(PREFIX) {
-            if let Err(e) = config.apply_env(rest, &value) {
-                tracing::warn!(key = %rest, error = %e, "ignoring invalid env override");
-            }
+        if let Some(rest) = key.strip_prefix(PREFIX)
+            && let Err(e) = config.apply_env(rest, &value)
+        {
+            tracing::warn!(key = %rest, error = %e, "ignoring invalid env override");
         }
     }
 }
@@ -172,5 +174,4 @@ mod tests {
         let cli = Cli::try_parse_from(["codex-conv", "--config-file", "/tmp/conv.yaml"]).unwrap();
         assert_eq!(cli.config_file, Some(PathBuf::from("/tmp/conv.yaml")));
     }
-
 }

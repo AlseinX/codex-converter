@@ -4,10 +4,10 @@
 //! Mock Anthropic returns a streaming text response. Verify the full pipeline
 //! converts correctly from Responses API -> Anthropic -> back to Responses API SSE.
 
-use codex_conv::conversion::{ConversionTask, NamespaceRegistry};
 use codex_conv::conversion::request::convert_request;
 use codex_conv::conversion::response::StreamingState;
-use codex_conv::sse::anthropic::{parse_sse_events, AnthropicEvent};
+use codex_conv::conversion::{ConversionTask, NamespaceRegistry};
+use codex_conv::sse::anthropic::{AnthropicEvent, parse_sse_events};
 use codex_conv::sse::responses::format_responses_event;
 use serde_json::json;
 
@@ -82,28 +82,67 @@ data: [DONE]"#;
 
     // -- Verify output --
     // Lifecycle events.
-    assert!(output_sse.contains("event: response.created"), "must emit response.created");
-    assert!(output_sse.contains("event: response.output_item.added"), "must emit output_item.added");
-    assert!(output_sse.contains("event: response.content_part.added"), "must emit content_part.added");
+    assert!(
+        output_sse.contains("event: response.created"),
+        "must emit response.created"
+    );
+    assert!(
+        output_sse.contains("event: response.output_item.added"),
+        "must emit output_item.added"
+    );
+    assert!(
+        output_sse.contains("event: response.content_part.added"),
+        "must emit content_part.added"
+    );
 
     // Delta events.
-    assert!(output_sse.contains("event: response.output_text.delta"), "must emit output_text.delta");
-    assert!(output_sse.contains("\"delta\":\"Hello!\""), "delta content must be Hello!");
+    assert!(
+        output_sse.contains("event: response.output_text.delta"),
+        "must emit output_text.delta"
+    );
+    assert!(
+        output_sse.contains("\"delta\":\"Hello!\""),
+        "delta content must be Hello!"
+    );
 
     // Done events.
-    assert!(output_sse.contains("event: response.output_text.done"), "must emit output_text.done");
-    assert!(output_sse.contains("\"text\":\"Hello!\""), "accumulated text must be Hello!");
-    assert!(output_sse.contains("event: response.content_part.done"), "must emit content_part.done");
-    assert!(output_sse.contains("event: response.output_item.done"), "must emit output_item.done");
+    assert!(
+        output_sse.contains("event: response.output_text.done"),
+        "must emit output_text.done"
+    );
+    assert!(
+        output_sse.contains("\"text\":\"Hello!\""),
+        "accumulated text must be Hello!"
+    );
+    assert!(
+        output_sse.contains("event: response.content_part.done"),
+        "must emit content_part.done"
+    );
+    assert!(
+        output_sse.contains("event: response.output_item.done"),
+        "must emit output_item.done"
+    );
 
     // Terminal event.
-    assert!(output_sse.contains("event: response.completed"), "must emit response.completed");
-    assert!(output_sse.contains("data: [DONE]"), "must emit [DONE] terminal marker");
+    assert!(
+        output_sse.contains("event: response.completed"),
+        "must emit response.completed"
+    );
+    assert!(
+        output_sse.contains("data: [DONE]"),
+        "must emit [DONE] terminal marker"
+    );
 
     // CRITICAL: NEVER response.incomplete.
-    assert!(!output_sse.contains("response.incomplete"), "must NEVER emit response.incomplete");
+    assert!(
+        !output_sse.contains("response.incomplete"),
+        "must NEVER emit response.incomplete"
+    );
     // CRITICAL: NEVER sequence_number.
-    assert!(!output_sse.contains("sequence_number"), "must NEVER include sequence_number");
+    assert!(
+        !output_sse.contains("sequence_number"),
+        "must NEVER include sequence_number"
+    );
 }
 
 /// Verifies the response.completed object structure for a simple text response.
@@ -169,7 +208,10 @@ data: [DONE]"#;
     assert_eq!(resp["status"], "completed");
     assert_eq!(resp["model"], "claude-sonnet-4-20250514");
     assert_eq!(resp["created_at"], 1717000000);
-    assert!(resp.get("completed_at").is_some(), "completed_at must be present");
+    assert!(
+        resp.get("completed_at").is_some(),
+        "completed_at must be present"
+    );
 
     // Usage.
     let usage = &resp["usage"];

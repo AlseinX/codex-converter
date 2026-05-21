@@ -37,6 +37,25 @@ Numbered list with source descriptions and URLs.
 
 Both APIs and Codex CLI evolve rapidly. Before relying on any research entry, verify it is still current. If an entry is outdated, update it with new references and note the change.
 
+## Integration Testing Requirement
+
+Integration tests are the **sole acceptance criterion** for all features. Unit tests may supplement but can never replace integration tests.
+
+- All integration tests must run without `#[ignore]`. Adding `#[ignore]` to an integration test is **strictly forbidden**.
+- Integration tests must exercise the full system end-to-end: proxy receives request, converts protocol, communicates with upstream, and returns correct response to the client.
+- A feature is not done until its integration tests pass against the real or mock upstream.
+
+## Code Quality Gates
+
+All code must pass `cargo clippy` and `cargo fmt` checks with zero warnings. Run both before committing:
+
+```
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
+
+Do not suppress clippy warnings with `#[allow(...)]` unless the reason is documented inline.
+
 ## Coding Behavior Contract (12 Rules)
 
 ### Core (Karpathy via Forrest Chang)

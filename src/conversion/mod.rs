@@ -74,8 +74,8 @@ mod tests {
     fn new_task_has_empty_state() {
         let task = ConversionTask::new("https://api.anthropic.com".to_string());
         assert!(task.upstream_base_url == "https://api.anthropic.com");
-        assert!(task.id_map.len() == 0);
-        assert!(task.namespace_registry.len() == 0);
+        assert!(task.id_map.is_empty());
+        assert!(task.namespace_registry.is_empty());
     }
 
     #[test]
@@ -122,8 +122,8 @@ mod tests {
             std::sync::Arc::clone(&cache),
         );
         assert!(task.upstream_base_url == "https://api.example.com");
-        assert!(task.id_map.len() == 0);
-        assert!(task.namespace_registry.len() == 0);
+        assert!(task.id_map.is_empty());
+        assert!(task.namespace_registry.is_empty());
         // Verify the shared cache reference
         task.signature_cache
             .insert("rs_test".to_string(), "sig123".to_string());
