@@ -2002,4 +2002,145 @@ mod tests {
             "should end with [DONE] even on retry failure"
         );
     }
+
+    // --- Scenario: Signatures from a failed response are drained and cached across retry ---
+
+    #[tokio::test]
+    async fn retry_loop_signatures_drained_and_cached_across_retry() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // Build first stream: thinking block with a known signature, then invalid apply_patch.
+        let mut first_events = Vec::new();
+
+        // message_start
+        first_events.push(sse_msg("message_start", serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_sig_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-20250514",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 10, "output_tokens": 0}
+            }
+        }).to_string()));
+
+        // thinking block (index 0)
+        first_events.push(sse_msg("content_block_start", serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }).to_string()));
+        first_events.push(sse_msg("content_block_delta", serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "I am reasoning"}
+        }).to_string()));
+        // signature_delta with known value
+        first_events.push(sse_msg("content_block_delta", serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "rs_test_signature_123"}
+        }).to_string()));
+        first_events.push(sse_msg("content_block_stop", serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }).to_string()));
+
+        // invalid apply_patch block (index 1)
+        first_events.push(sse_msg("content_block_start", serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_sig_bad",
+                "name": "apply_patch",
+                "input": {}
+            }
+        }).to_string()));
+        let bad_patch = serde_json::json!({"patch": "not a valid patch"}).to_string();
+        first_events.push(sse_msg("content_block_delta", serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": bad_patch}
+        }).to_string()));
+        first_events.push(sse_msg("content_block_stop", serde_json::json!({
+            "type": "content_block_stop",
+            "index": 1
+        }).to_string()));
+
+        first_events.push(sse_msg("message_delta", serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": {"output_tokens": 50}
+        }).to_string()));
+        first_events.push(sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()));
+
+        // Second stream: simple valid text response (the retry succeeds)
+        let valid_events = valid_text_only_sse_events("Retry successful");
+
+        let mut call_count = 0;
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            call_count += 1;
+            if call_count == 1 {
+                let stream =
+                    futures::stream::iter(first_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            } else {
+                assert_eq!(call_count, 2, "should only need 2 calls");
+                let stream =
+                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            }
+        });
+
+        let initial_body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 1024
+        });
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg,
+            // Clone sig_cache for the spawned task; we retain the original to inspect after.
+            sig_cache.clone(),
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // The retry should succeed.
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE], got: {}",
+            &output[..output.len().min(500)]
+        );
+
+        // Extract the reasoning_id from the SSE output.
+        // The response.reasoning_summary_text.done event includes "item_id": "rs_..."
+        let reasoning_id = output
+            .lines()
+            .filter_map(|line| {
+                let data = line.strip_prefix("data: ")?;
+                let json: serde_json::Value = serde_json::from_str(data).ok()?;
+                json.get("item_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|id| id.starts_with("rs_"))
+                    .map(|id| id.to_string())
+            })
+            .next()
+            .expect("should find a reasoning item_id (rs_...) in the SSE output");
+
+        // Verify the signature from the first (failed) response is in the cache.
+        let cached_sig = sig_cache.get(&reasoning_id);
+        assert_eq!(
+            cached_sig,
+            Some("rs_test_signature_123".to_string()),
+            "signature from the first (failed) response should be cached under reasoning_id {}",
+            reasoning_id
+        );
+    }
 }
