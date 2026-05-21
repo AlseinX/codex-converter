@@ -386,3 +386,264 @@ async fn stream_termination_handled() {
         "must have turn.completed (clean stream termination)"
     );
 }
+
+// ===========================================================================
+// apply_patch retry scenario tests
+// ===========================================================================
+
+#[tokio::test]
+async fn apply_patch_creates_new_file() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let lines = codex_exec(
+        addr,
+        "Create a new file called hello.txt with the content 'Hello World' using apply_patch.",
+        Some(tmpdir.path()),
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must use native apply_patch (file_change), using exec_command is wrong"
+    );
+
+    let content = std::fs::read_to_string(tmpdir.path().join("hello.txt")).unwrap();
+    assert!(
+        content.contains("Hello World"),
+        "file should contain 'Hello World', got: {content}"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_deletes_file() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let file_path = tmpdir.path().join("to_delete.txt");
+    std::fs::write(&file_path, "delete me\n").unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let lines = codex_exec(
+        addr,
+        "Delete the file to_delete.txt using apply_patch.",
+        Some(tmpdir.path()),
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must use native apply_patch (file_change)"
+    );
+
+    assert!(!file_path.exists(), "file should be deleted");
+}
+
+#[tokio::test]
+async fn apply_patch_multiple_files() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmpdir.path().join("file_a.txt"), "AAA\n").unwrap();
+    std::fs::write(tmpdir.path().join("file_b.txt"), "BBB\n").unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let lines = codex_exec(
+        addr,
+        "Use apply_patch to replace 'AAA' with 'XXX' in file_a.txt AND replace 'BBB' with 'YYY' in file_b.txt. Do both in a single response.",
+        Some(tmpdir.path()),
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+
+    // Must have at least one file_change (model may use multiple turns)
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must use native apply_patch (file_change)"
+    );
+
+    let a = std::fs::read_to_string(tmpdir.path().join("file_a.txt")).unwrap();
+    let b = std::fs::read_to_string(tmpdir.path().join("file_b.txt")).unwrap();
+    assert!(a.contains("XXX"), "file_a should contain XXX: {a}");
+    assert!(b.contains("YYY"), "file_b should contain YYY: {b}");
+}
+
+#[tokio::test]
+async fn apply_patch_complex_edit_no_fallback() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let content = "line one\nline two\nline three\nline four\nline five\n";
+    std::fs::write(tmpdir.path().join("complex.txt"), content).unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let lines = codex_exec(
+        addr,
+        "Use apply_patch to change the third line of complex.txt from 'line three' to 'LINE THREE'. Do not use exec_command or shell commands for file editing.",
+        Some(tmpdir.path()),
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must use native apply_patch (file_change), using exec_command is wrong"
+    );
+
+    let result = std::fs::read_to_string(tmpdir.path().join("complex.txt")).unwrap();
+    assert!(
+        result.contains("LINE THREE"),
+        "should contain LINE THREE: {result}"
+    );
+    assert!(
+        !result.contains("line three"),
+        "should not contain 'line three': {result}"
+    );
+    // Verify surrounding content preserved
+    assert!(
+        result.contains("line one"),
+        "surrounding content should be preserved"
+    );
+    assert!(
+        result.contains("line five"),
+        "surrounding content should be preserved"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_with_text_explanation() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmpdir.path().join("explain.txt"), "old value\n").unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let lines = codex_exec(
+        addr,
+        "Use apply_patch to replace 'old value' with 'new value' in explain.txt, then explain what you did.",
+        Some(tmpdir.path()),
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must have file_change"
+    );
+    let msg =
+        extract_agent_message(&events).expect("must have agent_message explaining the change");
+    assert!(!msg.is_empty(), "agent should explain what it did");
+
+    let content = std::fs::read_to_string(tmpdir.path().join("explain.txt")).unwrap();
+    assert!(
+        content.contains("new value"),
+        "file should contain 'new value': {content}"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_with_reasoning() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmpdir.path().join("think_patch.txt"), "original\n").unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let lines = codex_exec(
+        addr,
+        "Think carefully about the best way to change 'original' to 'modified' in think_patch.txt, then use apply_patch to do it.",
+        Some(tmpdir.path()),
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+
+    // If thinking is enabled, we may see reasoning items, but the key assertion
+    // is that apply_patch works correctly even when reasoning is present
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must use native apply_patch (file_change)"
+    );
+
+    let content = std::fs::read_to_string(tmpdir.path().join("think_patch.txt")).unwrap();
+    assert!(
+        content.contains("modified"),
+        "file should contain 'modified': {content}"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_transparent_retry_end_to_end() {
+    let (addr, _proxy) = start_proxy().await;
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmpdir.path().join("retry_test.txt"), "initial content\n").unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let lines = codex_exec(
+        addr,
+        "Use apply_patch to change 'initial content' to 'replaced content' in retry_test.txt.",
+        Some(tmpdir.path()),
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+
+    // Whether retry happened or not, the end result must be correct
+    assert!(
+        has_item_type(&events, "file_change"),
+        "must use native apply_patch (file_change)"
+    );
+
+    // Stream must terminate cleanly
+    let has_completed = events
+        .iter()
+        .any(|ev| ev.get("type").and_then(|t| t.as_str()) == Some("turn.completed"));
+    assert!(
+        has_completed,
+        "must have turn.completed (clean stream termination)"
+    );
+
+    let content = std::fs::read_to_string(tmpdir.path().join("retry_test.txt")).unwrap();
+    assert!(
+        content.contains("replaced content"),
+        "file should contain 'replaced content': {content}"
+    );
+}
