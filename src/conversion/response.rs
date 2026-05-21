@@ -2247,4 +2247,243 @@ mod tests {
         });
         assert!(events.is_empty(), "retry message_start should emit no events");
     }
+
+    // --- convert_to_freeform_patch tests ---
+
+    #[test]
+    fn freeform_already_freeform_returned_as_is() {
+        // Input starting with *** Begin Patch should be returned unchanged.
+        let input = "*** Begin Patch\n*** Update File: foo.txt\n-old\n+new\n*** End Patch";
+        let result = convert_to_freeform_patch(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn freeform_already_freeform_with_leading_whitespace() {
+        // Leading/trailing whitespace is trimmed for the check, but original is returned.
+        let input = "  *** Begin Patch\n*** End Patch\n";
+        let result = convert_to_freeform_patch(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn freeform_simple_unified_diff() {
+        let input = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new";
+        let result = convert_to_freeform_patch(input);
+        assert!(result.starts_with("*** Begin Patch\n"));
+        assert!(result.contains("*** Update File: file.txt\n"));
+        assert!(result.contains("-old\n"));
+        assert!(result.contains("+new\n"));
+        assert!(result.ends_with("*** End Patch\n"));
+        // Hunk header @@ should NOT appear in output
+        assert!(!result.contains("@@"));
+    }
+
+    #[test]
+    fn freeform_unified_diff_exact_output() {
+        let input = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new";
+        let expected = "*** Begin Patch\n*** Update File: file.txt\n-old\n+new\n*** End Patch\n";
+        assert_eq!(convert_to_freeform_patch(input), expected);
+    }
+
+    #[test]
+    fn freeform_diff_git_prefix() {
+        // diff --git prefix should be handled: metadata lines skipped, content converted.
+        let input = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n-old\n+new";
+        let result = convert_to_freeform_patch(input);
+        assert!(result.starts_with("*** Begin Patch\n"));
+        assert!(result.contains("*** Update File: file.txt\n"));
+        assert!(result.contains("-old\n"));
+        assert!(result.contains("+new\n"));
+        assert!(!result.contains("diff --git"));
+    }
+
+    #[test]
+    fn freeform_context_lines_prefix_stripped() {
+        // Context lines (leading space) should be included without the leading space.
+        let input = "--- a/file.txt\n+++ b/file.txt\n unchanged\n-old\n+new";
+        let result = convert_to_freeform_patch(input);
+        assert!(result.contains("unchanged\n"), "context line should not have leading space");
+        // The output should NOT contain " unchanged" with the space
+        assert!(!result.contains(" unchanged"), "context line prefix space should be stripped");
+    }
+
+    #[test]
+    fn freeform_hunk_headers_skipped() {
+        let input = "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n line1\n-old\n+new";
+        let result = convert_to_freeform_patch(input);
+        assert!(!result.contains("@@"), "hunk headers should be removed from output");
+    }
+
+    #[test]
+    fn freeform_git_index_metadata_skipped() {
+        let input = "diff --git a/file.txt b/file.txt\nindex abc123..def456 100644\n--- a/file.txt\n+++ b/file.txt\n-old\n+new";
+        let result = convert_to_freeform_patch(input);
+        assert!(!result.contains("index abc123"), "git index line should be removed");
+        assert!(!result.contains("diff --git"), "diff --git line should be removed");
+        assert!(result.contains("-old\n"));
+        assert!(result.contains("+new\n"));
+    }
+
+    #[test]
+    fn freeform_empty_input() {
+        // Empty string: no diff markers, so returned as-is.
+        let result = convert_to_freeform_patch("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn freeform_whitespace_only_input() {
+        // Whitespace-only input: no diff markers, returned as-is.
+        let result = convert_to_freeform_patch("   \n  \n");
+        assert_eq!(result, "   \n  \n");
+    }
+
+    #[test]
+    fn freeform_non_patch_garbage_returned_as_is() {
+        // Random text without diff markers should be returned unchanged.
+        let input = "hello world\nthis is not a patch\n";
+        let result = convert_to_freeform_patch(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn freeform_multiple_files_in_one_diff() {
+        // Two file sections in one diff should produce two *** Update File: sections.
+        let input = "\
+--- a/file1.txt
++++ b/file1.txt
+-old1
++new1
+--- a/file2.txt
++++ b/file2.txt
+-old2
++new2";
+        let result = convert_to_freeform_patch(input);
+        assert!(result.contains("*** Update File: file1.txt\n"), "should have file1 section");
+        assert!(result.contains("*** Update File: file2.txt\n"), "should have file2 section");
+        assert!(result.contains("-old1\n"));
+        assert!(result.contains("+new1\n"));
+        assert!(result.contains("-old2\n"));
+        assert!(result.contains("+new2\n"));
+        // Only one Begin/End pair wrapping everything
+        assert_eq!(result.matches("*** Begin Patch").count(), 1);
+        assert_eq!(result.matches("*** End Patch").count(), 1);
+    }
+
+    #[test]
+    fn freeform_add_file_dev_null() {
+        // New file diff: --- /dev/null, +++ b/newfile.txt
+        // Current implementation: --- /dev/null sets current_file to "/dev/null",
+        // then +++ b/newfile.txt does NOT override current_file (it's already Some),
+        // so the output uses "/dev/null" as the file path. This documents actual behavior.
+        let input = "--- /dev/null\n+++ b/newfile.txt\n+content";
+        let result = convert_to_freeform_patch(input);
+        // The current implementation emits *** Update File: /dev/null
+        // because current_file is set by --- /dev/null and +++ doesn't override it.
+        assert!(result.contains("*** Update File:"), "should have an Update File section");
+        assert!(result.contains("+content\n"), "should include added content");
+        assert!(result.starts_with("*** Begin Patch\n"));
+        assert!(result.ends_with("*** End Patch\n"));
+    }
+
+    #[test]
+    fn freeform_delete_file() {
+        // Delete file diff: --- a/oldfile.txt, +++ /dev/null
+        // current_file = "oldfile.txt" from --- line.
+        // +++ /dev/null: path becomes "/dev/null" but current_file is already Some,
+        // so *** Update File: oldfile.txt is emitted.
+        let input = "--- a/oldfile.txt\n+++ /dev/null\n-old content";
+        let result = convert_to_freeform_patch(input);
+        assert!(result.contains("*** Update File: oldfile.txt\n"),
+            "should use --- side path for delete");
+        assert!(result.contains("-old content\n"), "should include removed content");
+    }
+
+    #[test]
+    fn freeform_context_line_without_leading_space() {
+        // Lines that don't start with -, +, space, @@, ---, +++, diff, index, and are
+        // non-empty are included as-is (fall through to the else branch at line 135-138).
+        let input = "--- a/file.txt\n+++ b/file.txt\nsome other line\n-old\n+new";
+        let result = convert_to_freeform_patch(input);
+        assert!(result.contains("some other line\n"),
+            "unrecognized non-empty lines should be included as-is");
+    }
+
+    #[test]
+    fn freeform_empty_lines_within_diff_skipped() {
+        // Empty lines within a diff body are skipped (line.is_empty() check at line 135).
+        let input = "--- a/file.txt\n+++ b/file.txt\n\n-old\n\n+new";
+        let result = convert_to_freeform_patch(input);
+        // Should not have double newlines from the empty diff lines
+        assert!(result.contains("-old\n"));
+        assert!(result.contains("+new\n"));
+        // Count lines in output to ensure no extra blank lines from diff body
+        let out_lines: Vec<&str> = result.lines().collect();
+        assert!(!out_lines.iter().any(|l| l.is_empty() && !l.starts_with('*')),
+            "empty lines in diff body should be skipped");
+    }
+
+    #[test]
+    fn freeform_only_marker_no_content() {
+        // A diff with just headers and no content lines.
+        let input = "--- a/file.txt\n+++ b/file.txt";
+        let result = convert_to_freeform_patch(input);
+        assert_eq!(result, "*** Begin Patch\n*** Update File: file.txt\n*** End Patch\n");
+    }
+
+    #[test]
+    fn freeform_trailing_whitespace_on_markers() {
+        // --- a/path with extra content after path should still extract correctly.
+        let input = "--- a/file.txt\t\n+++ b/file.txt\n-old\n+new";
+        let result = convert_to_freeform_patch(input);
+        // strip_prefix("--- a/") gets "file.txt\t", which includes the tab.
+        // This documents the current behavior.
+        assert!(result.contains("file.txt\t"), "trailing whitespace in path is preserved");
+    }
+
+    #[test]
+    fn freeform_diff_git_without_traditional_headers() {
+        // A diff with diff --git but no --- / +++ lines.
+        // The has_diff_markers check passes (diff --git present), but no file header
+        // is found. The content lines should still be processed.
+        let input = "diff --git a/file.txt b/file.txt\n-old line\n+new line";
+        let result = convert_to_freeform_patch(input);
+        assert!(result.starts_with("*** Begin Patch\n"));
+        assert!(result.contains("-old line\n"));
+        assert!(result.contains("+new line\n"));
+        assert!(result.ends_with("*** End Patch\n"));
+    }
+
+    #[test]
+    fn freeform_preserves_original_for_already_freeform() {
+        // Ensure the ORIGINAL input string (not trimmed) is returned for freeform.
+        let input = "\n\n*** Begin Patch\n*** Update File: x\n-old\n+new\n*** End Patch\n\n";
+        let result = convert_to_freeform_patch(input);
+        assert_eq!(result, input, "original input with surrounding whitespace must be preserved");
+    }
+
+    #[test]
+    fn freeform_multiple_context_and_change_lines() {
+        // A realistic multi-line diff with context, additions, and deletions.
+        let input = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,7 +10,7 @@
+ fn main() {
+-    println!(\"old\");
++    println!(\"new\");
+ }";
+        let result = convert_to_freeform_patch(input);
+        let expected = "\
+*** Begin Patch
+*** Update File: src/main.rs
+fn main() {
+-    println!(\"old\");
++    println!(\"new\");
+}
+*** End Patch
+";
+        assert_eq!(result, expected);
+    }
 }
