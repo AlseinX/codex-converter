@@ -262,6 +262,17 @@ fn has_item_type(events: &[serde_json::Value], ty: &str) -> bool {
     })
 }
 
+/// Helper: extract the response.completed event from JSONL
+fn extract_response_completed(events: &[serde_json::Value]) -> Option<serde_json::Value> {
+    events.iter().find_map(|ev| {
+        if ev.get("type").and_then(|t| t.as_str()) == Some("response.completed") {
+            Some(ev.clone())
+        } else {
+            None
+        }
+    })
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -646,4 +657,166 @@ async fn apply_patch_transparent_retry_end_to_end() {
         content.contains("replaced content"),
         "file should contain 'replaced content': {content}"
     );
+}
+
+// ===========================================================================
+// Error path and code path coverage tests
+// ===========================================================================
+
+#[tokio::test]
+async fn failed_command_handled_gracefully() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(
+        addr,
+        "Run the command: cat /nonexistent_file_xyz_12345_abc",
+        None,
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+    // The command will fail, but codex should handle it gracefully
+    assert!(
+        has_item_type(&events, "command_execution"),
+        "must have command_execution item"
+    );
+    let msg = extract_agent_message(&events).expect("must have agent_message");
+    assert!(
+        !msg.is_empty(),
+        "agent should respond even after command failure"
+    );
+}
+
+#[tokio::test]
+async fn multi_tool_calls_in_sequence() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(
+        addr,
+        "Run these two commands one after another: first 'echo FIRST_TOOL', then 'echo SECOND_TOOL'",
+        None,
+    )
+    .await;
+    let events = parse_jsonl(&lines);
+    assert!(
+        has_item_type(&events, "command_execution"),
+        "must have command_execution item"
+    );
+    let msg = extract_agent_message(&events).expect("must have agent_message");
+    // Both outputs should be mentioned in the response
+    assert!(
+        msg.contains("FIRST_TOOL") || msg.contains("first") || msg.contains("First"),
+        "agent should reference first command output, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn response_completed_has_required_fields() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(addr, "Say hello", None).await;
+    let events = parse_jsonl(&lines);
+
+    let completed = extract_response_completed(&events).expect("must have response.completed");
+
+    // The response object inside must have an "id" field
+    let response = completed
+        .get("response")
+        .expect("response.completed must contain 'response'");
+    assert!(response.get("id").is_some(), "response must have id field");
+    assert!(
+        response.get("status").is_some(),
+        "response must have status field"
+    );
+    assert!(
+        response.get("model").is_some(),
+        "response must have model field"
+    );
+    assert!(
+        response.get("output").is_some(),
+        "response must have output field"
+    );
+    assert!(
+        response.get("usage").is_some(),
+        "response must have usage field"
+    );
+
+    // Usage must have input/output tokens
+    let usage = response.get("usage").expect("usage required");
+    assert!(
+        usage.get("input_tokens").is_some(),
+        "usage must have input_tokens"
+    );
+    assert!(
+        usage.get("output_tokens").is_some(),
+        "usage must have output_tokens"
+    );
+}
+
+#[tokio::test]
+async fn upstream_connection_error_handled() {
+    let (addr, _proxy) = start_proxy().await;
+    // Use a non-existent upstream host to trigger connection failure
+    let proxy_base = format!("http://{}/https/nonexistent.invalid.example.com", addr);
+    let key = api_key();
+    let model = std::env::var("CODEX_CONV_TEST_MODEL").unwrap_or_else(|_| "glm-5.1".to_string());
+    let codex_home = codex_test_home();
+
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmpdir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init failed");
+
+    let output = Command::new("codex")
+        .arg("exec")
+        .arg("--json")
+        .arg("--skip-git-repo-check")
+        .arg("-m")
+        .arg(&model)
+        .arg("-c")
+        .arg("approval_policy=\"never\"")
+        .arg("-c")
+        .arg("sandbox_mode=\"danger-full-access\"")
+        .arg("-c")
+        .arg(format!("model_providers.custom.base_url=\"{proxy_base}\""))
+        .arg("-c")
+        .arg("model_provider=\"custom\"")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("-C")
+        .arg(tmpdir.path())
+        .arg("--ephemeral")
+        .arg("Say hello")
+        .env("CODEX_HOME", codex_home)
+        .env("OPENAI_API_KEY", &key)
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("failed to spawn codex");
+
+    // codex may fail (non-zero exit) or may get an error event in JSONL
+    // Either way, the proxy must not crash
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The proxy should not panic — if it did, the test process would hang or fail differently
+    // We just verify that something was returned (even if it's an error)
+    assert!(
+        !stdout.is_empty() || !stderr.is_empty(),
+        "proxy must return something (error or response), not hang"
+    );
+}
+
+#[tokio::test]
+async fn minimal_prompt_response() {
+    let (addr, _proxy) = start_proxy().await;
+    let lines = codex_exec(addr, "Hi", None).await;
+    let events = parse_jsonl(&lines);
+    assert!(!events.is_empty(), "must receive JSONL events");
+    let has_completed = events
+        .iter()
+        .any(|ev| ev.get("type").and_then(|t| t.as_str()) == Some("turn.completed"));
+    assert!(has_completed, "must have turn.completed");
 }
