@@ -213,6 +213,61 @@ impl StreamingState {
         std::mem::take(&mut self.signature_store)
     }
 
+    /// Whether the last content_block_stop detected an invalid apply_patch format.
+    pub fn is_apply_patch_invalid(&self) -> bool {
+        self.apply_patch_invalid
+    }
+
+    /// Take all captured Anthropic content blocks (for retry assistant message).
+    pub fn take_content_block_capture(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.anthropic_content_blocks)
+    }
+
+    /// Take the failed apply_patch info: (toolu_id, raw_patch_text).
+    /// Returns empty strings if not set.
+    pub fn take_failed_apply_patch_info(&mut self) -> (String, String) {
+        self.failed_apply_patch_info.take().unwrap_or_default()
+    }
+
+    /// Whether we're in retry mode.
+    pub fn is_retry_mode(&self) -> bool {
+        self.retry_mode
+    }
+
+    /// View current output items (for testing).
+    pub fn output_items(&self) -> &[Value] {
+        &self.output_items
+    }
+
+    /// Prepare state for a retry response.
+    /// Sets retry_mode, resets per-response accumulators, preserves output_items,
+    /// fc_counter, response_id, model, created_at, namespace_registry, echo fields.
+    pub fn prepare_for_retry(&mut self) {
+        self.retry_mode = true;
+        self.active_block = ActiveBlock::None;
+        self.text_accumulator.clear();
+        self.thinking_accumulator.clear();
+        self.arguments_accumulator.clear();
+        self.signature_accumulator.clear();
+        self.current_reasoning_id.clear();
+        self.current_fc_item_id.clear();
+        self.current_fc_call_id.clear();
+        self.current_is_custom = false;
+        self.stop_reason = None;
+        self.output_tokens = 0;
+        self.apply_patch_format_confirmed = false;
+        self.apply_patch_invalid = false;
+        self.buffered_apply_patch_item = None;
+        self.buffered_apply_patch_output_index = None;
+        self.anthropic_content_blocks.clear();
+        self.failed_apply_patch_info = None;
+        self.signature_store.clear();
+        self.tool_use_map.clear();
+        // Preserved: output_items, fc_counter, response_id, model, created_at,
+        // namespace_registry, tool_choice_echo, instructions_echo, parallel_tool_calls_echo,
+        // input_tokens, cache_read_tokens
+    }
+
     // -----------------------------------------------------------------------
     // Event handlers
     // -----------------------------------------------------------------------
@@ -1867,5 +1922,42 @@ mod tests {
             convert_streaming_error_code("invalid_request_error", "bad parameter"),
             "invalid_request"
         );
+    }
+
+    #[test]
+    fn new_state_accessors_return_defaults() {
+        let state = make_state();
+        assert!(!state.is_retry_mode());
+        assert!(!state.is_apply_patch_invalid());
+        assert!(state.output_items().is_empty());
+    }
+
+    #[test]
+    fn prepare_for_retry_preserves_output_items() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_ORIGINAL", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        // Add a text block
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Hello"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        assert_eq!(state.output_items().len(), 1);
+
+        state.prepare_for_retry();
+
+        // output_items preserved
+        assert_eq!(state.output_items().len(), 1);
+        // retry_mode is true
+        assert!(state.is_retry_mode());
+        // accumulators are cleared
+        assert!(!state.is_apply_patch_invalid());
     }
 }
