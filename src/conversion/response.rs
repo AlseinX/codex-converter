@@ -84,10 +84,20 @@ pub struct StreamingState {
 /// Convert a patch string to Codex freeform format.
 ///
 /// If the input already starts with `*** Begin Patch`, it is returned as-is.
-/// Otherwise, the input is assumed to be unified diff format and is converted.
+/// If the input looks like unified diff format (contains `---` or `diff --git`),
+/// it is converted to freeform format.
+/// Otherwise, the input is returned as-is (no conversion attempted).
 fn convert_to_freeform_patch(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.starts_with("*** Begin Patch") {
+        return input.to_string();
+    }
+
+    // Heuristic: only attempt conversion if the input looks like unified diff.
+    let has_diff_markers = trimmed.lines().any(|line| {
+        line.starts_with("--- ") || line.starts_with("diff --git")
+    });
+    if !has_diff_markers {
         return input.to_string();
     }
 
@@ -649,8 +659,6 @@ impl StreamingState {
                     .unwrap_or_else(|| ("unknown".to_string(), None));
 
                 if is_custom {
-                    // Freeform tools use custom_tool_call format with raw input text.
-                    // 1. Anthropic wraps in JSON: unwrap to raw string.
                     let raw_input = serde_json::from_str::<Value>(&args)
                         .ok()
                         .and_then(|v| {
@@ -659,24 +667,60 @@ impl StreamingState {
                                 .and_then(|p| p.as_str())
                                 .map(|s| s.to_string())
                         })
-                        .unwrap_or(args.clone());
-                    // 2. Anthropic models often produce unified diff format
-                    //    (--- a/file, +++ b/file, @@ hunk headers).
-                    //    Codex requires its own freeform format
-                    //    (*** Begin Patch, *** Update File, +/- lines, *** End Patch).
-                    let patch = convert_to_freeform_patch(&raw_input);
-                    let mut item = json!({
-                        "type": "custom_tool_call",
-                        "call_id": call_id,
-                        "name": name,
-                        "status": "completed",
-                        "input": patch,
-                    });
-                    if let Some(ns) = namespace {
-                        item["namespace"] = json!(ns);
+                        .unwrap_or_else(|| args.clone());
+
+                    if self.apply_patch_format_confirmed {
+                        // Already confirmed valid during deltas. Emit OutputItemDone with raw patch.
+                        let mut item = json!({
+                            "type": "custom_tool_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "status": "completed",
+                            "input": raw_input,
+                        });
+                        if let Some(ns) = namespace {
+                            item["namespace"] = json!(ns);
+                        }
+                        self.output_items.push(item.clone());
+                        events.push(ResponsesEvent::OutputItemDone { output_index, item });
+                    } else {
+                        // Never confirmed during deltas. Try conversion.
+                        let converted = convert_to_freeform_patch(&raw_input);
+                        if converted.trim().starts_with("*** Begin Patch") {
+                            // Conversion succeeded. Release buffer + emit done.
+                            if let Some(buffered_item) = self.buffered_apply_patch_item.take() {
+                                let buffered_idx = self
+                                    .buffered_apply_patch_output_index
+                                    .take()
+                                    .unwrap_or(output_index);
+                                events.push(ResponsesEvent::OutputItemAdded {
+                                    output_index: buffered_idx,
+                                    item: buffered_item,
+                                });
+                            }
+                            let mut item = json!({
+                                "type": "custom_tool_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "status": "completed",
+                                "input": converted,
+                            });
+                            if let Some(ns) = namespace {
+                                item["namespace"] = json!(ns);
+                            }
+                            self.output_items.push(item.clone());
+                            events.push(ResponsesEvent::OutputItemDone { output_index, item });
+                        } else {
+                            // Conversion also failed. Mark invalid for retry.
+                            self.apply_patch_invalid = true;
+                            let toolu_id = self.tool_use_map.iter()
+                                .find(|(_, fid, _, _)| fid == &fc_id)
+                                .map(|(tid, _, _, _)| tid.clone())
+                                .unwrap_or_default();
+                            self.failed_apply_patch_info = Some((toolu_id, raw_input));
+                            // Do NOT emit any events. Router will detect flag and trigger retry.
+                        }
                     }
-                    self.output_items.push(item.clone());
-                    events.push(ResponsesEvent::OutputItemDone { output_index, item });
                 }
                 else {
                     events.push(ResponsesEvent::FunctionCallArgumentsDone {
@@ -2137,5 +2181,49 @@ mod tests {
         });
         assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
             "buffered OutputItemAdded should be released when *** Begin Patch detected");
+    }
+
+    #[test]
+    fn apply_patch_unified_diff_converted_at_stop() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"--- a/test.txt\\n+++ b/test.txt\\n@@ -1 +1 @@\\n-old\\n+new\"}"}),
+        });
+        let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
+            "buffered OutputItemAdded should be released for converted patch");
+        assert!(events.iter().any(|e| { let (t, d) = e.to_sse(); t == "response.output_item.done" && d.contains("*** Begin Patch") }),
+            "OutputItemDone should contain converted freeform patch");
+        assert!(!state.is_apply_patch_invalid());
+    }
+
+    #[test]
+    fn apply_patch_invalid_format_flags_retry() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"This is not a valid patch format at all.\"}"}),
+        });
+        let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+        assert!(events.is_empty(), "invalid patch should not emit events");
+        assert!(state.is_apply_patch_invalid());
+        let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
+        assert_eq!(toolu_id, "toolu_01");
+        assert!(raw_patch.contains("This is not a valid patch format"));
     }
 }
