@@ -2263,3 +2263,101 @@ Synthesis of findings from entries #41–#44. Is the proposed retry mechanism fe
 - [4] Source code: `src/router.rs` (streaming task architecture)
 - [5] Source code: `src/conversion/response.rs` (StreamingState, convert_to_freeform_patch, current_is_custom flag)
 - [6] OpenAI Responses streaming events reference — https://developers.openai.com/api/reference/resources/responses/streaming-events/
+
+---
+
+## 13. Models API conversion: OpenAI Models API ↔ Anthropic Models API
+
+### Description
+Codex CLI calls `GET /v1/models` to list available models and `GET /v1/models/{model}` to retrieve a specific model. The proxy must forward these requests to Anthropic's Models API and convert the response format to match what Codex CLI expects.
+
+### Result
+
+**Anthropic Models API** [1]:
+- `GET /v1/models` — returns paginated list with cursor-based pagination
+- `GET /v1/models/{model_id}` — returns single model object
+
+Anthropic response format (List):
+```json
+{
+  "data": [
+    {
+      "type": "model",
+      "id": "claude-sonnet-4-20250514",
+      "display_name": "Claude Sonnet 4",
+      "created_at": "2025-05-14T00:00:00Z"
+    }
+  ],
+  "has_more": false,
+  "first_id": "...",
+  "last_id": "..."
+}
+```
+
+Anthropic response format (Get):
+```json
+{
+  "type": "model",
+  "id": "claude-sonnet-4-20250514",
+  "display_name": "Claude Sonnet 4",
+  "created_at": "2025-05-14T00:00:00Z"
+}
+```
+
+**OpenAI Models API** [2][3]:
+- `GET /v1/models` — returns list of models
+- `GET /v1/models/{model}` — returns single model
+
+OpenAI response format (List):
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "model-id",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "openai"
+    }
+  ]
+}
+```
+
+OpenAI response format (Get):
+```json
+{
+  "id": "model-id",
+  "object": "model",
+  "created": 1686935002,
+  "owned_by": "openai"
+}
+```
+
+**Field mapping:**
+
+| Anthropic field | OpenAI field | Conversion |
+|---|---|---|
+| `type: "model"` | `object: "model"` | Rename field |
+| `id` | `id` | Direct passthrough |
+| `created_at` (ISO 8601) | `created` (Unix timestamp) | Parse ISO 8601 → Unix seconds |
+| N/A | `owned_by` | Default to `"anthropic"` |
+| `display_name` | N/A | Discard (OpenAI has no equivalent) |
+| `has_more`, `first_id`, `last_id` | N/A | Discard (OpenAI list has no pagination) |
+| N/A | `object: "list"` | Add wrapper for list response |
+
+**Codex CLI behavior** [4][5]:
+- Calls `GET /v1/models` to populate the model picker
+- Falls back to bundled `models.json` if the endpoint is unavailable
+- Calls `GET /v1/models/{model}` to verify a model exists before use
+- Expects standard OpenAI format response
+
+**Routing**: The proxy URL pattern mirrors the existing `/responses` route:
+- `GET /https/api.anthropic.com/models` → `GET https://api.anthropic.com/v1/models`
+- `GET /https/api.anthropic.com/models/{model}` → `GET https://api.anthropic.com/v1/models/{model}`
+
+### Reference
+- [1] Anthropic List Models API — https://docs.anthropic.com/en/api/models-list
+- [2] OpenAI List Models API — https://developers.openai.com/api/reference/resources/models/methods/list/
+- [3] OpenAI Retrieve Model API — https://developers.openai.com/api/reference/resources/models/methods/retrieve/
+- [4] Codex CLI issue #2507 — https://github.com/openai/codex/issues/2507 (shows Codex uses /v1/models to verify models)
+- [5] Codex CLI issue #10867 — https://github.com/openai/codex/issues/10867 (shows /v1/models endpoint usage with custom providers)
