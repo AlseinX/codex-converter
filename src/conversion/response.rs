@@ -62,6 +62,23 @@ pub struct StreamingState {
     parallel_tool_calls_echo: Option<bool>,
     /// Accumulated signatures keyed by reasoning_id, for writing to cache after stream ends.
     signature_store: Vec<(String, String)>,
+    /// Always-captured Anthropic content blocks for retry assistant message.
+    anthropic_content_blocks: Vec<Value>,
+    /// Whether we're processing a retry response (skip response.created/in_progress).
+    retry_mode: bool,
+    /// Set at content_block_stop when apply_patch was never confirmed valid AND
+    /// convert_to_freeform_patch() also fails. Router reads this flag to close upstream
+    /// and trigger retry.
+    apply_patch_invalid: bool,
+    /// Held-back OutputItemAdded event for apply_patch (released on confirmation or at stop).
+    buffered_apply_patch_item: Option<Value>,
+    /// Output index at the time apply_patch content_block_start was seen.
+    buffered_apply_patch_output_index: Option<usize>,
+    /// Whether *** Begin Patch has been detected in accumulated deltas for the current
+    /// apply_patch block. Reset to false at each content_block_start.
+    apply_patch_format_confirmed: bool,
+    /// (toolu_id, raw_patch_text) of the failed apply_patch, for retry error message.
+    failed_apply_patch_info: Option<(String, String)>,
 }
 
 /// Convert a patch string to Codex freeform format.
@@ -157,6 +174,13 @@ impl StreamingState {
             instructions_echo,
             parallel_tool_calls_echo,
             signature_store: Vec::new(),
+            anthropic_content_blocks: Vec::new(),
+            retry_mode: false,
+            apply_patch_invalid: false,
+            buffered_apply_patch_item: None,
+            buffered_apply_patch_output_index: None,
+            apply_patch_format_confirmed: false,
+            failed_apply_patch_info: None,
         }
     }
 
