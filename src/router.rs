@@ -304,12 +304,7 @@ async fn handle_responses(
     let upstream_url = task.upstream_messages_url();
     let anthropic_version = state.config.upstream.anthropic_version.clone();
 
-    let request_builder = client
-        .post(&upstream_url)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", &anthropic_version)
-        .header("content-type", "application/json")
-        .json(&anthropic_body);
+    // -- Step 7-9: Stream SSE events from upstream, convert, and forward downstream --
 
     tracing::debug!(
         url = %upstream_url,
@@ -317,7 +312,13 @@ async fn handle_responses(
         "forwarding request to upstream"
     );
 
-    // -- Step 7-9: Stream SSE events from upstream, convert, and forward downstream --
+    // Clone values needed for retry before moving into the spawn closure.
+    let retry_client = client.clone();
+    let retry_api_key = api_key.clone();
+    let retry_anthropic_version = anthropic_version.clone();
+    let retry_upstream_url = upstream_url.clone();
+    let retry_anthropic_body = anthropic_body.clone();
+
     let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
 
     // Namespace registry is moved into the streaming task.
@@ -325,153 +326,176 @@ async fn handle_responses(
         std::sync::Arc::new(std::sync::Mutex::new(task.namespace_registry));
     let signature_cache = task.signature_cache.clone();
 
-    // Spawn a task to consume the upstream SSE stream.
+    // Spawn a task to consume the upstream SSE stream, with retry support for
+    // invalid apply_patch format.
     tokio::spawn(async move {
         use crate::conversion::response::StreamingState;
         use crate::sse::anthropic::{parse_sse_events, AnthropicEvent};
         use crate::sse::responses::{format_done, format_responses_event, ResponsesEvent};
 
-        let mut event_source = match reqwest_eventsource::EventSource::new(request_builder) {
-            Ok(es) => es,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to create EventSource for upstream request");
-                let _ = tx.send(Ok(axum::body::Bytes::from(
-                    "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Failed to connect to upstream\"}\n\n",
-                ))).await;
-                let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
-                return;
-            }
-        };
-
+        let mut current_body = retry_anthropic_body.clone();
         let mut streaming_state: Option<StreamingState> = None;
         let mut done_sent = false;
 
-        while let Some(event_result) = event_source.next().await {
-            match event_result {
-                Ok(reqwest_eventsource::Event::Message(msg)) => {
-                    // Reconstruct raw SSE text for the parser.
-                    // reqwest_eventsource::Event::Message provides event (String) and data (String).
-                    let raw_chunk = format!("event: {}\ndata: {}\n\n", msg.event, msg.data);
+        'retry_loop: loop {
+            // Create request_builder INSIDE the loop (fresh each retry).
+            let request_builder = retry_client
+                .post(&retry_upstream_url)
+                .header("x-api-key", &retry_api_key)
+                .header("anthropic-version", &retry_anthropic_version)
+                .header("content-type", "application/json")
+                .json(&current_body);
 
-                    let anthropic_events = parse_sse_events(&raw_chunk);
+            let mut event_source = match reqwest_eventsource::EventSource::new(request_builder) {
+                Ok(es) => es,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create EventSource");
+                    let _ = tx.send(Ok(axum::body::Bytes::from(
+                        "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Failed to connect to upstream\"}\n\n",
+                    ))).await;
+                    let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
+                    return;
+                }
+            };
 
-                    for a_event in anthropic_events {
-                        // Create StreamingState lazily on first message_start.
-                        if streaming_state.is_none() {
-                            if let AnthropicEvent::MessageStart { ref message } = a_event {
-                                let response_id = message
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("msg_unknown")
-                                    .to_string();
-                                let ns_reg = {
-                                    let guard = namespace_registry.lock().unwrap();
-                                    guard.clone()
-                                };
-                                streaming_state = Some(StreamingState::new(
-                                    response_id,
-                                    model.clone(),
-                                    ns_reg,
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    tool_choice_echo.clone(),
-                                    instructions_echo.clone(),
-                                    parallel_tool_calls_echo,
-                                ));
-                            } else {
-                                // Skip events before message_start.
+            // Inner SSE streaming loop.
+            while let Some(event_result) = event_source.next().await {
+                match event_result {
+                    Ok(reqwest_eventsource::Event::Message(msg)) => {
+                        let raw_chunk = format!("event: {}\ndata: {}\n\n", msg.event, msg.data);
+                        let anthropic_events = parse_sse_events(&raw_chunk);
+
+                        for a_event in anthropic_events {
+                            // Create StreamingState lazily on first message_start.
+                            if streaming_state.is_none() {
+                                if let AnthropicEvent::MessageStart { ref message } = a_event {
+                                    let response_id = message
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("msg_unknown")
+                                        .to_string();
+                                    let ns_reg = {
+                                        let guard = namespace_registry.lock().unwrap();
+                                        guard.clone()
+                                    };
+                                    streaming_state = Some(StreamingState::new(
+                                        response_id,
+                                        model.clone(),
+                                        ns_reg,
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        tool_choice_echo.clone(),
+                                        instructions_echo.clone(),
+                                        parallel_tool_calls_echo,
+                                    ));
+                                } else {
+                                    continue;
+                                }
+                            }
+
+                            let state = match streaming_state.as_mut() {
+                                Some(s) => s,
+                                None => continue,
+                            };
+
+                            let responses_events = state.process_event(a_event);
+
+                            // If apply_patch invalid, consume silently (don't forward).
+                            if state.is_apply_patch_invalid() {
                                 continue;
                             }
-                        }
 
-                        let state = match streaming_state.as_mut() {
-                            Some(s) => s,
-                            None => continue,
-                        };
-
-                        let responses_events = state.process_event(a_event);
-
-                        for r_event in responses_events {
-                            // Check if this is the Done marker.
-                            if matches!(r_event, ResponsesEvent::Done) {
-                                done_sent = true;
-                                let _ = tx
-                                    .send(Ok(axum::body::Bytes::from(format_done())))
-                                    .await;
-                            } else {
-                                let sse_str = format_responses_event(&r_event);
-                                let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
+                            for r_event in responses_events {
+                                if matches!(r_event, ResponsesEvent::Done) {
+                                    done_sent = true;
+                                    let _ = tx
+                                        .send(Ok(axum::body::Bytes::from(format_done())))
+                                        .await;
+                                } else {
+                                    let sse_str = format_responses_event(&r_event);
+                                    let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
+                                }
                             }
                         }
                     }
-                }
-                Ok(reqwest_eventsource::Event::Open) => {
-                    // Connection established, nothing to do.
-                }
-                Err(e) => {
-                    // "Stream ended" is normal — Anthropic closes the connection after
-                    // message_stop without a [DONE] marker. Only treat unexpected
-                    // errors as real errors.
-                    let err_str = e.to_string();
-                    if err_str.contains("Stream ended") {
-                        tracing::debug!("upstream SSE stream ended normally");
-                    } else if streaming_state.is_some() {
-                        // We already got message_start — the stream was partially
-                        // delivered.  StreamingState::handle_error will produce
-                        // error + response.failed + Done events.
-                        tracing::error!(error = %e, "SSE stream error from upstream (mid-stream)");
-                        let state = streaming_state.as_mut().unwrap();
-                        let error_val = serde_json::json!({
-                            "type": "api_error",
-                            "message": format!("Upstream stream error: {}", e)
-                        });
-                        let events = state.process_event(
-                            crate::sse::anthropic::AnthropicEvent::Error { error: error_val },
-                        );
-                        for r_event in events {
-                            if matches!(r_event, ResponsesEvent::Done) {
-                                done_sent = true;
-                                let _ = tx
-                                    .send(Ok(axum::body::Bytes::from(format_done())))
-                                    .await;
-                            } else {
-                                let sse_str = format_responses_event(&r_event);
-                                let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
+                    Ok(reqwest_eventsource::Event::Open) => {}
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("Stream ended") {
+                            tracing::debug!("upstream SSE stream ended normally");
+                        } else if streaming_state.is_some() {
+                            tracing::error!(error = %e, "SSE stream error from upstream (mid-stream)");
+                            let state = streaming_state.as_mut().unwrap();
+                            let error_val = serde_json::json!({
+                                "type": "api_error",
+                                "message": format!("Upstream stream error: {}", e)
+                            });
+                            let events = state.process_event(
+                                crate::sse::anthropic::AnthropicEvent::Error { error: error_val },
+                            );
+                            for r_event in events {
+                                if matches!(r_event, ResponsesEvent::Done) {
+                                    done_sent = true;
+                                    let _ = tx
+                                        .send(Ok(axum::body::Bytes::from(format_done())))
+                                        .await;
+                                } else {
+                                    let sse_str = format_responses_event(&r_event);
+                                    let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
+                                }
                             }
+                        } else {
+                            tracing::error!(error = %e, "SSE stream error from upstream (no message_start)");
+                            let _ = tx
+                                .send(Ok(axum::body::Bytes::from(
+                                    "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Upstream stream error\"}\n\n",
+                                )))
+                                .await;
+                            let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
+                            done_sent = true;
                         }
-                    } else {
-                        // Never got message_start — the upstream likely returned a
-                        // non-streaming error (e.g. 4xx/5xx) before any SSE events.
-                        tracing::error!(error = %e, "SSE stream error from upstream (no message_start)");
-                        let _ = tx
-                            .send(Ok(axum::body::Bytes::from(
-                                "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Upstream stream error\"}\n\n",
-                            )))
-                            .await;
-                        let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
-                        done_sent = true;
+                        break;
                     }
-                    break;
                 }
             }
-        }
 
-        // Write accumulated signatures to cache after stream ends.
-        if let Some(state) = streaming_state.as_mut() {
-            let sigs = state.drain_signatures();
-            for (reasoning_id, signature) in sigs {
-                signature_cache.insert(reasoning_id, signature);
+            // Close the event source (releases upstream connection).
+            let _ = event_source.close();
+
+            // Drain signatures from this response.
+            if let Some(state) = streaming_state.as_mut() {
+                let sigs = state.drain_signatures();
+                for (reasoning_id, signature) in sigs {
+                    signature_cache.insert(reasoning_id, signature);
+                }
             }
+
+            // Check if retry is needed.
+            if let Some(state) = streaming_state.as_mut() {
+                if state.is_apply_patch_invalid() {
+                    let captured = state.take_content_block_capture();
+                    let (toolu_id, _) = state.take_failed_apply_patch_info();
+                    let error_msg = format_apply_patch_error();
+
+                    // Build retry body using current_body (accumulates context across retries).
+                    current_body = build_retry_body(&current_body, captured, &toolu_id, error_msg);
+
+                    state.prepare_for_retry();
+                    tracing::info!(toolu_id = %toolu_id, "retrying apply_patch with format error feedback");
+                    continue 'retry_loop;
+                }
+            }
+
+            break 'retry_loop;
         }
 
-        // Send final [DONE] only if not already sent (e.g. via error or Done event).
+        // Send final [DONE] only if not already sent.
         if !done_sent {
             let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
         }
         drop(tx);
-        let _ = event_source.close();
     });
 
     // Build downstream SSE response.
