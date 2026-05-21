@@ -1795,6 +1795,167 @@ mod tests {
         );
     }
 
+    // --- Scenario 35: EventSource factory called exactly 2 times (invalid then valid) ---
+
+    #[tokio::test]
+    async fn retry_loop_factory_called_exactly_twice() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // First call: invalid patch. Second call: valid text response.
+        let invalid_events =
+            invalid_apply_patch_sse_events("msg_factory1", None, "toolu_f1", "bad patch content");
+        let valid_events = valid_text_only_sse_events("Factory works!");
+
+        // Use Arc<AtomicUsize> so the factory (moved into closure) can count calls,
+        // and we can read the final count after the retry loop completes.
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            let prev = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if prev == 0 {
+                let stream =
+                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            } else {
+                let stream =
+                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            }
+        });
+
+        let initial_body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 1024
+        });
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Factory should have been called exactly 2 times
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst), 2,
+            "factory should be called exactly 2 times (once for invalid, once for retry), got: {}",
+            call_count.load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        // Should end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE], got: {}",
+            &output[..output.len().min(500)]
+        );
+
+        // Should have text from the second (retry) stream
+        assert!(
+            output.contains("Factory works!"),
+            "should have text from retry stream"
+        );
+    }
+
+    // --- Scenario 48: StreamingState created lazily (non-message_start events first) ---
+
+    #[tokio::test]
+    async fn retry_loop_lazy_state_creation_with_ping_then_message() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // Stream: ping event, then an Open event, then a valid text response.
+        // The ping and Open events should be handled without error (no state creation yet),
+        // then message_start creates state and text is processed normally.
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            let events: Vec<reqwest_eventsource::Event> = vec![
+                // Ping event (non-message_start, no state created)
+                sse_msg("ping", serde_json::json!({"type": "ping"}).to_string()),
+                // Open event (handled but no action)
+                reqwest_eventsource::Event::Open,
+                // Now the real message starts
+                sse_msg("message_start", serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_lazy",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "claude-sonnet-4-20250514",
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 10, "output_tokens": 0}
+                    }
+                }).to_string()),
+                sse_msg("content_block_start", serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }).to_string()),
+                sse_msg("content_block_delta", serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "Lazy state works"}
+                }).to_string()),
+                sse_msg("content_block_stop", serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": 0
+                }).to_string()),
+                sse_msg("message_delta", serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {"output_tokens": 5}
+                }).to_string()),
+                sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()),
+            ];
+            let stream = futures::stream::iter(events.into_iter().map(Ok));
+            Ok(Box::pin(stream) as SseStream)
+        });
+
+        let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have response.created (from message_start after ping)
+        assert!(
+            sse_output_contains(&output, "response.created"),
+            "should have response.created after ping, got: {}",
+            &output[..output.len().min(500)]
+        );
+
+        // Should have the text content
+        assert!(
+            output.contains("Lazy state works"),
+            "should have text content after lazy state creation, got: {}",
+            &output[..output.len().min(500)]
+        );
+
+        // Should have response.completed
+        assert!(
+            sse_output_contains(&output, "response.completed"),
+            "should have response.completed"
+        );
+
+        // Should end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE]"
+        );
+
+        // Should NOT have error events
+        assert!(
+            !sse_output_contains(&output, "error"),
+            "ping events before message_start should not cause errors"
+        );
+    }
+
     // --- Scenario 4b: EventSource creation failure on retry (not first call) ---
 
     #[tokio::test]

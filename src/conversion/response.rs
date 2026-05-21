@@ -3708,6 +3708,47 @@ fn main() {
     }
 
     // =========================================================================
+    // Scenario 54: Patch input field "input" key fallback
+    // =========================================================================
+
+    #[test]
+    fn scenario_54_input_key_fallback_detected_as_invalid() {
+        // When the patch content is under {"input": "..."} instead of {"patch": "..."},
+        // the fallback in handle_content_block_stop should still extract it and flag
+        // it as invalid if the content is not a valid patch format.
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+
+        // apply_patch with "input" key instead of "patch" key, containing garbage
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_input_key", "name": "apply_patch", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"input\":\"garbage text\"}"}),
+        });
+        let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // The invalid format should be detected via the "input" key fallback
+        assert!(state.is_apply_patch_invalid(),
+            "apply_patch with 'input' key should be flagged as invalid when content is garbage");
+
+        // No events should be emitted for invalid apply_patch
+        assert!(events.is_empty(),
+            "invalid apply_patch with 'input' key should emit zero events");
+
+        // take_failed_apply_patch_info should return content from the "input" key
+        let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
+        assert_eq!(toolu_id, "toolu_input_key",
+            "failed_apply_patch_info should have the correct toolu_id");
+        assert!(raw_patch.contains("garbage text"),
+            "raw patch should contain the content extracted from the 'input' key, got: {}", raw_patch);
+    }
+
+    // =========================================================================
     // Scenario 40: Output tokens from failed response not accumulated
     // =========================================================================
 
