@@ -307,6 +307,7 @@ dependencies = [
  "axum",
  "axum-server",
  "clap",
+ "eventsource-stream",
  "futures",
  "hex",
  "reqwest",

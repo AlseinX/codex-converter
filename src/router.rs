@@ -5,6 +5,7 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
 use futures::StreamExt;
+use std::pin::Pin;
 use tokio::sync::mpsc;
 
 /// Parsed route information extracted from the request URL.
@@ -156,6 +157,221 @@ fn build_retry_body(
     }));
 
     retry_body
+}
+
+/// Type alias for a boxed SSE event stream used by the retry loop.
+type SseStream = Pin<
+    Box<dyn futures::Stream<Item = Result<reqwest_eventsource::Event, reqwest_eventsource::Error>> + Send>,
+>;
+
+/// Type alias for the factory that creates SSE event streams.
+/// Given the current request body, returns a stream of SSE events (or an error).
+type SseStreamFactory = Box<
+    dyn FnMut(
+        &serde_json::Value,
+    ) -> Result<SseStream, Box<dyn std::error::Error + Send + Sync>>
+        + Send,
+>;
+
+/// Run the streaming SSE conversion with retry support for invalid apply_patch.
+///
+/// This is the core retry loop, extracted for testability. In production,
+/// the `stream_factory` creates EventSource instances from HTTP requests.
+/// In tests, it can provide in-memory mock streams.
+///
+/// # Arguments
+/// * `tx` - Channel sender for output SSE events to the downstream client
+/// * `initial_body` - The initial Anthropic Messages API request body
+/// * `stream_factory` - Factory that creates SSE event streams from a request body
+/// * `model` - Model name for echo-back
+/// * `tool_choice_echo` - Tool choice for echo-back
+/// * `instructions_echo` - Instructions for echo-back
+/// * `parallel_tool_calls_echo` - Parallel tool calls for echo-back
+/// * `namespace_registry` - Shared namespace registry from request conversion
+/// * `signature_cache` - Shared signature cache
+async fn run_streaming_with_retry(
+    tx: mpsc::Sender<Result<axum::body::Bytes, std::convert::Infallible>>,
+    initial_body: serde_json::Value,
+    mut stream_factory: SseStreamFactory,
+    model: String,
+    tool_choice_echo: String,
+    instructions_echo: Option<String>,
+    parallel_tool_calls_echo: Option<bool>,
+    namespace_registry: std::sync::Arc<std::sync::Mutex<crate::conversion::NamespaceRegistry>>,
+    signature_cache: std::sync::Arc<crate::conversion::SignatureCache>,
+) {
+    use crate::conversion::response::StreamingState;
+    use crate::sse::anthropic::{parse_sse_events, AnthropicEvent};
+    use crate::sse::responses::{format_done, format_responses_event, ResponsesEvent};
+
+    let mut current_body = initial_body;
+    let mut streaming_state: Option<StreamingState> = None;
+    let mut done_sent = false;
+
+    'retry_loop: loop {
+        let mut event_stream = match stream_factory(&current_body) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create EventSource");
+                let _ = tx
+                    .send(Ok(axum::body::Bytes::from(
+                        "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Failed to connect to upstream\"}\n\n",
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(axum::body::Bytes::from(format_done())))
+                    .await;
+                return;
+            }
+        };
+
+        // Inner SSE streaming loop.
+        while let Some(event_result) = event_stream.next().await {
+            match event_result {
+                Ok(reqwest_eventsource::Event::Message(msg)) => {
+                    let raw_chunk = format!("event: {}\ndata: {}\n\n", msg.event, msg.data);
+                    let anthropic_events = parse_sse_events(&raw_chunk);
+
+                    for a_event in anthropic_events {
+                        // Create StreamingState lazily on first message_start.
+                        if streaming_state.is_none() {
+                            if let AnthropicEvent::MessageStart { ref message } = a_event {
+                                let response_id = message
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("msg_unknown")
+                                    .to_string();
+                                let ns_reg = {
+                                    let guard = namespace_registry.lock().unwrap();
+                                    guard.clone()
+                                };
+                                streaming_state = Some(StreamingState::new(
+                                    response_id,
+                                    model.clone(),
+                                    ns_reg,
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    tool_choice_echo.clone(),
+                                    instructions_echo.clone(),
+                                    parallel_tool_calls_echo,
+                                ));
+                            } else {
+                                continue;
+                            }
+                        }
+
+                        let state = match streaming_state.as_mut() {
+                            Some(s) => s,
+                            None => continue,
+                        };
+
+                        let responses_events = state.process_event(a_event);
+
+                        // If apply_patch invalid, consume silently (don't forward).
+                        if state.is_apply_patch_invalid() {
+                            continue;
+                        }
+
+                        for r_event in responses_events {
+                            if matches!(r_event, ResponsesEvent::Done) {
+                                done_sent = true;
+                                let _ = tx
+                                    .send(Ok(axum::body::Bytes::from(format_done())))
+                                    .await;
+                            } else {
+                                let sse_str = format_responses_event(&r_event);
+                                let _ = tx
+                                    .send(Ok(axum::body::Bytes::from(sse_str)))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                Ok(reqwest_eventsource::Event::Open) => {}
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("Stream ended") {
+                        tracing::debug!("upstream SSE stream ended normally");
+                    } else if streaming_state.is_some() {
+                        tracing::error!(error = %e, "SSE stream error from upstream (mid-stream)");
+                        let state = streaming_state.as_mut().unwrap();
+                        let error_val = serde_json::json!({
+                            "type": "api_error",
+                            "message": format!("Upstream stream error: {}", e)
+                        });
+                        let events = state.process_event(
+                            crate::sse::anthropic::AnthropicEvent::Error { error: error_val },
+                        );
+                        for r_event in events {
+                            if matches!(r_event, ResponsesEvent::Done) {
+                                done_sent = true;
+                                let _ = tx
+                                    .send(Ok(axum::body::Bytes::from(format_done())))
+                                    .await;
+                            } else {
+                                let sse_str = format_responses_event(&r_event);
+                                let _ = tx
+                                    .send(Ok(axum::body::Bytes::from(sse_str)))
+                                    .await;
+                            }
+                        }
+                    } else {
+                        tracing::error!(error = %e, "SSE stream error from upstream (no message_start)");
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from(
+                                "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Upstream stream error\"}\n\n",
+                            )))
+                            .await;
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from(format_done())))
+                            .await;
+                        done_sent = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Drop the event stream (releases any upstream connection).
+        drop(event_stream);
+
+        // Drain signatures from this response.
+        if let Some(state) = streaming_state.as_mut() {
+            let sigs = state.drain_signatures();
+            for (reasoning_id, signature) in sigs {
+                signature_cache.insert(reasoning_id, signature);
+            }
+        }
+
+        // Check if retry is needed.
+        if let Some(state) = streaming_state.as_mut() {
+            if state.is_apply_patch_invalid() {
+                let captured = state.take_content_block_capture();
+                let (toolu_id, _) = state.take_failed_apply_patch_info();
+                let error_msg = format_apply_patch_error();
+
+                // Build retry body using current_body (accumulates context across retries).
+                current_body =
+                    build_retry_body(&current_body, captured, &toolu_id, error_msg);
+
+                state.prepare_for_retry();
+                tracing::info!(toolu_id = %toolu_id, "retrying apply_patch with format error feedback");
+                continue 'retry_loop;
+            }
+        }
+
+        break 'retry_loop;
+    }
+
+    // Send final [DONE] only if not already sent.
+    if !done_sent {
+        let _ = tx
+            .send(Ok(axum::body::Bytes::from(format_done())))
+            .await;
+    }
+    drop(tx);
 }
 
 /// Build a reqwest client for upstream connections using the TLS/proxy config.
@@ -328,175 +544,29 @@ async fn handle_responses(
 
     // Spawn a task to consume the upstream SSE stream, with retry support for
     // invalid apply_patch format.
-    tokio::spawn(async move {
-        use crate::conversion::response::StreamingState;
-        use crate::sse::anthropic::{parse_sse_events, AnthropicEvent};
-        use crate::sse::responses::{format_done, format_responses_event, ResponsesEvent};
+    let spawn_factory: SseStreamFactory = Box::new(move |body: &serde_json::Value| {
+        let request_builder = retry_client
+            .post(&retry_upstream_url)
+            .header("x-api-key", &retry_api_key)
+            .header("anthropic-version", &retry_anthropic_version)
+            .header("content-type", "application/json")
+            .json(body);
 
-        let mut current_body = retry_anthropic_body.clone();
-        let mut streaming_state: Option<StreamingState> = None;
-        let mut done_sent = false;
-
-        'retry_loop: loop {
-            // Create request_builder INSIDE the loop (fresh each retry).
-            let request_builder = retry_client
-                .post(&retry_upstream_url)
-                .header("x-api-key", &retry_api_key)
-                .header("anthropic-version", &retry_anthropic_version)
-                .header("content-type", "application/json")
-                .json(&current_body);
-
-            let mut event_source = match reqwest_eventsource::EventSource::new(request_builder) {
-                Ok(es) => es,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to create EventSource");
-                    let _ = tx.send(Ok(axum::body::Bytes::from(
-                        "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Failed to connect to upstream\"}\n\n",
-                    ))).await;
-                    let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
-                    return;
-                }
-            };
-
-            // Inner SSE streaming loop.
-            while let Some(event_result) = event_source.next().await {
-                match event_result {
-                    Ok(reqwest_eventsource::Event::Message(msg)) => {
-                        let raw_chunk = format!("event: {}\ndata: {}\n\n", msg.event, msg.data);
-                        let anthropic_events = parse_sse_events(&raw_chunk);
-
-                        for a_event in anthropic_events {
-                            // Create StreamingState lazily on first message_start.
-                            if streaming_state.is_none() {
-                                if let AnthropicEvent::MessageStart { ref message } = a_event {
-                                    let response_id = message
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("msg_unknown")
-                                        .to_string();
-                                    let ns_reg = {
-                                        let guard = namespace_registry.lock().unwrap();
-                                        guard.clone()
-                                    };
-                                    streaming_state = Some(StreamingState::new(
-                                        response_id,
-                                        model.clone(),
-                                        ns_reg,
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs(),
-                                        tool_choice_echo.clone(),
-                                        instructions_echo.clone(),
-                                        parallel_tool_calls_echo,
-                                    ));
-                                } else {
-                                    continue;
-                                }
-                            }
-
-                            let state = match streaming_state.as_mut() {
-                                Some(s) => s,
-                                None => continue,
-                            };
-
-                            let responses_events = state.process_event(a_event);
-
-                            // If apply_patch invalid, consume silently (don't forward).
-                            if state.is_apply_patch_invalid() {
-                                continue;
-                            }
-
-                            for r_event in responses_events {
-                                if matches!(r_event, ResponsesEvent::Done) {
-                                    done_sent = true;
-                                    let _ = tx
-                                        .send(Ok(axum::body::Bytes::from(format_done())))
-                                        .await;
-                                } else {
-                                    let sse_str = format_responses_event(&r_event);
-                                    let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
-                                }
-                            }
-                        }
-                    }
-                    Ok(reqwest_eventsource::Event::Open) => {}
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("Stream ended") {
-                            tracing::debug!("upstream SSE stream ended normally");
-                        } else if streaming_state.is_some() {
-                            tracing::error!(error = %e, "SSE stream error from upstream (mid-stream)");
-                            let state = streaming_state.as_mut().unwrap();
-                            let error_val = serde_json::json!({
-                                "type": "api_error",
-                                "message": format!("Upstream stream error: {}", e)
-                            });
-                            let events = state.process_event(
-                                crate::sse::anthropic::AnthropicEvent::Error { error: error_val },
-                            );
-                            for r_event in events {
-                                if matches!(r_event, ResponsesEvent::Done) {
-                                    done_sent = true;
-                                    let _ = tx
-                                        .send(Ok(axum::body::Bytes::from(format_done())))
-                                        .await;
-                                } else {
-                                    let sse_str = format_responses_event(&r_event);
-                                    let _ = tx.send(Ok(axum::body::Bytes::from(sse_str))).await;
-                                }
-                            }
-                        } else {
-                            tracing::error!(error = %e, "SSE stream error from upstream (no message_start)");
-                            let _ = tx
-                                .send(Ok(axum::body::Bytes::from(
-                                    "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"Upstream stream error\"}\n\n",
-                                )))
-                                .await;
-                            let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
-                            done_sent = true;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // Close the event source (releases upstream connection).
-            let _ = event_source.close();
-
-            // Drain signatures from this response.
-            if let Some(state) = streaming_state.as_mut() {
-                let sigs = state.drain_signatures();
-                for (reasoning_id, signature) in sigs {
-                    signature_cache.insert(reasoning_id, signature);
-                }
-            }
-
-            // Check if retry is needed.
-            if let Some(state) = streaming_state.as_mut() {
-                if state.is_apply_patch_invalid() {
-                    let captured = state.take_content_block_capture();
-                    let (toolu_id, _) = state.take_failed_apply_patch_info();
-                    let error_msg = format_apply_patch_error();
-
-                    // Build retry body using current_body (accumulates context across retries).
-                    current_body = build_retry_body(&current_body, captured, &toolu_id, error_msg);
-
-                    state.prepare_for_retry();
-                    tracing::info!(toolu_id = %toolu_id, "retrying apply_patch with format error feedback");
-                    continue 'retry_loop;
-                }
-            }
-
-            break 'retry_loop;
-        }
-
-        // Send final [DONE] only if not already sent.
-        if !done_sent {
-            let _ = tx.send(Ok(axum::body::Bytes::from(format_done()))).await;
-        }
-        drop(tx);
+        let event_source = reqwest_eventsource::EventSource::new(request_builder)?;
+        Ok(Box::pin(event_source) as SseStream)
     });
+
+    tokio::spawn(run_streaming_with_retry(
+        tx,
+        retry_anthropic_body,
+        spawn_factory,
+        model,
+        tool_choice_echo,
+        instructions_echo,
+        parallel_tool_calls_echo,
+        namespace_registry,
+        signature_cache,
+    ));
 
     // Build downstream SSE response.
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -1067,5 +1137,708 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // Auth passed -- should NOT be 401.
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // =======================================================================
+    // Retry loop integration tests
+    // =======================================================================
+
+    use crate::conversion::SignatureCache;
+
+    /// Helper: create a reqwest_eventsource::Event::Message from event type and data.
+    fn sse_msg(event: &str, data: String) -> reqwest_eventsource::Event {
+        reqwest_eventsource::Event::Message(eventsource_stream::Event {
+            event: event.to_string(),
+            data,
+            id: String::new(),
+            retry: None,
+        })
+    }
+
+    /// Helper: build a complete valid Anthropic SSE stream (text-only, no tool use).
+    /// Produces: message_start -> content_block_start(text) -> content_block_delta ->
+    ///   content_block_stop -> message_delta -> message_stop
+    fn valid_text_only_sse_events(text: &str) -> Vec<reqwest_eventsource::Event> {
+        let msg_id = "msg_test001";
+        vec![
+            sse_msg("message_start", serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-sonnet-4-20250514",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 0}
+                }
+            }).to_string()),
+            sse_msg("content_block_start", serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }).to_string()),
+            sse_msg("content_block_delta", serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text}
+            }).to_string()),
+            sse_msg("content_block_stop", serde_json::json!({
+                "type": "content_block_stop",
+                "index": 0
+            }).to_string()),
+            sse_msg("message_delta", serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": 5}
+            }).to_string()),
+            sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()),
+        ]
+    }
+
+    /// Helper: build SSE events for an apply_patch with invalid format.
+    /// The patch text does NOT start with "*** Begin Patch" and has no diff markers.
+    fn invalid_apply_patch_sse_events(
+        msg_id: &str,
+        text_before: Option<&str>,
+        toolu_id: &str,
+        patch_text: &str,
+    ) -> Vec<reqwest_eventsource::Event> {
+        let mut events = Vec::new();
+
+        // message_start
+        events.push(sse_msg("message_start", serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-20250514",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 10, "output_tokens": 0}
+            }
+        }).to_string()));
+
+        let mut block_index = 0;
+
+        // Optional text block before the apply_patch
+        if let Some(text) = text_before {
+            events.push(sse_msg("content_block_start", serde_json::json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "text", "text": ""}
+            }).to_string()));
+            events.push(sse_msg("content_block_delta", serde_json::json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "text_delta", "text": text}
+            }).to_string()));
+            events.push(sse_msg("content_block_stop", serde_json::json!({
+                "type": "content_block_stop",
+                "index": block_index
+            }).to_string()));
+            block_index += 1;
+        }
+
+        // apply_patch tool_use block (invalid format)
+        events.push(sse_msg("content_block_start", serde_json::json!({
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": {
+                "type": "tool_use",
+                "id": toolu_id,
+                "name": "apply_patch",
+                "input": {}
+            }
+        }).to_string()));
+        let patch_json = serde_json::json!({"patch": patch_text}).to_string();
+        events.push(sse_msg("content_block_delta", serde_json::json!({
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": "input_json_delta", "partial_json": patch_json}
+        }).to_string()));
+        events.push(sse_msg("content_block_stop", serde_json::json!({
+            "type": "content_block_stop",
+            "index": block_index
+        }).to_string()));
+
+        events.push(sse_msg("message_delta", serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": {"output_tokens": 50}
+        }).to_string()));
+        events.push(sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()));
+
+        events
+    }
+
+    /// Helper: build SSE events for a valid apply_patch (correct Codex freeform format).
+    fn valid_apply_patch_sse_events(
+        msg_id: &str,
+        toolu_id: &str,
+        patch_text: &str,
+    ) -> Vec<reqwest_eventsource::Event> {
+        let mut events = Vec::new();
+
+        events.push(sse_msg("message_start", serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-20250514",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 10, "output_tokens": 0}
+            }
+        }).to_string()));
+
+        events.push(sse_msg("content_block_start", serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": toolu_id,
+                "name": "apply_patch",
+                "input": {}
+            }
+        }).to_string()));
+        let patch_json = serde_json::json!({"patch": patch_text}).to_string();
+        events.push(sse_msg("content_block_delta", serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": patch_json}
+        }).to_string()));
+        events.push(sse_msg("content_block_stop", serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }).to_string()));
+
+        events.push(sse_msg("message_delta", serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": {"output_tokens": 30}
+        }).to_string()));
+        events.push(sse_msg("message_stop", serde_json::json!({"type": "message_stop"}).to_string()));
+
+        events
+    }
+
+    /// Helper: collect all output bytes from the retry loop into a single String.
+    async fn collect_retry_output(
+        rx: &mut tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::convert::Infallible>>,
+    ) -> String {
+        let mut output = String::new();
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                Ok(bytes) => output.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(_) => unreachable!("infallible"),
+            }
+        }
+        output
+    }
+
+    /// Helper: check if the SSE output contains a specific event type.
+    fn sse_output_contains(output: &str, event_type: &str) -> bool {
+        output.contains(&format!("event: {}\n", event_type))
+    }
+
+    /// Helper: count occurrences of an SSE event type in the output.
+    fn count_sse_events(output: &str, event_type: &str) -> usize {
+        output.matches(&format!("event: {}\n", event_type)).count()
+    }
+
+    /// Helper: create default retry loop parameters.
+    fn default_retry_params() -> (
+        String,
+        String,
+        Option<String>,
+        Option<bool>,
+        std::sync::Arc<std::sync::Mutex<crate::conversion::NamespaceRegistry>>,
+        std::sync::Arc<SignatureCache>,
+    ) {
+        (
+            "claude-sonnet-4-20250514".to_string(),
+            "auto".to_string(),
+            None,
+            None,
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::conversion::NamespaceRegistry::new(),
+            )),
+            std::sync::Arc::new(SignatureCache::new(std::time::Duration::from_secs(3600))),
+        )
+    }
+
+    // --- Scenario 1: Valid response (no retry) ---
+
+    #[tokio::test]
+    async fn retry_loop_valid_response_no_retry() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        let events = valid_text_only_sse_events("Hello world");
+
+        // Factory that returns one valid stream, then would fail if called again.
+        let events_clone = events.clone();
+        let mut call_count = 0;
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            call_count += 1;
+            assert!(
+                call_count <= 1,
+                "factory should only be called once for valid response"
+            );
+            let stream = futures::stream::iter(events_clone.clone().into_iter().map(Ok));
+            Ok(Box::pin(stream) as SseStream)
+        });
+
+        let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have the text content events and [DONE]
+        assert!(
+            sse_output_contains(&output, "response.created"),
+            "should have response.created, got: {}",
+            &output[..output.len().min(500)]
+        );
+        assert!(
+            sse_output_contains(&output, "response.output_text.delta"),
+            "should have text delta, got: {}",
+            &output[..output.len().min(500)]
+        );
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE], got: {}",
+            &output[..output.len().min(500)]
+        );
+        // Should have response.completed (from message_stop -> ResponseCompleted)
+        assert!(
+            sse_output_contains(&output, "response.completed"),
+            "should have response.completed"
+        );
+        // Should NOT have retry-related error events
+        assert!(
+            !sse_output_contains(&output, "error"),
+            "should not have error events"
+        );
+    }
+
+    // --- Scenario 2: Invalid apply_patch triggers retry, second stream succeeds ---
+
+    #[tokio::test]
+    async fn retry_loop_invalid_patch_triggers_retry_then_succeeds() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // First call: invalid patch. Second call: valid text response.
+        let invalid_events =
+            invalid_apply_patch_sse_events("msg_retry1", None, "toolu_bad1", "bad patch content");
+        let valid_events = valid_text_only_sse_events("Fixed!");
+
+        let mut call_count = 0;
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            call_count += 1;
+            if call_count == 1 {
+                let stream =
+                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            } else {
+                assert_eq!(call_count, 2, "should only need 2 calls");
+                let stream =
+                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            }
+        });
+
+        let initial_body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 1024
+        });
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE], got: {}",
+            &output[..output.len().min(500)]
+        );
+
+        // Should have response.created (from the first or second stream)
+        assert!(
+            sse_output_contains(&output, "response.created"),
+            "should have response.created"
+        );
+
+        // Should have the text from the second stream
+        assert!(
+            sse_output_contains(&output, "response.output_text.delta"),
+            "should have text delta from retry stream"
+        );
+
+        // Should NOT have any error events (the invalid patch is silently retried)
+        assert!(
+            !sse_output_contains(&output, "error"),
+            "should not have error events"
+        );
+    }
+
+    // --- Scenario 3: Double retry (two invalid patches, third succeeds) ---
+
+    #[tokio::test]
+    async fn retry_loop_double_retry_then_succeeds() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        let invalid1 =
+            invalid_apply_patch_sse_events("msg_retry1", None, "toolu_bad1", "still bad");
+        let invalid2 =
+            invalid_apply_patch_sse_events("msg_retry2", None, "toolu_bad2", "also bad");
+        let valid = valid_text_only_sse_events("Finally works!");
+
+        let mut call_count = 0;
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            call_count += 1;
+            let events = match call_count {
+                1 => invalid1.clone(),
+                2 => invalid2.clone(),
+                3 => valid.clone(),
+                _ => panic!("factory called too many times: {}", call_count),
+            };
+            let stream = futures::stream::iter(events.into_iter().map(Ok));
+            Ok(Box::pin(stream) as SseStream)
+        });
+
+        let initial_body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 1024
+        });
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE]"
+        );
+        // Should have text from the third (successful) stream
+        assert!(
+            sse_output_contains(&output, "response.output_text.delta"),
+            "should have text delta from final successful stream"
+        );
+    }
+
+    // --- Scenario 4: EventSource creation failure ---
+
+    #[tokio::test]
+    async fn retry_loop_event_source_creation_failure() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            Err("connection refused".into())
+        });
+
+        let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have an error event
+        assert!(
+            sse_output_contains(&output, "error"),
+            "should have error event for creation failure"
+        );
+        assert!(
+            output.contains("Failed to connect to upstream"),
+            "error message should mention connection failure"
+        );
+        // Should still end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE] even on error"
+        );
+    }
+
+    // --- Scenario 5: SSE stream error mid-stream (StreamEnded) ---
+
+    #[tokio::test]
+    async fn retry_loop_sse_stream_ends_prematurely() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // Stream that starts with message_start then ends with StreamEnded error.
+        // In the retry loop, "Stream ended" is treated as a normal stream end.
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            let msg_start = Ok(sse_msg("message_start", serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_miderr",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-sonnet-4-20250514",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 0}
+                }
+            }).to_string()));
+            let err = reqwest_eventsource::Error::StreamEnded;
+            let stream = futures::stream::iter(vec![msg_start, Err(err)]);
+            Ok(Box::pin(stream) as SseStream)
+        });
+
+        let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have response.created (from message_start)
+        assert!(
+            sse_output_contains(&output, "response.created"),
+            "should have response.created before stream end"
+        );
+        // Should end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE] after stream end"
+        );
+    }
+
+    // --- Scenario 5b: SSE stream error before message_start ---
+
+    #[tokio::test]
+    async fn retry_loop_sse_stream_error_before_message_start() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // Stream that errors immediately, before any message_start.
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            let err = reqwest_eventsource::Error::InvalidLastEventId(
+                "bad-id".to_string(),
+            );
+            let stream = futures::stream::iter(vec![Err(err)]);
+            Ok(Box::pin(stream) as SseStream)
+        });
+
+        let initial_body = serde_json::json!({"model": "test", "messages": [], "max_tokens": 1024});
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have error event
+        assert!(
+            sse_output_contains(&output, "error"),
+            "should have error event for stream error before message_start"
+        );
+        // Should end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE] after error"
+        );
+    }
+
+
+    // --- Scenario 6: Text forwarded before retry ---
+
+    #[tokio::test]
+    async fn retry_loop_text_forwarded_before_retry() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // First stream: text "I will fix it" + invalid apply_patch
+        let invalid_events = invalid_apply_patch_sse_events(
+            "msg_txt_retry",
+            Some("I will fix it"),
+            "toolu_txt_bad",
+            "not a valid patch",
+        );
+        // Second stream: valid text response
+        let valid_events = valid_text_only_sse_events("Done!");
+
+        let mut call_count = 0;
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            call_count += 1;
+            if call_count == 1 {
+                let stream =
+                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            } else {
+                let stream =
+                    futures::stream::iter(valid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            }
+        });
+
+        let initial_body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 1024
+        });
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have text from both streams
+        // First stream should have forwarded "I will fix it"
+        assert!(
+            output.contains("I will fix it"),
+            "text from first stream should be forwarded before retry"
+        );
+        // Second stream should have "Done!"
+        assert!(
+            output.contains("Done!"),
+            "text from retry stream should be forwarded"
+        );
+        // Should end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE]"
+        );
+
+        // Count response.created events -- should have at least one
+        let created_count = count_sse_events(&output, "response.created");
+        assert!(
+            created_count >= 1,
+            "should have at least one response.created"
+        );
+    }
+
+    // --- Scenario: Valid apply_patch succeeds without retry ---
+
+    #[tokio::test]
+    async fn retry_loop_valid_apply_patch_no_retry() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // A valid apply_patch (starts with *** Begin Patch) should succeed without retry.
+        let valid_patch = "*** Begin Patch\n*** Update File: foo.rs\n-old\n+new\n*** End Patch\n";
+        let events = valid_apply_patch_sse_events("msg_valid_patch", "toolu_valid", valid_patch);
+
+        let mut call_count = 0;
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            call_count += 1;
+            assert_eq!(call_count, 1, "factory should only be called once for valid patch");
+            let stream = futures::stream::iter(events.clone().into_iter().map(Ok));
+            Ok(Box::pin(stream) as SseStream)
+        });
+
+        let initial_body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 1024
+        });
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have response.created
+        assert!(
+            sse_output_contains(&output, "response.created"),
+            "should have response.created"
+        );
+        // Should have custom_tool_call output (the apply_patch was valid)
+        assert!(
+            output.contains("custom_tool_call"),
+            "should have custom_tool_call for valid apply_patch, got: {}",
+            &output[..output.len().min(500)]
+        );
+        // Should end with [DONE]
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE]"
+        );
+        // Should NOT have error events
+        assert!(
+            !sse_output_contains(&output, "error"),
+            "should not have error events for valid patch"
+        );
+    }
+
+    // --- Scenario 4b: EventSource creation failure on retry (not first call) ---
+
+    #[tokio::test]
+    async fn retry_loop_creation_failure_on_retry_attempt() {
+        let (tx, mut rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+        let (model, tool_choice, instructions, parallel, ns_reg, sig_cache) =
+            default_retry_params();
+
+        // First call succeeds with invalid patch, second call fails
+        let invalid_events =
+            invalid_apply_patch_sse_events("msg_retry_fail", None, "toolu_rfail", "bad patch");
+
+        let mut call_count = 0;
+        let factory: SseStreamFactory = Box::new(move |_body: &serde_json::Value| {
+            call_count += 1;
+            if call_count == 1 {
+                let stream =
+                    futures::stream::iter(invalid_events.clone().into_iter().map(Ok));
+                Ok(Box::pin(stream) as SseStream)
+            } else {
+                Err("retry connection failed".into())
+            }
+        });
+
+        let initial_body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 1024
+        });
+
+        tokio::spawn(run_streaming_with_retry(
+            tx, initial_body, factory, model, tool_choice, instructions, parallel, ns_reg, sig_cache,
+        ));
+
+        let output = collect_retry_output(&mut rx).await;
+
+        // Should have error from the retry failure
+        assert!(
+            sse_output_contains(&output, "error"),
+            "should have error event for retry creation failure"
+        );
+        assert!(
+            output.contains("data: [DONE]"),
+            "should end with [DONE] even on retry failure"
+        );
     }
 }
