@@ -505,6 +505,20 @@ impl StreamingState {
                 // For custom_tool_call (freeform tools), accumulate silently
                 // and emit the full input at content_block_stop.
                 if self.current_is_custom {
+                    if !self.apply_patch_format_confirmed
+                        && self.arguments_accumulator.contains("*** Begin Patch")
+                    {
+                        self.apply_patch_format_confirmed = true;
+                        let mut events = Vec::new();
+                        if let Some(item) = self.buffered_apply_patch_item.take() {
+                            let output_index = self
+                                .buffered_apply_patch_output_index
+                                .take()
+                                .unwrap_or(self.output_items.len());
+                            events.push(ResponsesEvent::OutputItemAdded { output_index, item });
+                        }
+                        return events;
+                    }
                     return vec![];
                 }
                 let output_index = self.output_items.len();
@@ -2098,5 +2112,30 @@ mod tests {
             let (t, _) = e.to_sse();
             t == "response.output_item.added"
         }), "apply_patch OutputItemAdded should be buffered, not emitted");
+    }
+
+    #[test]
+    fn apply_patch_freeform_released_on_positive_detection() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {}}),
+        });
+        // First delta: no *** Begin Patch
+        let events = state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\""}),
+        });
+        assert!(!events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }));
+        // Second delta: *** Begin Patch appears
+        let events = state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "*** Begin Patch\\n*** Update File: test.txt\\n-old\\n+new\\n*** End Patch\"}"}),
+        });
+        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
+            "buffered OutputItemAdded should be released when *** Begin Patch detected");
     }
 }
