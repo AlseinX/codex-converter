@@ -126,7 +126,7 @@ Codex sees one continuous SSE stream. The retry is invisible. No retry limit —
 Codex request → proxy converts → Anthropic streams response
     ├─ text/thinking blocks → forwarded immediately
     ├─ apply_patch tool_use detected (content_block_start)
-    │   ├─ Buffer OutputItemAdded (don't emit yet)
+    │   ├─ Buffer OutputItemAdded (don't emit yet), reset format_confirmed flag
     │   ├─ Accumulate deltas (input_json_delta)
     │   │   ├─ Contains "*** Begin Patch" → VALID
     │   │   │   ├─ Release buffer, resume streaming
@@ -135,8 +135,8 @@ Codex request → proxy converts → Anthropic streams response
     │   └─ content_block_stop (never confirmed valid)
     │       ├─ Try convert_to_freeform_patch()
     │       │   ├─ Conversion succeeds → VALID after conversion
-    │       │   │   ├─ Release buffer with converted patch
-    │       │   │   └─ Resume streaming
+    │       │   │   ├─ Emit buffered OutputItemAdded + OutputItemDone with converted patch
+    │       │   │   └─ Continue normal event loop for subsequent blocks
     │       │   └─ Conversion fails → CONFIRMED INVALID
     │       │       ├─ Close upstream connection (like user interrupt)
     │       │       └─ Begin retry flow
@@ -199,7 +199,7 @@ New fields:
 |-------|------|---------|
 | `anthropic_content_blocks` | `Vec<Value>` | Always-captured Anthropic content blocks for retry assistant message |
 | `retry_mode` | `bool` | Skip response.created/in_progress on retry response |
-| `apply_patch_invalid` | `bool` | Set during delta accumulation when format is clearly not freeform. content_block_stop uses this as the signal to close upstream. |
+| `apply_patch_invalid` | `bool` | Set at content_block_stop when apply_patch was never confirmed valid AND `convert_to_freeform_patch()` also fails. Router reads this flag to close upstream and trigger retry. |
 | `buffered_apply_patch_item` | `Option<Value>` | Held-back OutputItemAdded for apply_patch |
 | `buffered_apply_patch_output_index` | `Option<usize>` | Output index at content_block_start time |
 | `apply_patch_format_confirmed` | `bool` | `*** Begin Patch` detected in accumulated deltas |
@@ -214,7 +214,7 @@ New public methods:
 
 ### Behavior Changes
 
-**content_block_start (apply_patch):** Buffer OutputItemAdded instead of emitting. Record output_index.
+**content_block_start (apply_patch):** Buffer OutputItemAdded instead of emitting. Record output_index. Reset `apply_patch_format_confirmed` to false (per-block flag).
 
 **content_block_delta (apply_patch):** Accumulate silently in `arguments_accumulator`. Single positive check per delta:
 - Accumulated content contains `*** Begin Patch` → set `apply_patch_format_confirmed`, release buffered OutputItemAdded. From this point, normal streaming resumes (deltas still accumulated silently, OutputItemDone emitted at content_block_stop).
@@ -222,7 +222,7 @@ New public methods:
 
 **content_block_stop (apply_patch):**
 - If `apply_patch_format_confirmed`: emit OutputItemDone with raw patch. Normal flow.
-- If `apply_patch_format_confirmed` is false (never saw `*** Begin Patch`): try `convert_to_freeform_patch()` on accumulated content. If conversion produces valid freeform → release buffer with converted patch, emit OutputItemDone, resume streaming. If conversion fails → set `apply_patch_invalid`, close upstream connection, begin retry.
+- If `apply_patch_format_confirmed` is false (never saw `*** Begin Patch`): try `convert_to_freeform_patch()` on accumulated content. If conversion produces valid freeform → emit buffered OutputItemAdded + OutputItemDone with converted patch, continue normal event loop for subsequent content blocks in this response. If conversion fails → set `apply_patch_invalid`, router closes upstream connection and begins retry.
 
 **content_block_stop (all blocks):** Push Anthropic-format content block to `anthropic_content_blocks` for potential retry.
 
@@ -255,7 +255,7 @@ The `tx` channel is shared across all retry iterations. Codex sees one continuou
 | Text/thinking already forwarded before detection | Already sent to Codex. Retry adds more items. Multiple output items are valid in Responses API. |
 | Invalid apply_patch detected | Close upstream immediately after content_block_stop, construct retry. No tokens wasted on subsequent generation. |
 | No apply_patch in response at all | No special handling, normal flow |
-| Multiple apply_patch in one response | Each validated independently. Invalid ones trigger retry. |
+| Multiple apply_patch in one response | Each validated independently. First invalid one triggers upstream close — subsequent content blocks in the same response are never received (never forwarded to Codex, so no inconsistency). Retry response may contain corrected apply_patch plus other content. |
 | Thinking blocks in failed response | Must be preserved in retry assistant message (including signatures and redacted_thinking) — required by Anthropic multi-turn protocol |
 
 ## Constraints
@@ -264,6 +264,7 @@ The `tx` channel is shared across all retry iterations. Codex sees one continuou
 - **Anthropic prefill removed on Claude 4.6+.** Cannot use assistant-message continuation. Must use standard tool-use retry pattern (assistant + user with tool_result).
 - **Responses API has no cancel/reset mechanism.** Already-forwarded SSE events cannot be unsent. This is why early detection matters — the less we forward before detecting a problem, the cleaner the retry.
 - **Thinking blocks must be preserved.** Anthropic requires thinking blocks (with signatures) to be passed back unmodified in multi-turn conversations. Dropping them causes API errors.
+- **Usage tracking is best-effort after retry.** The first response's upstream is closed at content_block_stop (before message_stop), so output token usage from the failed response may be incomplete. Only input usage from message_start is reliably captured. Retry response usage is additive. This is an acceptable trade-off — accurate retry behavior matters more than precise usage accounting.
 
 ## Files to Modify
 
