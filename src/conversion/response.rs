@@ -539,6 +539,9 @@ impl StreamingState {
                 });
                 self.output_items.push(item.clone());
                 events.push(ResponsesEvent::OutputItemDone { output_index, item });
+
+                // Capture Anthropic-format content block for retry
+                self.anthropic_content_blocks.push(json!({"type": "text", "text": text}));
             }
             ActiveBlock::Thinking => {
                 let thinking_text = std::mem::take(&mut self.thinking_accumulator);
@@ -548,7 +551,7 @@ impl StreamingState {
                 // Store signature for cache write after stream ends.
                 if !signature.is_empty() {
                     self.signature_store
-                        .push((reasoning_id.clone(), signature));
+                        .push((reasoning_id.clone(), signature.clone()));
                 }
 
                 events.push(ResponsesEvent::ReasoningSummaryTextDone {
@@ -570,6 +573,13 @@ impl StreamingState {
                 });
                 self.output_items.push(item.clone());
                 events.push(ResponsesEvent::OutputItemDone { output_index, item });
+
+                // Capture Anthropic-format content block for retry
+                let mut thinking_block = json!({"type": "thinking", "thinking": thinking_text.clone()});
+                if !signature.is_empty() {
+                    thinking_block["signature"] = json!(signature);
+                }
+                self.anthropic_content_blocks.push(thinking_block);
             }
             ActiveBlock::RedactedThinking { encrypted_content } => {
                 let reasoning_id = std::mem::take(&mut self.current_reasoning_id);
@@ -583,6 +593,9 @@ impl StreamingState {
                 }
                 self.output_items.push(item.clone());
                 events.push(ResponsesEvent::OutputItemDone { output_index, item });
+
+                // Capture Anthropic-format content block for retry
+                self.anthropic_content_blocks.push(json!({"type": "redacted_thinking", "data": encrypted_content}));
             }
             ActiveBlock::ToolUse => {
                 let args = std::mem::take(&mut self.arguments_accumulator);
@@ -625,7 +638,7 @@ impl StreamingState {
                                 .and_then(|p| p.as_str())
                                 .map(|s| s.to_string())
                         })
-                        .unwrap_or(args);
+                        .unwrap_or(args.clone());
                     // 2. Anthropic models often produce unified diff format
                     //    (--- a/file, +++ b/file, @@ hunk headers).
                     //    Codex requires its own freeform format
@@ -643,7 +656,8 @@ impl StreamingState {
                     }
                     self.output_items.push(item.clone());
                     events.push(ResponsesEvent::OutputItemDone { output_index, item });
-                } else {
+                }
+                else {
                     events.push(ResponsesEvent::FunctionCallArgumentsDone {
                         output_index,
                         item_id: fc_id.clone(),
@@ -664,6 +678,23 @@ impl StreamingState {
                     self.output_items.push(item.clone());
                     events.push(ResponsesEvent::OutputItemDone { output_index, item });
                 }
+
+                // Capture Anthropic-format content block for retry
+                let toolu_id = self.tool_use_map.iter()
+                    .find(|(_, fid, _, _)| fid == &fc_id)
+                    .map(|(tid, _, _, _)| tid.clone())
+                    .unwrap_or_default();
+                let raw_name = self.tool_use_map.iter()
+                    .find(|(_, fid, _, _)| fid == &fc_id)
+                    .map(|(_, _, _, n)| n.clone())
+                    .unwrap_or_default();
+                let input_value: Value = serde_json::from_str(&args).unwrap_or_default();
+                self.anthropic_content_blocks.push(json!({
+                    "type": "tool_use",
+                    "id": toolu_id,
+                    "name": raw_name,
+                    "input": input_value,
+                }));
             }
             ActiveBlock::None => {
                 // No active block, nothing to do.
@@ -1959,5 +1990,88 @@ mod tests {
         assert!(state.is_retry_mode());
         // accumulators are cleared
         assert!(!state.is_apply_patch_invalid());
+    }
+
+    #[test]
+    fn content_blocks_captured_at_stop() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+
+        // Text block
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Hello"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // Tool use block
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 1,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "run", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 1,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"cmd\":\"ls\"}"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
+
+        let captured = state.take_content_block_capture();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0]["type"], "text");
+        assert_eq!(captured[0]["text"], "Hello");
+        assert_eq!(captured[1]["type"], "tool_use");
+        assert_eq!(captured[1]["id"], "toolu_01");
+        assert_eq!(captured[1]["name"], "run");
+    }
+
+    #[test]
+    fn thinking_captured_with_signature() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "thinking", "thinking": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "thinking_delta", "thinking": "hmm"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "signature_delta", "signature": "SIG123"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        let captured = state.take_content_block_capture();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["type"], "thinking");
+        assert_eq!(captured[0]["thinking"], "hmm");
+        assert_eq!(captured[0]["signature"], "SIG123");
+    }
+
+    #[test]
+    fn redacted_thinking_captured() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "redacted_thinking", "data": "ENCRYPTED_BLOB"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        let captured = state.take_content_block_capture();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["type"], "redacted_thinking");
+        assert_eq!(captured[0]["data"], "ENCRYPTED_BLOB");
     }
 }
