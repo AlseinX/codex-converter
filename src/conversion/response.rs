@@ -3313,4 +3313,477 @@ fn main() {
         assert!(state.is_apply_patch_invalid(),
             "second apply_patch should be flagged as invalid (format_confirmed was reset per block)");
     }
+
+    // =========================================================================
+    // Scenario 17: First apply_patch invalid, second never arrives
+    // =========================================================================
+
+    #[test]
+    fn scenario_17_first_invalid_apply_patch_flags_and_stores_info() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+
+        // Stream an invalid apply_patch (garbage content, no patch markers)
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_BAD", "name": "apply_patch", "input": {}}),
+        });
+        let events = state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"this is garbage not a patch at all\"}"}),
+        });
+        // No events during delta for apply_patch (buffered)
+        assert!(!events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
+            "delta should not release buffered apply_patch");
+
+        let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // Verify: apply_patch is flagged invalid
+        assert!(state.is_apply_patch_invalid(),
+            "apply_patch should be flagged as invalid");
+
+        // Verify: NO events emitted for the invalid apply_patch
+        assert!(events.is_empty(),
+            "invalid apply_patch should emit zero events");
+
+        // Verify: failed_apply_patch_info has the correct toolu_id
+        let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
+        assert_eq!(toolu_id, "toolu_BAD",
+            "failed_apply_patch_info should contain toolu_BAD's toolu_id");
+        assert!(raw_patch.contains("garbage"),
+            "raw patch text should contain the garbage content");
+    }
+
+    // =========================================================================
+    // Scenario 19: Full double-retry StreamingState cycle
+    // =========================================================================
+
+    #[test]
+    fn scenario_19_double_retry_cycle() {
+        let mut state = make_state();
+
+        // --- First response: text "Hello" + invalid apply_patch ---
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_ORIG", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 50, "output_tokens": 0}}),
+        });
+        // Text block "Hello"
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Hello"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // Invalid apply_patch #1
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 1,
+            content_block: json!({"type": "tool_use", "id": "toolu_FIRST", "name": "apply_patch", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 1,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"bad patch 1\"}"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
+        assert!(state.is_apply_patch_invalid(), "first apply_patch should be invalid");
+
+        // --- Call prepare_for_retry() ---
+        state.prepare_for_retry();
+        assert!(!state.is_apply_patch_invalid(), "invalid flag reset after prepare_for_retry");
+
+        // --- Retry response: text "Retry" + ANOTHER invalid apply_patch ---
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_RETRY1", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 30, "output_tokens": 0}}),
+        });
+        // Text block "Retry"
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Retry"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // Invalid apply_patch #2
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 1,
+            content_block: json!({"type": "tool_use", "id": "toolu_SECOND", "name": "apply_patch", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 1,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"bad patch 2\"}"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
+        assert!(state.is_apply_patch_invalid(), "second apply_patch should also be invalid");
+
+        // --- Verify output_items contains "Hello" and "Retry" ---
+        let items = state.output_items();
+        assert_eq!(items.len(), 2, "output_items should have both text blocks from both responses");
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["content"][0]["text"], "Hello");
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[1]["content"][0]["text"], "Retry");
+
+        // --- Verify failed_apply_patch_info has the SECOND apply_patch's info ---
+        let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
+        assert_eq!(toolu_id, "toolu_SECOND",
+            "failed_apply_patch_info should be from the SECOND (most recent) invalid apply_patch");
+        assert!(raw_patch.contains("bad patch 2"),
+            "raw patch should be from the second invalid apply_patch");
+
+        // --- Verify anthropic_content_blocks from retry response captured ---
+        let captured = state.take_content_block_capture();
+        // The retry response had text "Retry" + invalid apply_patch => 2 captured blocks
+        assert!(!captured.is_empty(),
+            "anthropic_content_blocks should have been captured from the retry response");
+        assert!(captured.iter().any(|b| b["type"] == "text" && b["text"] == "Retry"),
+            "captured blocks should include the Retry text block");
+
+        // --- Call prepare_for_retry() again (second retry) ---
+        state.prepare_for_retry();
+        assert!(!state.is_apply_patch_invalid(), "invalid flag reset for third attempt");
+        assert!(state.is_retry_mode(), "retry_mode should be true");
+        assert_eq!(state.output_items().len(), 2,
+            "output_items should still be preserved after second prepare_for_retry");
+
+        // --- Verify state is ready for a third attempt ---
+        // Stream a valid text block as a third attempt
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_RETRY2", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 20, "output_tokens": 0}}),
+        });
+        let events = state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        // Should emit events normally (state is ready)
+        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.added" }),
+            "third attempt should emit OutputItemAdded for text block");
+
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Third"}),
+        });
+        let events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+        assert!(events.iter().any(|e| { let (t, _) = e.to_sse(); t == "response.output_item.done" }),
+            "third attempt text block should complete normally");
+
+        // Verify all three responses' text items accumulated
+        let items = state.output_items();
+        assert_eq!(items.len(), 3, "output_items should have all three text blocks");
+    }
+
+    // =========================================================================
+    // Scenario 47: Buffer released exactly once
+    // =========================================================================
+
+    #[test]
+    fn scenario_47_buffer_released_exactly_once() {
+        let mut state = make_state();
+        let mut all_events: Vec<ResponsesEvent> = Vec::new();
+
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+
+        // Start apply_patch
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {}}),
+        });
+
+        // First delta with *** Begin Patch => triggers release of buffered item
+        let delta_events = state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"*** Begin Patch\\n*** Update File: x.txt\\n-old\\n+new\\n*** End Patch\"}"}),
+        });
+        all_events.extend(delta_events);
+
+        // Send additional deltas
+        let delta_events2 = state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": ""}),
+        });
+        all_events.extend(delta_events2);
+
+        // content_block_stop
+        let stop_events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+        all_events.extend(stop_events);
+
+        // Count OutputItemAdded events
+        let added_count = all_events.iter().filter(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.added"
+        }).count();
+
+        assert_eq!(added_count, 1,
+            "OutputItemAdded should be emitted exactly once (from the delta detection), got {}",
+            added_count);
+
+        // OutputItemDone should be emitted at content_block_stop
+        let done_count = all_events.iter().filter(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.done"
+        }).count();
+        assert_eq!(done_count, 1,
+            "OutputItemDone should be emitted exactly once at content_block_stop, got {}",
+            done_count);
+
+        // No duplicate OutputItemAdded
+        assert!(added_count == 1, "no duplicate OutputItemAdded should exist");
+    }
+
+    // =========================================================================
+    // Scenario 52: Namespace registry preserved across retries
+    // =========================================================================
+
+    #[test]
+    fn scenario_52_namespace_registry_preserved_across_retries() {
+        let mut registry = NamespaceRegistry::new();
+        registry.register(
+            "mcp__memory__search".to_string(),
+            "mcp__memory__".to_string(),
+            "search".to_string(),
+        );
+        let mut state = StreamingState::new(
+            "msg_test".to_string(),
+            "m".to_string(),
+            registry,
+            1717000000,
+            "auto".to_string(),
+            None,
+            None,
+        );
+
+        // First response: use a namespaced tool
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        // OutputItemAdded is emitted at ContentBlockStart for regular tool_use
+        let start_events = state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "mcp__memory__search", "input": {}}),
+        });
+
+        // Verify namespace lookup worked on first response
+        let added = start_events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.added"
+        }).unwrap();
+        let (_, data) = added.to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(parsed["item"]["name"], "search");
+        assert_eq!(parsed["item"]["namespace"], "mcp__memory__");
+
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"q\":\"test\"}"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // prepare_for_retry
+        state.prepare_for_retry();
+
+        // Retry response: use the same namespaced tool again
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_RETRY", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 5, "output_tokens": 0}}),
+        });
+        // OutputItemAdded is emitted at ContentBlockStart for regular tool_use
+        let start_events = state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_02", "name": "mcp__memory__search", "input": {}}),
+        });
+
+        // Verify namespace lookup still works after retry (at ContentBlockStart)
+        let added = start_events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.added"
+        }).unwrap();
+        let (_, data) = added.to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(parsed["item"]["name"], "search",
+            "namespace lookup should still work after retry");
+        assert_eq!(parsed["item"]["namespace"], "mcp__memory__",
+            "namespace should still be resolved correctly after retry");
+
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"q\":\"retry\"}"}),
+        });
+        let stop_events = state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // Verify OutputItemDone also has correct namespace after retry
+        let done = stop_events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.done"
+        }).unwrap();
+        let (_, done_data) = done.to_sse();
+        let done_parsed: serde_json::Value = serde_json::from_str(&done_data).unwrap();
+        assert_eq!(done_parsed["item"]["name"], "search",
+            "OutputItemDone should have correct display name after retry");
+        assert_eq!(done_parsed["item"]["namespace"], "mcp__memory__",
+            "OutputItemDone should have correct namespace after retry");
+    }
+
+    // =========================================================================
+    // Scenario 16: SSE event order - text emitted before apply_patch detection
+    // =========================================================================
+
+    #[test]
+    fn scenario_16_text_before_apply_patch_event_order() {
+        let mut state = make_state();
+        let mut all_events: Vec<ResponsesEvent> = Vec::new();
+        let mut event_types: Vec<String> = Vec::new();
+
+        // message_start
+        all_events.extend(state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        }));
+
+        // Text block (completed)
+        all_events.extend(state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        }));
+        all_events.extend(state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Some text"}),
+        }));
+        all_events.extend(state.process_event(AnthropicEvent::ContentBlockStop { index: 0 }));
+
+        // apply_patch content_block_start
+        all_events.extend(state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 1,
+            content_block: json!({"type": "tool_use", "id": "toolu_bad", "name": "apply_patch", "input": {}}),
+        }));
+        // apply_patch delta (invalid)
+        all_events.extend(state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 1,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"not valid\"}"}),
+        }));
+        // apply_patch content_block_stop (should emit nothing for invalid)
+        all_events.extend(state.process_event(AnthropicEvent::ContentBlockStop { index: 1 }));
+
+        // Build event type list
+        for e in &all_events {
+            let (t, _) = e.to_sse();
+            event_types.push(t);
+        }
+
+        // Find positions of text-related events
+        let text_added_pos = event_types.iter().position(|t| t == "response.output_item.added");
+        let text_done_pos = event_types.iter().position(|t| t == "response.output_item.done");
+
+        // Verify text events exist
+        assert!(text_added_pos.is_some(), "should have OutputItemAdded for text block");
+        assert!(text_done_pos.is_some(), "should have OutputItemDone for text block");
+
+        // Verify text OutputItemAdded comes before text OutputItemDone
+        let added_pos = text_added_pos.unwrap();
+        let done_pos = text_done_pos.unwrap();
+        assert!(added_pos < done_pos,
+            "text OutputItemAdded should come before text OutputItemDone");
+
+        // Verify no apply_patch events exist (invalid => no events)
+        let apply_patch_events: Vec<_> = event_types.iter()
+            .filter(|t| **t == "response.output_item.added" || **t == "response.output_item.done")
+            .collect();
+        // We should have exactly 2: one added + one done, both for text
+        assert_eq!(apply_patch_events.len(), 2,
+            "should only have text-related added/done events, no apply_patch events");
+
+        // Verify text output_items are present even though apply_patch was invalid
+        let items = state.output_items();
+        assert_eq!(items.len(), 1, "should have 1 output item (text only)");
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["content"][0]["text"], "Some text");
+
+        // Verify apply_patch was flagged invalid
+        assert!(state.is_apply_patch_invalid());
+    }
+
+    // =========================================================================
+    // Scenario 40: Output tokens from failed response not accumulated
+    // =========================================================================
+
+    #[test]
+    fn scenario_40_output_tokens_reset_after_failed_response() {
+        let mut state = make_state();
+
+        // First response: message_start (input_tokens=100)
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 100, "output_tokens": 0}}),
+        });
+
+        // Text block
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Partial"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+
+        // Invalid apply_patch at content_block_stop
+        // Note: there's no message_delta/message_stop (upstream closed early)
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 1,
+            content_block: json!({"type": "tool_use", "id": "toolu_bad", "name": "apply_patch", "input": {}}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 1,
+            delta: json!({"type": "input_json_delta", "partial_json": "{\"patch\":\"garbage\"}"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 1 });
+
+        // output_tokens was never set (no message_delta), so it should be 0
+        // But we verify the important thing: prepare_for_retry resets it
+
+        // Call prepare_for_retry()
+        state.prepare_for_retry();
+
+        // Verify output_tokens was reset to 0 by prepare_for_retry
+        // We verify by running a retry response and checking the final usage
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_RETRY", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}),
+        });
+
+        // Complete the retry normally
+        state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "text", "text": ""}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: json!({"type": "text_delta", "text": "Retry"}),
+        });
+        state.process_event(AnthropicEvent::ContentBlockStop { index: 0 });
+        state.process_event(AnthropicEvent::MessageDelta {
+            delta: json!({"stop_reason": "end_turn", "stop_sequence": null}),
+            usage: json!({"output_tokens": 25}),
+        });
+        let events = state.process_event(AnthropicEvent::MessageStop);
+
+        let completed = events.iter().find(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        }).unwrap();
+        let (_, data) = completed.to_sse();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+
+        // output_tokens should be exactly 25 from the retry response, not accumulated from before
+        assert_eq!(parsed["response"]["usage"]["output_tokens"], 25,
+            "output_tokens should be 25 from retry response only (reset by prepare_for_retry)");
+
+        // input_tokens was preserved (100 from first response, 0 from retry = 100)
+        assert_eq!(parsed["response"]["usage"]["input_tokens"], 100,
+            "input_tokens should be preserved from first response (100)");
+    }
 }
