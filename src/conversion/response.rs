@@ -283,6 +283,14 @@ impl StreamingState {
     // -----------------------------------------------------------------------
 
     fn handle_message_start(&mut self, message: Value) -> Vec<ResponsesEvent> {
+        if self.retry_mode {
+            if let Some(usage) = message.get("usage") {
+                self.input_tokens += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.cache_read_tokens += usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            }
+            return vec![];
+        }
+
         // Record response ID and usage from the initial message.
         if let Some(id) = message.get("id").and_then(|v| v.as_str()) {
             self.response_id = id.to_string();
@@ -2225,5 +2233,18 @@ mod tests {
         let (toolu_id, raw_patch) = state.take_failed_apply_patch_info();
         assert_eq!(toolu_id, "toolu_01");
         assert!(raw_patch.contains("This is not a valid patch format"));
+    }
+
+    #[test]
+    fn retry_mode_suppresses_response_created() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_ORIGINAL", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        state.prepare_for_retry();
+        let events = state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_RETRY", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 20, "output_tokens": 0}}),
+        });
+        assert!(events.is_empty(), "retry message_start should emit no events");
     }
 }
