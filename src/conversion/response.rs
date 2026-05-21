@@ -434,7 +434,14 @@ impl StreamingState {
                     item["namespace"] = json!(ns);
                 }
 
-                vec![ResponsesEvent::OutputItemAdded { output_index, item }]
+                if is_custom_tool_call {
+                    self.apply_patch_format_confirmed = false;
+                    self.buffered_apply_patch_output_index = Some(output_index);
+                    self.buffered_apply_patch_item = Some(item);
+                    vec![]
+                } else {
+                    vec![ResponsesEvent::OutputItemAdded { output_index, item }]
+                }
             }
             _ => {
                 tracing::warn!(
@@ -2073,5 +2080,23 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0]["type"], "redacted_thinking");
         assert_eq!(captured[0]["data"], "ENCRYPTED_BLOB");
+    }
+
+    // --- apply_patch retry mechanism tests ---
+
+    #[test]
+    fn apply_patch_buffered_at_start_not_emitted() {
+        let mut state = make_state();
+        state.process_event(AnthropicEvent::MessageStart {
+            message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+        });
+        let events = state.process_event(AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {}}),
+        });
+        assert!(!events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.output_item.added"
+        }), "apply_patch OutputItemAdded should be buffered, not emitted");
     }
 }
