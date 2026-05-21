@@ -101,6 +101,63 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Format error message for invalid apply_patch format.
+fn format_apply_patch_error() -> &'static str {
+    concat!(
+        "Error: apply_patch format not accepted. The patch MUST be in Codex freeform format.\n\n",
+        "Required format:\n",
+        "*** Begin Patch\n",
+        "*** Update File: <filepath>\n",
+        "-<line to remove>\n",
+        "+<line to add>\n",
+        "*** End Patch\n\n",
+        "Or for new files:\n",
+        "*** Begin Patch\n",
+        "*** Add File: <filepath>\n",
+        "+<file content>\n",
+        "*** End Patch\n\n",
+        "Or for deleted files:\n",
+        "*** Begin Patch\n",
+        "*** Delete File: <filepath>\n",
+        "*** End Patch\n\n",
+        "The FIRST line MUST be exactly '*** Begin Patch'. ",
+        "Do NOT use unified diff format (--- a/, +++ b/, @@ @@)."
+    )
+}
+
+/// Build the retry request body with captured content blocks and error message.
+fn build_retry_body(
+    original_body: &serde_json::Value,
+    captured_blocks: Vec<serde_json::Value>,
+    toolu_id: &str,
+    error_message: &str,
+) -> serde_json::Value {
+    let mut retry_body = original_body.clone();
+    let messages = retry_body
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .expect("retry body must have messages array");
+
+    // Append assistant message with all captured content blocks
+    messages.push(serde_json::json!({
+        "role": "assistant",
+        "content": captured_blocks,
+    }));
+
+    // Append user message with tool_result error
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": toolu_id,
+            "is_error": true,
+            "content": error_message,
+        }]
+    }));
+
+    retry_body
+}
+
 /// Build a reqwest client for upstream connections using the TLS/proxy config.
 fn build_upstream_client(
     config: &crate::config::UpstreamConfig,
@@ -531,6 +588,49 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "".parse().unwrap());
         assert!(extract_api_key(&headers).is_none());
+    }
+
+    // --- apply_patch helper function tests ---
+
+    #[test]
+    fn format_apply_patch_error_starts_correctly() {
+        let msg = format_apply_patch_error();
+        assert!(msg.starts_with("Error: apply_patch format not accepted"));
+        assert!(msg.contains("*** Begin Patch"));
+        assert!(msg.contains("*** Update File"));
+        assert!(msg.contains("*** Add File"));
+        assert!(msg.contains("*** Delete File"));
+        assert!(msg.contains("*** End Patch"));
+    }
+
+    #[test]
+    fn build_retry_body_appends_assistant_and_user_messages() {
+        let original = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "fix the bug"}],
+            "max_tokens": 4096,
+        });
+        let captured = vec![
+            serde_json::json!({"type": "text", "text": "I'll fix it."}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {"patch": "bad format"}}),
+        ];
+        let body = build_retry_body(&original, captured, "toolu_01", "Error message");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        // Original user message
+        assert_eq!(messages[0]["role"], "user");
+        // Appended assistant message
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"].as_array().unwrap().len(), 2);
+        // Appended user message with tool_result
+        assert_eq!(messages[2]["role"], "user");
+        let tool_result = &messages[2]["content"].as_array().unwrap()[0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["tool_use_id"], "toolu_01");
+        assert_eq!(tool_result["is_error"], true);
+        // Other fields preserved
+        assert_eq!(body["model"], "claude-sonnet-4-20250514");
+        assert_eq!(body["max_tokens"], 4096);
     }
 
     // --- Handler-level 401 tests using a test router ---
