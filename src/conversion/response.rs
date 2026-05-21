@@ -104,22 +104,49 @@ fn convert_to_freeform_patch(input: &str) -> String {
     // Parse unified diff → freeform.
     let mut out = String::from("*** Begin Patch\n");
     let mut current_file: Option<String> = None;
+    let mut is_new_file = false;
+    let mut is_delete_file = false;
     for line in trimmed.lines() {
         if let Some(path) = line.strip_prefix("--- a/") {
             // --- a/path: note the file (use the --- side for the path)
             current_file = Some(path.to_string());
+            is_new_file = false;
+            is_delete_file = false;
         } else if let Some(path) = line.strip_prefix("--- ") {
-            current_file = Some(path.to_string());
+            // --- /dev/null or other variants
+            if path == "/dev/null" {
+                // New file: path will come from the +++ line
+                current_file = None;
+                is_new_file = true;
+                is_delete_file = false;
+            } else {
+                current_file = Some(path.to_string());
+                is_new_file = false;
+                is_delete_file = false;
+            }
         } else if line.starts_with("+++ ") {
-            // +++ b/path or +++ /dev/null: use this path if we haven't seen one
+            // +++ b/path or +++ /dev/null
             let path = line.trim_start_matches("+++ b/").trim_start_matches("+++ ");
-            if current_file.is_none() {
+            if path == "/dev/null" {
+                // Delete file: path should already be set from the --- line
+                is_delete_file = true;
+            } else if current_file.is_none() {
+                // New file case: current_file not set from --- /dev/null
                 current_file = Some(path.to_string());
             }
             if let Some(ref f) = current_file {
-                out.push_str(&format!("*** Update File: {f}\n"));
+                let op = if is_new_file {
+                    "Add File"
+                } else if is_delete_file {
+                    "Delete File"
+                } else {
+                    "Update File"
+                };
+                out.push_str(&format!("*** {op}: {f}\n"));
             }
             current_file = None; // consumed
+            is_new_file = false;
+            is_delete_file = false;
         } else if line.starts_with("@@") {
             // Skip hunk header
         } else if line.starts_with("diff --git") || line.starts_with("index ") {
@@ -2491,16 +2518,16 @@ mod tests {
     #[test]
     fn freeform_add_file_dev_null() {
         // New file diff: --- /dev/null, +++ b/newfile.txt
-        // Current implementation: --- /dev/null sets current_file to "/dev/null",
-        // then +++ b/newfile.txt does NOT override current_file (it's already Some),
-        // so the output uses "/dev/null" as the file path. This documents actual behavior.
+        // Should emit *** Add File: newfile.txt with the path from the +++ line.
         let input = "--- /dev/null\n+++ b/newfile.txt\n+content";
         let result = convert_to_freeform_patch(input);
-        // The current implementation emits *** Update File: /dev/null
-        // because current_file is set by --- /dev/null and +++ doesn't override it.
         assert!(
-            result.contains("*** Update File:"),
-            "should have an Update File section"
+            result.contains("*** Add File: newfile.txt\n"),
+            "should have Add File section with correct path"
+        );
+        assert!(
+            !result.contains("*** Update File:"),
+            "should NOT use Update File for new files"
         );
         assert!(
             result.contains("+content\n"),
@@ -2513,14 +2540,16 @@ mod tests {
     #[test]
     fn freeform_delete_file() {
         // Delete file diff: --- a/oldfile.txt, +++ /dev/null
-        // current_file = "oldfile.txt" from --- line.
-        // +++ /dev/null: path becomes "/dev/null" but current_file is already Some,
-        // so *** Update File: oldfile.txt is emitted.
+        // Should emit *** Delete File: oldfile.txt with path from the --- line.
         let input = "--- a/oldfile.txt\n+++ /dev/null\n-old content";
         let result = convert_to_freeform_patch(input);
         assert!(
-            result.contains("*** Update File: oldfile.txt\n"),
-            "should use --- side path for delete"
+            result.contains("*** Delete File: oldfile.txt\n"),
+            "should use Delete File marker for deleted files"
+        );
+        assert!(
+            !result.contains("*** Update File:"),
+            "should NOT use Update File for deleted files"
         );
         assert!(
             result.contains("-old content\n"),
