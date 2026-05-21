@@ -67,8 +67,11 @@ Use Anthropic's standard tool-use retry pattern. When invalid format is detected
 
 Key insight from the conversation: the retry request includes all previously received content (text, thinking, failed apply_patch) in the assistant message. Since the model sees its own prior output, it has full context and will likely continue quickly to a corrected apply_patch. The retry response may include additional text/thinking, but multiple output items are valid in the Responses API.
 
+An important refinement: when an invalid apply_patch is detected at `content_block_stop`, we close the upstream Anthropic connection immediately — we don't wait for any subsequent content blocks. From Anthropic's perspective, it's as if the user interrupted the response. This saves token budget (no wasted generation after the failed block) and reduces latency before the retry.
+
 This approach is viable because:
 - Anthropic's tool-use conversation pattern (assistant with `tool_use` → user with `tool_result`) is a standard API feature
+- Closing the SSE connection mid-stream is equivalent to a user interrupt — Anthropic bills only for tokens generated up to that point
 - The `tx` channel is shared across retry iterations within the same tokio::spawn task
 - `StreamingState` can be put into `retry_mode` to suppress duplicate `response.created` events
 - Thinking blocks (including `redacted_thinking`) are preserved in the retry assistant message as required by Anthropic's multi-turn protocol
@@ -87,11 +90,11 @@ The current proxy attempts conversion via `convert_to_freeform_patch()` (handles
 
 ## Solution
 
-Transparent retry within a single downstream request. When an invalid apply_patch format is detected:
+Transparent retry within a single downstream request. When an invalid apply_patch format is detected at `content_block_stop`:
 
 1. Stop forwarding SSE events to Codex from the detection point
-2. Buffer the rest of the Anthropic response
-3. Construct a retry request with the full failed response as assistant message + a tool_result error containing the freeform syntax definition
+2. Immediately close the upstream Anthropic connection (saves token budget — no wasted generation after the invalid block)
+3. Construct a retry request with the received content blocks as assistant message + a tool_result error containing the freeform syntax definition
 4. Stream the retry response to Codex through the same SSE channel
 
 Codex sees one continuous SSE stream. The retry is invisible. No retry limit — every invalid apply_patch triggers a retry.
@@ -111,8 +114,9 @@ Codex request → proxy converts → Anthropic streams response
     │   │       ├─ convert_to_freeform_patch() succeeds → emit converted patch
     │   │       └─ Conversion also fails → INVALID, trigger retry
     └─ (if retry triggered)
-        ├─ Drain remaining Anthropic response
-        ├─ Construct retry: original messages + assistant(failed response) + user(tool_result error)
+        ├─ Close upstream connection immediately (like a user interrupt)
+        │   Saves tokens — no wasted generation after the invalid block
+        ├─ Construct retry: original messages + assistant(received content) + user(tool_result error)
         ├─ New Anthropic request → stream response through same tx channel
         └─ Repeat if apply_patch still invalid
 ```
@@ -207,8 +211,8 @@ New public methods:
 **Retry loop:** The current flat streaming loop becomes an outer retry loop:
 1. Create EventSource from current request body
 2. Consume SSE events, forward via tx channel
-3. If `apply_patch_invalid` detected: stop forwarding, continue consuming
-4. After stream ends: if needs_retry, construct retry body, continue outer loop
+3. If `apply_patch_invalid` detected at content_block_stop: stop forwarding, close EventSource immediately
+4. If needs_retry: construct retry body, continue outer loop (creates new EventSource)
 5. If no retry needed: break
 
 The `tx` channel is shared across all retry iterations. Codex sees one continuous SSE stream.
@@ -223,7 +227,7 @@ The `tx` channel is shared across all retry iterations. Codex sees one continuou
 | Retry also invalid | Retry again with accumulated context. No limit. |
 | Model responds with text instead of apply_patch after retry | Forward normally. Model's choice. |
 | Text/thinking already forwarded before detection | Already sent to Codex. Retry adds more items. Multiple output items are valid in Responses API. |
-| Network error during retry | Forward error via existing error handling |
+| Invalid apply_patch detected | Close upstream immediately after content_block_stop, construct retry. No tokens wasted on subsequent generation. |
 | No apply_patch in response at all | No special handling, normal flow |
 | Multiple apply_patch in one response | Each validated independently. Invalid ones trigger retry. |
 | Thinking blocks in failed response | Must be preserved in retry assistant message (including signatures and redacted_thinking) — required by Anthropic multi-turn protocol |
