@@ -627,6 +627,92 @@ mod tests {
         assert!(msg.contains("*** End Patch"));
     }
 
+    // --- Comprehensive format_apply_patch_error() tests ---
+
+    #[test]
+    fn format_apply_patch_error_starts_with_required_prefix() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.starts_with("Error: apply_patch format not accepted."),
+            "Error message must start with the exact required prefix"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_contains_begin_patch() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.contains("*** Begin Patch"),
+            "Error message must contain '*** Begin Patch'"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_contains_update_file() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.contains("*** Update File:"),
+            "Error message must contain '*** Update File:'"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_contains_add_file() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.contains("*** Add File:"),
+            "Error message must contain '*** Add File:'"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_contains_delete_file() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.contains("*** Delete File:"),
+            "Error message must contain '*** Delete File:'"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_contains_end_patch() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.contains("*** End Patch"),
+            "Error message must contain '*** End Patch'"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_warns_against_unified_diff() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.contains("Do NOT use unified diff format"),
+            "Error message must warn against unified diff format"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_states_first_line_requirement() {
+        let msg = format_apply_patch_error();
+        assert!(
+            msg.contains("The FIRST line MUST be exactly '*** Begin Patch'"),
+            "Error message must state the first line requirement"
+        );
+    }
+
+    #[test]
+    fn format_apply_patch_error_is_deterministic() {
+        let first = format_apply_patch_error();
+        let second = format_apply_patch_error();
+        assert_eq!(
+            first, second,
+            "Calling format_apply_patch_error() twice must return the same string"
+        );
+    }
+
+    // --- Comprehensive build_retry_body() tests ---
+
     #[test]
     fn build_retry_body_appends_assistant_and_user_messages() {
         let original = serde_json::json!({
@@ -655,6 +741,260 @@ mod tests {
         // Other fields preserved
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
         assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn build_retry_body_empty_captured_blocks() {
+        let original = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_empty", "some error");
+        let messages = body["messages"].as_array().unwrap();
+        // Original user + assistant (empty content) + user tool_result
+        assert_eq!(messages.len(), 3);
+        let assistant_content = messages[1]["content"].as_array().unwrap();
+        assert!(
+            assistant_content.is_empty(),
+            "Assistant content array should be empty when captured_blocks is empty"
+        );
+    }
+
+    #[test]
+    fn build_retry_body_multiple_tool_use_blocks() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "go"}],
+            "max_tokens": 256,
+        });
+        let captured = vec![
+            serde_json::json!({"type": "tool_use", "id": "toolu_a", "name": "apply_patch", "input": {"patch": "p1"}}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_b", "name": "apply_patch", "input": {"patch": "p2"}}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_c", "name": "shell", "input": {"cmd": "ls"}}),
+        ];
+        let body = build_retry_body(&original, captured, "toolu_b", "error");
+        let assistant_content = body["messages"].as_array().unwrap()[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_content.len(), 3);
+        assert_eq!(assistant_content[0]["id"], "toolu_a");
+        assert_eq!(assistant_content[1]["id"], "toolu_b");
+        assert_eq!(assistant_content[2]["id"], "toolu_c");
+    }
+
+    #[test]
+    fn build_retry_body_preserves_model_field() {
+        let original = serde_json::json!({
+            "model": "claude-opus-4-20250514",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 8192,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_1", "err");
+        assert_eq!(body["model"], "claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn build_retry_body_preserves_max_tokens_field() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 16384,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_1", "err");
+        assert_eq!(body["max_tokens"], 16384);
+    }
+
+    #[test]
+    fn build_retry_body_preserves_system_field() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+            "system": "You are a helpful assistant.",
+        });
+        let body = build_retry_body(&original, vec![], "toolu_1", "err");
+        assert_eq!(body["system"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn build_retry_body_preserves_tools_field() {
+        let tools = serde_json::json!([
+            {"name": "apply_patch", "description": "Apply a patch"},
+            {"name": "shell", "description": "Run a shell command"},
+        ]);
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+            "tools": tools,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_1", "err");
+        assert_eq!(body["tools"], tools);
+    }
+
+    #[test]
+    fn build_retry_body_preserves_thinking_field() {
+        let thinking = serde_json::json!({
+            "type": "enabled",
+            "budget_tokens": 5000,
+        });
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+            "thinking": thinking,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_1", "err");
+        assert_eq!(body["thinking"], thinking);
+    }
+
+    #[test]
+    fn build_retry_body_user_message_has_correct_role_and_structure() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_99", "err");
+        let messages = body["messages"].as_array().unwrap();
+        let user_msg = &messages[2];
+        assert_eq!(user_msg["role"], "user");
+        let content = user_msg["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "User message content must be an array with one block");
+    }
+
+    #[test]
+    fn build_retry_body_tool_result_has_is_error_true() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_err", "some error");
+        let tool_result = &body["messages"].as_array().unwrap()[2]["content"].as_array().unwrap()[0];
+        assert_eq!(tool_result["is_error"], true);
+    }
+
+    #[test]
+    fn build_retry_body_tool_result_has_correct_tool_use_id() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+        });
+        let body = build_retry_body(&original, vec![], "toolu_abc123", "err");
+        let tool_result = &body["messages"].as_array().unwrap()[2]["content"].as_array().unwrap()[0];
+        assert_eq!(tool_result["tool_use_id"], "toolu_abc123");
+    }
+
+    #[test]
+    fn build_retry_body_tool_result_contains_error_message() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+        });
+        let error_msg = format_apply_patch_error();
+        let body = build_retry_body(&original, vec![], "toolu_1", error_msg);
+        let tool_result = &body["messages"].as_array().unwrap()[2]["content"].as_array().unwrap()[0];
+        let content = tool_result["content"].as_str().unwrap();
+        assert!(
+            content.contains("apply_patch format not accepted"),
+            "Tool result content must contain the apply_patch error message"
+        );
+        assert!(
+            content.contains("*** Begin Patch"),
+            "Tool result content must contain the patch format instructions"
+        );
+    }
+
+    #[test]
+    fn build_retry_body_preserves_thinking_text_and_tool_use_in_order() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+        });
+        let captured = vec![
+            serde_json::json!({"type": "thinking", "thinking": "Let me reason about this..."}),
+            serde_json::json!({"type": "text", "text": "Here's my answer."}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {"patch": "*** Begin Patch\n*** End Patch"}}),
+        ];
+        let body = build_retry_body(&original, captured, "toolu_01", "bad patch");
+        let assistant_content = body["messages"].as_array().unwrap()[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_content.len(), 3);
+        assert_eq!(assistant_content[0]["type"], "thinking");
+        assert_eq!(assistant_content[0]["thinking"], "Let me reason about this...");
+        assert_eq!(assistant_content[1]["type"], "text");
+        assert_eq!(assistant_content[1]["text"], "Here's my answer.");
+        assert_eq!(assistant_content[2]["type"], "tool_use");
+        assert_eq!(assistant_content[2]["id"], "toolu_01");
+    }
+
+    #[test]
+    fn build_retry_body_preserves_redacted_thinking_with_data_field() {
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1024,
+        });
+        let captured = vec![
+            serde_json::json!({"type": "redacted_thinking", "data": "base64encodeddata=="}),
+        ];
+        let body = build_retry_body(&original, captured, "toolu_1", "err");
+        let assistant_content = body["messages"].as_array().unwrap()[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_content.len(), 1);
+        assert_eq!(assistant_content[0]["type"], "redacted_thinking");
+        assert_eq!(assistant_content[0]["data"], "base64encodeddata==");
+    }
+
+    // --- Multi-retry accumulation test ---
+
+    #[test]
+    fn build_retry_body_accumulates_across_two_retries() {
+        // Simulate an original body with one user message.
+        let original = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "fix the bug"}],
+            "max_tokens": 4096,
+        });
+
+        // First retry: captured blocks from the first response.
+        let first_captured = vec![
+            serde_json::json!({"type": "text", "text": "Attempting fix."}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_01", "name": "apply_patch", "input": {"patch": "bad1"}}),
+        ];
+        let first_retry = build_retry_body(&original, first_captured, "toolu_01", "first error");
+        assert_eq!(first_retry["messages"].as_array().unwrap().len(), 3);
+
+        // Second retry: use the first retry body as the "original" and retry again.
+        let second_captured = vec![
+            serde_json::json!({"type": "text", "text": "Second attempt."}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_02", "name": "apply_patch", "input": {"patch": "bad2"}}),
+        ];
+        let second_retry =
+            build_retry_body(&first_retry, second_captured, "toolu_02", "second error");
+        let messages = second_retry["messages"].as_array().unwrap();
+        // Expected: original user + 1st assistant + 1st user_tool_result + 2nd assistant + 2nd user_tool_result
+        assert_eq!(messages.len(), 5);
+        // Verify ordering and roles.
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[4]["role"], "user");
+        // Verify first tool_result points to toolu_01.
+        let first_tool_result = &messages[2]["content"].as_array().unwrap()[0];
+        assert_eq!(first_tool_result["tool_use_id"], "toolu_01");
+        assert_eq!(first_tool_result["is_error"], true);
+        assert_eq!(first_tool_result["content"], "first error");
+        // Verify second tool_result points to toolu_02.
+        let second_tool_result = &messages[4]["content"].as_array().unwrap()[0];
+        assert_eq!(second_tool_result["tool_use_id"], "toolu_02");
+        assert_eq!(second_tool_result["is_error"], true);
+        assert_eq!(second_tool_result["content"], "second error");
+        // Verify top-level fields still preserved after two retries.
+        assert_eq!(second_retry["model"], "claude-sonnet-4-20250514");
+        assert_eq!(second_retry["max_tokens"], 4096);
     }
 
     // --- Handler-level 401 tests using a test router ---
