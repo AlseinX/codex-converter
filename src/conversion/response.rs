@@ -831,8 +831,14 @@ impl StreamingState {
             .take()
             .unwrap_or_else(|| "end_turn".to_string());
 
-        // Always "completed", never "incomplete" (B2 critical constraint).
-        let status = "completed";
+        // Determine if the response is incomplete.
+        let is_incomplete =
+            stop_reason == "max_tokens" || stop_reason == "model_context_window_exceeded";
+        let status = if is_incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
 
         // Build usage object.
         let total_tokens = self.input_tokens + self.output_tokens;
@@ -845,7 +851,7 @@ impl StreamingState {
             usage["input_tokens_details"] = json!({"cached_tokens": self.cache_read_tokens});
         }
 
-        // Build response object for response.completed.
+        // Build response object for response.completed or response.incomplete.
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
@@ -859,7 +865,7 @@ impl StreamingState {
         });
 
         // Incomplete details when max_tokens or model_context_window_exceeded.
-        if stop_reason == "max_tokens" || stop_reason == "model_context_window_exceeded" {
+        if is_incomplete {
             response_obj["incomplete_details"] = json!({"reason": "max_output_tokens"});
         }
 
@@ -870,9 +876,15 @@ impl StreamingState {
             response_obj["instructions"] = json!(instructions);
         }
 
-        vec![ResponsesEvent::ResponseCompleted {
-            response: response_obj,
-        }]
+        if is_incomplete {
+            vec![ResponsesEvent::ResponseIncomplete {
+                response: response_obj,
+            }]
+        } else {
+            vec![ResponsesEvent::ResponseCompleted {
+                response: response_obj,
+            }]
+        }
     }
 
     fn handle_error(&mut self, error: Value) -> Vec<ResponsesEvent> {
@@ -967,7 +979,7 @@ mod tests {
         )
     }
 
-    /// Helper: run a full text stream and return the response.completed data.
+    /// Helper: run a full text stream and return the terminal event data.
     fn run_text_stream(text: &str, stop_reason: &str) -> (Vec<ResponsesEvent>, serde_json::Value) {
         let mut state = make_state();
         let mut all_events = Vec::new();
@@ -990,14 +1002,15 @@ mod tests {
         }));
         all_events.extend(state.process_event(AnthropicEvent::MessageStop));
 
-        let completed = all_events
+        // Find the terminal event (response.completed or response.incomplete).
+        let terminal = all_events
             .iter()
             .find(|e| {
                 let (t, _) = e.to_sse();
-                t == "response.completed"
+                t == "response.completed" || t == "response.incomplete"
             })
             .unwrap();
-        let (_, data) = completed.to_sse();
+        let (_, data) = terminal.to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         (all_events, parsed)
     }
@@ -1175,10 +1188,10 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // --- Completion always response.completed ---
+    // --- Completion produces response.completed for normal stop reasons ---
 
     #[test]
-    fn completion_always_response_completed() {
+    fn completion_end_turn_produces_response_completed() {
         let mut state = make_state();
         state.process_event(AnthropicEvent::MessageStart {
             message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
@@ -1196,17 +1209,34 @@ mod tests {
                 let (t, _) = e.to_sse();
                 t == "response.completed"
             }),
-            "message_stop must produce response.completed, NEVER response.incomplete"
+            "message_stop with end_turn must produce response.completed"
         );
     }
 
     #[test]
-    fn max_tokens_still_response_completed() {
-        let (_, parsed) = run_text_stream("partial", "max_tokens");
-        assert_eq!(parsed["response"]["status"], "completed");
+    fn max_tokens_produces_response_incomplete() {
+        let (events, parsed) = run_text_stream("partial", "max_tokens");
+        assert_eq!(parsed["response"]["status"], "incomplete");
         assert_eq!(
             parsed["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
+        );
+        // Verify the event type is response.incomplete, not response.completed.
+        let has_incomplete = events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.incomplete"
+        });
+        assert!(
+            has_incomplete,
+            "max_tokens must produce response.incomplete"
+        );
+        let has_completed = events.iter().any(|e| {
+            let (t, _) = e.to_sse();
+            t == "response.completed"
+        });
+        assert!(
+            !has_completed,
+            "max_tokens must NOT produce response.completed"
         );
     }
 
@@ -1609,7 +1639,7 @@ mod tests {
     // --- model_context_window_exceeded produces incomplete_details ---
 
     #[test]
-    fn model_context_window_exceeded_has_incomplete_details() {
+    fn model_context_window_exceeded_produces_response_incomplete() {
         let mut state = make_state();
         state.process_event(AnthropicEvent::MessageStart {
             message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 100, "output_tokens": 0}}),
@@ -1621,11 +1651,13 @@ mod tests {
         let events = state.process_event(AnthropicEvent::MessageStop);
         let (_, data) = events[0].to_sse();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["response"]["status"], "completed");
+        assert_eq!(parsed["response"]["status"], "incomplete");
         assert_eq!(
             parsed["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
         );
+        // Verify the event type is response.incomplete.
+        assert_eq!(parsed["type"], "response.incomplete");
     }
 
     // --- message_start updates response_id ---
@@ -1816,20 +1848,17 @@ mod tests {
     }
 
     #[test]
-    fn all_stop_reasons_produce_response_completed() {
-        // CRITICAL: NEVER emit response.incomplete. Every stop_reason must produce
-        // response.completed. Test all known Anthropic stop reasons.
-        let stop_reasons = vec![
+    fn completed_stop_reasons_produce_response_completed() {
+        // These stop_reasons produce response.completed with status "completed".
+        let completed_reasons = vec![
             "end_turn",
-            "max_tokens",
             "stop_sequence",
             "tool_use",
             "pause_turn",
             "refusal",
-            "model_context_window_exceeded",
         ];
 
-        for sr in &stop_reasons {
+        for sr in &completed_reasons {
             let mut state = make_state();
             state.process_event(AnthropicEvent::MessageStart {
                 message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
@@ -1854,18 +1883,18 @@ mod tests {
                 sr, completed_count
             );
 
-            // Must NEVER have response.incomplete.
+            // Must NOT have response.incomplete.
             let has_incomplete = events.iter().any(|e| {
                 let (t, _) = e.to_sse();
                 t == "response.incomplete"
             });
             assert!(
                 !has_incomplete,
-                "stop_reason='{}' must NEVER produce response.incomplete",
+                "stop_reason='{}' must NOT produce response.incomplete",
                 sr
             );
 
-            // Status must be "completed" for all stop reasons.
+            // Status must be "completed".
             let (_, data) = events
                 .iter()
                 .find(|e| {
@@ -1879,6 +1908,70 @@ mod tests {
                 parsed["response"]["status"], "completed",
                 "stop_reason='{}' must have status 'completed', got '{}'",
                 sr, parsed["response"]["status"]
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_stop_reasons_produce_response_incomplete() {
+        // These stop_reasons produce response.incomplete with status "incomplete".
+        let incomplete_reasons = vec!["max_tokens", "model_context_window_exceeded"];
+
+        for sr in &incomplete_reasons {
+            let mut state = make_state();
+            state.process_event(AnthropicEvent::MessageStart {
+                message: json!({"id": "msg_test", "type": "message", "role": "assistant", "content": [], "model": "m", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 10, "output_tokens": 0}}),
+            });
+            state.process_event(AnthropicEvent::MessageDelta {
+                delta: json!({"stop_reason": sr, "stop_sequence": null}),
+                usage: json!({"output_tokens": 5}),
+            });
+            let events = state.process_event(AnthropicEvent::MessageStop);
+
+            // Must have exactly one response.incomplete event.
+            let incomplete_count = events
+                .iter()
+                .filter(|e| {
+                    let (t, _) = e.to_sse();
+                    t == "response.incomplete"
+                })
+                .count();
+            assert_eq!(
+                incomplete_count, 1,
+                "stop_reason='{}' must produce exactly one response.incomplete, got {}",
+                sr, incomplete_count
+            );
+
+            // Must NOT have response.completed.
+            let has_completed = events.iter().any(|e| {
+                let (t, _) = e.to_sse();
+                t == "response.completed"
+            });
+            assert!(
+                !has_completed,
+                "stop_reason='{}' must NOT produce response.completed",
+                sr
+            );
+
+            // Status must be "incomplete" with incomplete_details.
+            let (_, data) = events
+                .iter()
+                .find(|e| {
+                    let (t, _) = e.to_sse();
+                    t == "response.incomplete"
+                })
+                .unwrap()
+                .to_sse();
+            let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(
+                parsed["response"]["status"], "incomplete",
+                "stop_reason='{}' must have status 'incomplete', got '{}'",
+                sr, parsed["response"]["status"]
+            );
+            assert_eq!(
+                parsed["response"]["incomplete_details"]["reason"], "max_output_tokens",
+                "stop_reason='{}' must have incomplete_details.reason 'max_output_tokens'",
+                sr
             );
         }
     }

@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 ///
 /// CRITICAL CONSTRAINTS:
 /// - NEVER include `sequence_number` in any event (Codex ignores it, adds wire overhead).
-/// - NEVER emit `response.incomplete` -- always use `response.completed`.
 /// - NEVER emit `custom_tool_call_input.*` events -- all tools are function type.
 /// - `response.failed` must carry a FULL response object with error inside.
 #[derive(Debug)]
@@ -94,6 +93,9 @@ pub enum ResponsesEvent {
 
     // -- Terminal events --
     ResponseCompleted {
+        response: Value,
+    },
+    ResponseIncomplete {
         response: Value,
     },
     ResponseFailed {
@@ -337,13 +339,21 @@ impl ResponsesEvent {
                 )
             }
 
-            // CRITICAL: Always response.completed, NEVER response.incomplete.
             ResponsesEvent::ResponseCompleted { response } => {
                 let data = json!({
                     "type": "response.completed",
                     "response": response,
                 });
                 ("response.completed".to_string(), data.to_string())
+            }
+
+            // Emitted when stop_reason is max_tokens or model_context_window_exceeded.
+            ResponsesEvent::ResponseIncomplete { response } => {
+                let data = json!({
+                    "type": "response.incomplete",
+                    "response": response,
+                });
+                ("response.incomplete".to_string(), data.to_string())
             }
 
             // CRITICAL: response.failed carries FULL response object with error inside.
@@ -575,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn response_completed_never_incomplete() {
+    fn response_completed_event() {
         let response_obj = json!({
             "id": "msg_01",
             "object": "response",
@@ -587,35 +597,35 @@ mod tests {
             response: response_obj,
         };
         let (event_type, data) = evt.to_sse();
-        assert_eq!(
-            event_type, "response.completed",
-            "NEVER emit response.incomplete"
-        );
+        assert_eq!(event_type, "response.completed");
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["type"], "response.completed");
         assert!(parsed.get("sequence_number").is_none());
     }
 
     #[test]
-    fn response_completed_with_incomplete_details() {
+    fn response_incomplete_event() {
         let response_obj = json!({
             "id": "msg_01",
-            "status": "completed",
+            "object": "response",
+            "status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"},
             "output": [],
             "usage": {"input_tokens": 100, "output_tokens": 4096, "total_tokens": 4196}
         });
-        let evt = ResponsesEvent::ResponseCompleted {
+        let evt = ResponsesEvent::ResponseIncomplete {
             response: response_obj,
         };
         let (event_type, data) = evt.to_sse();
-        assert_eq!(event_type, "response.completed");
+        assert_eq!(event_type, "response.incomplete");
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["response"]["status"], "completed");
+        assert_eq!(parsed["type"], "response.incomplete");
+        assert_eq!(parsed["response"]["status"], "incomplete");
         assert_eq!(
             parsed["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
         );
+        assert!(parsed.get("sequence_number").is_none());
     }
 
     #[test]
@@ -748,6 +758,9 @@ mod tests {
                 arguments: "x".into(),
             },
             ResponsesEvent::ResponseCompleted {
+                response: json!({}),
+            },
+            ResponsesEvent::ResponseIncomplete {
                 response: json!({}),
             },
             ResponsesEvent::ResponseFailed {
