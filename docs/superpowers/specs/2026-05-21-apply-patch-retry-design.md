@@ -76,11 +76,16 @@ This approach is viable because:
 - `StreamingState` can be put into `retry_mode` to suppress duplicate `response.created` events
 - Thinking blocks (including `redacted_thinking`) are preserved in the retry assistant message as required by Anthropic's multi-turn protocol
 
-### Additional Optimizations
+### Format Detection Logic
 
-**Early detection**: The `*** Begin Patch` marker is unambiguous. As `input_json_delta` fragments accumulate in `arguments_accumulator`, we check for this marker. Once found, the format is confirmed valid and we release the buffered `OutputItemAdded` event, resuming normal streaming. This minimizes the buffering window for the common case (valid format).
+Format detection is the core decision mechanism. It happens during delta accumulation, not at content_block_stop. The logic is intentionally simple and binary:
 
-**Unified diff fallback**: Before declaring a patch invalid, we still try `convert_to_freeform_patch()`. If the conversion produces valid freeform format, we use it without retry. This handles the second most common case efficiently.
+**During each `input_json_delta` for an apply_patch block:**
+- Check if the accumulated `arguments_accumulator` contains `*** Begin Patch`
+- If found: `apply_patch_format_confirmed = true`. Release buffered OutputItemAdded. Resume streaming. No further format checks.
+- If enough content has accumulated to be certain it's NOT freeform (e.g., starts with `--- a/`, starts with a non-patch string, starts with `{` that doesn't contain `*** Begin Patch` after sufficient accumulation): `apply_patch_invalid = true`. No conversion attempt, no second chance.
+
+There is no middle ground. The format is either freeform or it's not. We do NOT attempt `convert_to_freeform_patch()` as a silent fallback — the model should learn to produce the correct format. The `convert_to_freeform_patch()` function remains in the codebase but is only used for non-retry scenarios (e.g., if the proxy decides not to retry for some reason).
 
 ## Problem
 
@@ -90,10 +95,15 @@ The current proxy attempts conversion via `convert_to_freeform_patch()` (handles
 
 ## Solution
 
-Transparent retry within a single downstream request. When an invalid apply_patch format is detected at `content_block_stop`:
+Transparent retry within a single downstream request. Format validation happens early — as soon as `input_json_delta` fragments arrive. The logic is binary:
 
-1. Stop forwarding SSE events to Codex from the detection point
-2. Immediately close the upstream Anthropic connection (saves token budget — no wasted generation after the invalid block)
+- If accumulated content contains `*** Begin Patch` → valid, release buffer, resume streaming. No further checks.
+- If the content clearly does not start with freeform format → invalid, declared immediately. No conversion attempt, no waiting for content_block_stop.
+
+Once invalid format is declared:
+
+1. Stop forwarding SSE events to Codex
+2. Wait for `content_block_stop` (complete the current block so the Anthropic response is in a clean state), then immediately close the upstream connection (saves token budget — no wasted generation after the invalid block)
 3. Construct a retry request with the received content blocks as assistant message + a tool_result error containing the freeform syntax definition
 4. Stream the retry response to Codex through the same SSE channel
 
@@ -106,16 +116,17 @@ Codex sees one continuous SSE stream. The retry is invisible. No retry limit —
 ```
 Codex request → proxy converts → Anthropic streams response
     ├─ text/thinking blocks → forwarded immediately
-    ├─ apply_patch tool_use detected
+    ├─ apply_patch tool_use detected (content_block_start)
     │   ├─ Buffer OutputItemAdded (don't emit yet)
-    │   ├─ Accumulate deltas, check for "*** Begin Patch"
-    │   │   ├─ Found early → release buffer, continue streaming
-    │   │   └─ content_block_stop reached without finding it
-    │   │       ├─ convert_to_freeform_patch() succeeds → emit converted patch
-    │   │       └─ Conversion also fails → INVALID, trigger retry
+    │   ├─ Accumulate deltas (input_json_delta)
+    │   │   ├─ Contains "*** Begin Patch" → VALID
+    │   │   │   ├─ Release buffer, resume streaming
+    │   │   │   └─ content_block_stop → emit OutputItemDone
+    │   │   └─ Clearly NOT freeform format → INVALID (declared immediately)
+    │   │       ├─ No conversion attempt, no further checks
+    │   │       ├─ Wait for content_block_stop (clean block boundary)
+    │   │       └─ Close upstream connection (like user interrupt)
     └─ (if retry triggered)
-        ├─ Close upstream connection immediately (like a user interrupt)
-        │   Saves tokens — no wasted generation after the invalid block
         ├─ Construct retry: original messages + assistant(received content) + user(tool_result error)
         ├─ New Anthropic request → stream response through same tx channel
         └─ Repeat if apply_patch still invalid
@@ -174,7 +185,7 @@ New fields:
 |-------|------|---------|
 | `anthropic_content_blocks` | `Vec<Value>` | Always-captured Anthropic content blocks for retry assistant message |
 | `retry_mode` | `bool` | Skip response.created/in_progress on retry response |
-| `apply_patch_invalid` | `bool` | Set at content_block_stop when format is invalid |
+| `apply_patch_invalid` | `bool` | Set during delta accumulation when format is clearly not freeform. content_block_stop uses this as the signal to close upstream. |
 | `buffered_apply_patch_item` | `Option<Value>` | Held-back OutputItemAdded for apply_patch |
 | `buffered_apply_patch_output_index` | `Option<usize>` | Output index at content_block_start time |
 | `apply_patch_format_confirmed` | `bool` | `*** Begin Patch` detected in accumulated deltas |
@@ -191,12 +202,13 @@ New public methods:
 
 **content_block_start (apply_patch):** Buffer OutputItemAdded instead of emitting. Record output_index.
 
-**content_block_delta (apply_patch):** Accumulate silently. Check if accumulated content contains `*** Begin Patch`. If found: set `apply_patch_format_confirmed`, release buffered OutputItemAdded.
+**content_block_delta (apply_patch):** Accumulate silently in `arguments_accumulator`. Two outcomes:
+- Accumulated content contains `*** Begin Patch` → set `apply_patch_format_confirmed`, release buffered OutputItemAdded. From this point, normal streaming resumes (deltas still accumulated silently, OutputItemDone emitted at content_block_stop).
+- Accumulated content clearly does NOT start with freeform format (enough content received to be certain) → set `apply_patch_invalid` immediately. No conversion attempt. The remaining deltas continue to be consumed but no events are emitted.
 
 **content_block_stop (apply_patch):**
-- If format_confirmed: emit OutputItemDone with raw patch. Normal flow.
-- If not confirmed: try `convert_to_freeform_patch()`. If result starts with `*** Begin Patch`: emit converted patch. Normal flow.
-- If conversion also fails: set `apply_patch_invalid`. Emit nothing. Router handles retry.
+- If `apply_patch_format_confirmed`: emit OutputItemDone with raw patch. Normal flow.
+- If `apply_patch_invalid`: this is the signal to close the upstream connection. The router detects this flag, closes EventSource, and begins retry. No events emitted for this block.
 
 **content_block_stop (all blocks):** Push Anthropic-format content block to `anthropic_content_blocks` for potential retry.
 
@@ -211,7 +223,7 @@ New public methods:
 **Retry loop:** The current flat streaming loop becomes an outer retry loop:
 1. Create EventSource from current request body
 2. Consume SSE events, forward via tx channel
-3. If `apply_patch_invalid` detected at content_block_stop: stop forwarding, close EventSource immediately
+3. If `apply_patch_invalid` detected during delta accumulation: stop forwarding, continue consuming silently until `content_block_stop`, then close EventSource
 4. If needs_retry: construct retry body, continue outer loop (creates new EventSource)
 5. If no retry needed: break
 
@@ -221,9 +233,9 @@ The `tx` channel is shared across all retry iterations. Codex sees one continuou
 
 | Scenario | Behavior |
 |----------|----------|
-| Valid freeform on first try | Early detection releases buffer, normal streaming, no retry |
-| Unified diff format | `convert_to_freeform_patch()` converts at content_block_stop, no retry |
-| Unrecognized format | Retry with error message + freeform syntax definition |
+| Valid freeform on first try | Early detection (`*** Begin Patch` in deltas) releases buffer, normal streaming, no retry |
+| Unified diff format | Not freeform → retry. The model is told the correct format via tool_result error. |
+| Any non-freeform format | Retry with error message + freeform syntax definition |
 | Retry also invalid | Retry again with accumulated context. No limit. |
 | Model responds with text instead of apply_patch after retry | Forward normally. Model's choice. |
 | Text/thinking already forwarded before detection | Already sent to Codex. Retry adds more items. Multiple output items are valid in Responses API. |
