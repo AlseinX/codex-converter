@@ -38,13 +38,13 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 
 ## 代理配置
 
-配置优先级从低到高：
+配置优先级从高到低：
 
-1. 代码默认值
-2. YAML 配置文件（`-c`）
+1. CLI `-C` 覆盖项
+2. CLI 便捷参数（`--listen`、`--upstream-tls-extra-ca-certs`）
 3. 环境变量（`CODEX_CONV_` 前缀）
-4. CLI 便捷参数（`--listen`、`--upstream-tls-extra-ca-certs`）
-5. CLI `-C` 覆盖项（最高优先级）
+4. YAML 配置文件（`-c`）
+5. 代码默认值
 
 ### CLI 参数
 

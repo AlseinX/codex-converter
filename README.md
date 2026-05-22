@@ -38,13 +38,13 @@ The proxy extracts the upstream host from the URL path (`/https/<host>/responses
 
 ## Proxy Configuration
 
-Configuration priority (lowest to highest):
+Configuration priority (highest to lowest):
 
-1. Code defaults
-2. YAML config file (`-c`)
+1. CLI `-C` overrides
+2. CLI convenience flags (`--listen`, `--upstream-tls-extra-ca-certs`)
 3. Environment variables (`CODEX_CONV_` prefix)
-4. CLI convenience flags (`--listen`, `--upstream-tls-extra-ca-certs`)
-5. CLI `-C` overrides (highest)
+4. YAML config file (`-c`)
+5. Code defaults
 
 ### CLI
 
