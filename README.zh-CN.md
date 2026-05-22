@@ -23,8 +23,6 @@ model_provider = "anthropic-proxy"
 [model_providers.anthropic-proxy]
 name = "Anthropic via codex-conv"
 base_url = "http://localhost:8080/https/api.anthropic.com"
-wire_api = "responses"
-env_key = "ANTHROPIC_API_KEY"
 ```
 
 ### 2. 编辑 `~/.codex/auth.json`
@@ -125,7 +123,7 @@ http://<proxy>/https/<host>/models/<model-id>  → GET  https://<host>/v1/models
 http://<proxy>/http/<host>/responses           → POST http://<host>/v1/messages
 ```
 
-`/v1` 前缀可选。`/http/` 用于 HTTP 上游（如反向代理链）。
+`/http/` 用于 HTTP 上游（如反向代理链）。
 
 ## Models API 双模式
 

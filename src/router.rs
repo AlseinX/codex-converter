@@ -32,16 +32,13 @@ impl RouteInfo {
     /// - `/https/api.anthropic.com/responses` (HTTPS upstream, default)
     /// - `/https:/api.anthropic.com/responses`
     /// - `/https://api.anthropic.com/responses`
-    /// - `/v1/https/api.anthropic.com/responses`
     /// - `/http/127.0.0.1:12345/responses` (HTTP upstream, for reverse proxy chaining)
     /// - `/https/api.anthropic.com/models`
     /// - `/https/api.anthropic.com/models/claude-sonnet-4-20250514`
     ///
     /// Returns None if the path does not match a known route or the host is missing.
     pub fn parse(path: &str) -> Option<Self> {
-        let stripped = path.strip_prefix("/v1").unwrap_or(path);
-
-        let (scheme, host_and_rest) = if let Some(rest) = stripped.strip_prefix("/http") {
+        let (scheme, host_and_rest) = if let Some(rest) = path.strip_prefix("/http") {
             if let Some(s) = rest.strip_prefix('/') {
                 ("http", s)
             } else if let Some(s) = rest.strip_prefix("s") {
@@ -1010,12 +1007,6 @@ mod tests {
     #[test]
     fn extracts_upstream_base_url_double_slash() {
         let route = RouteInfo::parse("/https://api.anthropic.com/responses").unwrap();
-        assert_eq!(route.upstream_base_url, "https://api.anthropic.com");
-    }
-
-    #[test]
-    fn extracts_upstream_base_url_with_v1_prefix() {
-        let route = RouteInfo::parse("/v1/https/api.anthropic.com/responses").unwrap();
         assert_eq!(route.upstream_base_url, "https://api.anthropic.com");
     }
 

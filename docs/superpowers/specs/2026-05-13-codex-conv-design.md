@@ -138,13 +138,10 @@ Codex base URL: `https://my.domain/https/api.anthropic.com`
 
 Codex appends `responses`, sends to: `https://my.domain/https/api.anthropic.com/responses`
 
-Note: the `/v1/` prefix commonly seen in Codex requests (e.g., `/v1/responses`) comes from the user-configured `base_url` in Codex config (typically ending in `/v1`), not from Codex itself. Codex appends only `responses`. The proxy should accept paths ending in `/responses` regardless of prefix.
-
 Protocol normalization (all accepted):
 - `/https/api.anthropic.com/responses`
 - `/https:/api.anthropic.com/responses`
 - `/https://api.anthropic.com/responses`
-- `/v1/https/api.anthropic.com/responses` (if base_url includes `/v1`)
 
 Proxy extracts:
 - Upstream base URL: `https://api.anthropic.com` (no `/v1`, follows Anthropic convention)

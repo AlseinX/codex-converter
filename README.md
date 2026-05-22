@@ -23,8 +23,6 @@ model_provider = "anthropic-proxy"
 [model_providers.anthropic-proxy]
 name = "Anthropic via codex-conv"
 base_url = "http://localhost:8080/https/api.anthropic.com"
-wire_api = "responses"
-env_key = "ANTHROPIC_API_KEY"
 ```
 
 ### 2. Edit `~/.codex/auth.json`
@@ -125,7 +123,7 @@ http://<proxy>/https/<host>/models/<model-id>  → GET  https://<host>/v1/models
 http://<proxy>/http/<host>/responses           → POST http://<host>/v1/messages
 ```
 
-An optional `/v1` prefix is accepted. The `/http/` scheme enables chaining behind another reverse proxy over plain HTTP.
+The `/http/` scheme enables chaining behind another reverse proxy over plain HTTP.
 
 ## Models API
 
