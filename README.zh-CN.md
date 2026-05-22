@@ -41,8 +41,6 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 | | codex-conv | [CLIProxyAPI] | [Tokligence GW] | [CC-Adapter] | [claude-code-proxy] | [LiteLLM] |
 |---|---|---|---|---|---|---|
 | 转换方向 | Responses→Anthropic | 双向 | Responses→Anthropic | Anthropic→其他 | Anthropic→其他 | 统一接口 |
-| 流式 | Yes | Yes | Yes | Yes | Yes | Yes |
-| 多轮对话 | Yes | Yes | Yes | Yes | Yes | Yes |
 | 工具调用 | Yes | 部分 | 部分 | 部分 | Yes | Yes |
 | apply_patch | Yes | No | No | No | No | No |
 | Models API | Yes | Yes | No | No | No | No |

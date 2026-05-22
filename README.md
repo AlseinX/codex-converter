@@ -41,8 +41,6 @@ The proxy extracts the upstream host from the URL path (`/https/<host>/responses
 | | codex-conv | [CLIProxyAPI] | [Tokligence GW] | [CC-Adapter] | [claude-code-proxy] | [LiteLLM] |
 |---|---|---|---|---|---|---|
 | Direction | Responses→Anthropic | Both | Responses→Anthropic | Anthropic→Others | Anthropic→Others | Unified |
-| Streaming | Yes | Yes | Yes | Yes | Yes | Yes |
-| Multi-turn | Yes | Yes | Yes | Yes | Yes | Yes |
 | Tool calls | Yes | Partial | Partial | Partial | Yes | Yes |
 | apply_patch | Yes | No | No | No | No | No |
 | Models API | Yes | Yes | No | No | No | No |
