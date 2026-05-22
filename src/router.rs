@@ -28,27 +28,44 @@ pub struct RouteInfo {
 impl RouteInfo {
     /// Parse the request path to extract the upstream base URL and route type.
     ///
-    /// Accepted formats (all normalized to `https://host`):
+    /// Accepted formats (all normalized to `https://host` unless `/http/` prefix is used):
     /// - `/https/api.anthropic.com/responses`
     /// - `/https:/api.anthropic.com/responses`
     /// - `/https://api.anthropic.com/responses`
     /// - `/v1/https/api.anthropic.com/responses`
+    /// - `/http/127.0.0.1:12345/responses` (plain HTTP, for testing)
     /// - `/https/api.anthropic.com/models`
     /// - `/https/api.anthropic.com/models/claude-sonnet-4-20250514`
     ///
     /// Returns None if the path does not match a known route or the host is missing.
     pub fn parse(path: &str) -> Option<Self> {
         let stripped = path.strip_prefix("/v1").unwrap_or(path);
-        let after_https = stripped.strip_prefix("/https")?;
 
-        let host_and_rest = if let Some(s) = after_https.strip_prefix("://") {
-            s
-        } else if let Some(s) = after_https.strip_prefix(":/") {
-            s
+        // Detect scheme: /http/ -> plain HTTP, /https/ -> HTTPS (default).
+        let (scheme, after_scheme) = if let Some(rest) = stripped.strip_prefix("/http") {
+            // Must distinguish /http/ from /https — check the next character.
+            if let Some(s) = rest.strip_prefix('/') {
+                // /http/host/... — plain HTTP.
+                ("http", s)
+            } else if let Some(s) = rest.strip_prefix("s") {
+                // /https... — fall through to HTTPS parsing below.
+                let after_https = s;
+                let host_and_rest = if let Some(s) = after_https.strip_prefix("://") {
+                    s
+                } else if let Some(s) = after_https.strip_prefix(":/") {
+                    s
+                } else {
+                    after_https.strip_prefix('/')?
+                };
+                ("https", host_and_rest)
+            } else {
+                return None;
+            }
         } else {
-            after_https.strip_prefix('/')?
+            return None;
         };
 
+        let host_and_rest = after_scheme;
         if host_and_rest.is_empty() {
             return None;
         }
@@ -62,7 +79,7 @@ impl RouteInfo {
             return None;
         }
 
-        let upstream_base_url = format!("https://{}", host);
+        let upstream_base_url = format!("{}://{}", scheme, host);
 
         let (route_type, model_id) = if rest.is_empty() {
             return None;
@@ -219,15 +236,14 @@ async fn handle_models_standard(
 
     match &route_info.route_type {
         RouteType::ModelsList => {
-            let url = route_info.upstream_models_list_url();
-            let mut request_builder = client
+            let url = match query_string {
+                Some(ref q) => format!("{}?{}", route_info.upstream_models_list_url(), q),
+                None => route_info.upstream_models_list_url(),
+            };
+            let request_builder = client
                 .get(&url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", anthropic_version);
-
-            if let Some(query) = query_string {
-                request_builder = request_builder.query(query);
-            }
 
             let resp = request_builder
                 .timeout(std::time::Duration::from_secs(30))
@@ -319,15 +335,14 @@ async fn handle_models_catalog(
 
     match &route_info.route_type {
         RouteType::ModelsList => {
-            let url = route_info.upstream_models_list_url();
-            let mut request_builder = client
+            let url = match query_string {
+                Some(ref q) => format!("{}?{}", route_info.upstream_models_list_url(), q),
+                None => route_info.upstream_models_list_url(),
+            };
+            let request_builder = client
                 .get(&url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", anthropic_version);
-
-            if let Some(query) = query_string {
-                request_builder = request_builder.query(query);
-            }
 
             let resp = request_builder
                 .timeout(std::time::Duration::from_secs(30))

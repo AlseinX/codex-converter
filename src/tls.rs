@@ -54,10 +54,14 @@ pub fn build_upstream_tls_config(
         }
     }
 
-    // Configure HTTP proxy if provided.
+    // Configure HTTP proxy if provided. When no proxy is configured in the
+    // config, explicitly disable system proxy env vars (HTTP_PROXY etc.) so that
+    // the proxy does not inadvertently route through a system-level proxy.
     if !proxy.is_empty() {
         tracing::info!(%proxy, "configuring upstream HTTP proxy");
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    } else {
+        builder = builder.no_proxy();
     }
 
     Ok(builder)
