@@ -45,6 +45,25 @@ Integration tests are the **sole acceptance criterion** for all features. Unit t
 - Integration tests must exercise the full system end-to-end: proxy receives request, converts protocol, communicates with upstream, and returns correct response to the client.
 - A feature is not done until its integration tests pass against the real upstream.
 
+### ABSOLUTE PROHIBITION: No Commit Without Integration Test Verification
+
+**Every commit that touches source code — without exception — must be verified by running the integration test suite (`cargo test --test integrations`) before committing.** Running only unit tests (`cargo test --lib`) is **not sufficient** and **never has been**. A commit that passes unit tests but has not been verified against integration tests is a defective commit that must not exist in this repository's history.
+
+**This is not a suggestion.** This is a hard gate on the commit workflow:
+
+1. Make code changes.
+2. Run `cargo test --test integrations`. **All tests must pass.**
+3. Only then may you commit.
+
+**There are no shortcuts:**
+
+- "The unit tests passed" is irrelevant. Unit tests do not exercise the real protocol. They prove nothing about actual correctness.
+- "The change is trivial" is irrelevant. Trivial changes have introduced real-protocol breakage before. If the change touches source code, it gets integration-tested.
+- "CI will catch it" is irrelevant. You do not push unverified code and hope CI saves you. You verify before committing, always.
+- "Integration tests are slow" is irrelevant. Speed is never an excuse for skipping verification. Wait for them.
+
+**Violating this rule means you have submitted broken work.** There is no scenario where committing without integration test verification is acceptable.
+
 ### ABSOLUTE PROHIBITION: No Mock Upstreams or Alternative Clients in Integration Tests
 
 This rule is **non-negotiable, unconditional, and has no exceptions.** Violating it is a **critical development failure** — not a difference of opinion, not a pragmatic shortcut, not an acceptable trade-off. It is a **fundamental breach of the testing philosophy that this project exists to enforce.**
