@@ -38,26 +38,26 @@ The proxy extracts the upstream host from the URL path (`/https/<host>/responses
 
 ## Comparison
 
-All projects below convert OpenAI Responses API → Anthropic Messages API (Responses→Anthropic direction).
+All projects below convert OpenAI Responses API → Anthropic Messages API.
 
-| | codex-conv | [CLIProxyAPI] | [Headroom] | [codex-bridge] | [rosetta-llm] | [AnthMorph] |
-|---|---|---|---|---|---|---|
-| Tool calls | Yes | Partial¹ | Yes | Yes | Partial² | Partial² |
-| apply_patch | Yes | No | No | No | No | No |
-| Models API | Yes | Yes | Yes | No | Yes | No |
-| Model catalog | Yes | Partial³ | Yes | No | Yes | No |
-| Upstream chaining | Yes | No | Yes | No | No | No |
-| Language | Rust | Go | Rust+Python | Python | Python | Rust |
+| | codex-conv | [CLIProxyAPI] | [AnthMorph] | [codex-bridge] | [rosetta-llm] |
+|---|---|---|---|---|---|
+| MCP namespace mapping | Yes | Yes | Partial¹ | No | No |
+| 64-char name truncation | Yes | Yes | Yes | No | No |
+| apply_patch | Yes | No | No | No | No |
+| Models API | Yes | Yes | No | No | Yes |
+| Model catalog | Full Codex¹ | No² | No | No | Standard OpenAI³ |
+| Language | Rust | Go | Rust | Python | Python |
 
-¹ CLIProxyAPI: known bugs in tool call conversion (see [issue #736](https://github.com/router-for-me/CLIProxyAPI/issues/736)).
-² Partial: basic function call mapping only; streaming tool-use reconstruction not fully handled.
-³ CLIProxyAPI: model aliasing only, no catalog filtering.
+¹ AnthMorph: uses SHA1 hash suffix for name shortening, but targets Chat Completions API — does not handle OpenAI Responses API `type: "namespace"` tool definitions.
+¹ Full Codex: complete Codex CLI `ModelInfo` spec (all 32 fields), intersected with actual upstream model availability.
+² CLIProxyAPI: returns hardcoded OpenAI model templates (gpt-5.5, gpt-5.4, etc.) — these models do not exist on Anthropic upstream.
+³ Standard OpenAI: basic model list with `id`, `object`, `owned_by`, `created` only — no Codex-specific fields.
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
-[Headroom]: https://github.com/chopratejas/headroom
+[AnthMorph]: https://github.com/DioNanos/AnthMorph
 [codex-bridge]: https://github.com/nicholasyangyang/codex-bridge
 [rosetta-llm]: https://github.com/Lokesh-Chimakurthi/rosetta-llm
-[AnthMorph]: https://github.com/DioNanos/AnthMorph
 
 ## Proxy Configuration
 

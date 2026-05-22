@@ -38,26 +38,26 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 
 ## 功能对比
 
-以下项目均为 OpenAI Responses API → Anthropic Messages API 转换方向（Responses→Anthropic）。
+以下项目均为 OpenAI Responses API → Anthropic Messages API 转换方向。
 
-| | codex-conv | [CLIProxyAPI] | [Headroom] | [codex-bridge] | [rosetta-llm] | [AnthMorph] |
-|---|---|---|---|---|---|---|
-| 工具调用 | Yes | 部分¹ | Yes | Yes | 部分² | 部分² |
-| apply_patch | Yes | No | No | No | No | No |
-| Models API | Yes | Yes | Yes | No | Yes | No |
-| 模型目录 | Yes | 部分³ | Yes | No | Yes | No |
-| 上游链式代理 | Yes | No | Yes | No | No | No |
-| 语言 | Rust | Go | Rust+Python | Python | Python | Rust |
+| | codex-conv | [CLIProxyAPI] | [AnthMorph] | [codex-bridge] | [rosetta-llm] |
+|---|---|---|---|---|---|
+| MCP 命名空间映射 | Yes | Yes | Partial¹ | No | No |
+| 64字符名称截断 | Yes | Yes | Yes | No | No |
+| apply_patch | Yes | No | No | No | No |
+| Models API | Yes | Yes | No | No | Yes |
+| 模型目录 | 完整 Codex¹ | No² | No | No | 标准 OpenAI³ |
+| 语言 | Rust | Go | Rust | Python | Python |
 
-¹ CLIProxyAPI：工具调用转换存在已知缺陷（见 [issue #736](https://github.com/router-for-me/CLIProxyAPI/issues/736)）。
-² 部分：仅支持基础 function call 映射，流式 tool-use 重建不完整。
-³ CLIProxyAPI：仅支持模型别名，无目录过滤。
+¹ AnthMorph：使用 SHA1 哈希后缀缩短名称，但目标是 Chat Completions API，不支持 OpenAI Responses API 的 `type: "namespace"` 工具定义。
+¹ 完整 Codex：完整 Codex CLI `ModelInfo` 规范（全部 32 字段），与上游实际可用模型取交集。
+² CLIProxyAPI：返回硬编码的 OpenAI 模型模板（gpt-5.5、gpt-5.4 等）——这些模型在 Anthropic 上游并不存在。
+³ 标准 OpenAI：仅返回基础模型列表，包含 `id`、`object`、`owned_by`、`created`，无 Codex 专有字段。
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
-[Headroom]: https://github.com/chopratejas/headroom
+[AnthMorph]: https://github.com/DioNanos/AnthMorph
 [codex-bridge]: https://github.com/nicholasyangyang/codex-bridge
 [rosetta-llm]: https://github.com/Lokesh-Chimakurthi/rosetta-llm
-[AnthMorph]: https://github.com/DioNanos/AnthMorph
 
 ## 代理配置
 
