@@ -3,7 +3,6 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::routing::post;
 use futures::StreamExt;
 use std::pin::Pin;
 use tokio::sync::mpsc;
@@ -139,14 +138,373 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 #[derive(Clone)]
 pub struct AppState {
     pub config: crate::config::AppConfig,
+    pub catalog: Option<crate::catalog::ModelsResponse>,
 }
 
 /// Build the main axum router with all routes.
 pub fn build_router(state: AppState) -> Router {
+    use axum::routing::get;
+
     Router::new()
-        // Catch-all route that accepts any path ending in /responses.
-        .route("/{*path}", post(handle_responses))
+        .route("/{*path}", get(handle_models).post(handle_responses))
         .with_state(state)
+}
+
+async fn handle_models(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Response<Body>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let api_key = extract_api_key(req.headers()).ok_or_else(|| {
+        tracing::warn!("missing or empty Authorization header");
+        auth_error()
+    })?;
+
+    let path = req.uri().path().to_string();
+    let route_info = RouteInfo::parse(&path).ok_or_else(|| {
+        tracing::warn!(path = %path, "invalid route path");
+        bad_request_error(&path)
+    })?;
+
+    match &route_info.route_type {
+        RouteType::ModelsList | RouteType::ModelsGet(_) => {}
+        _ => return Err(bad_request_error(&path)),
+    }
+
+    tracing::debug!(
+        path = %path,
+        upstream = %route_info.upstream_base_url,
+        route_type = ?route_info.route_type,
+        "routed models request"
+    );
+
+    let client = build_upstream_client(&state.config.upstream).map_err(|e| {
+        tracing::error!(error = %e, "failed to build upstream HTTP client");
+        internal_error("failed to build upstream client")
+    })?;
+
+    let anthropic_version = state.config.upstream.anthropic_version.clone();
+    let query_string = req.uri().query().map(|q| q.to_string());
+
+    if state.catalog.is_none() {
+        handle_models_standard(
+            &client,
+            &api_key,
+            &anthropic_version,
+            &route_info,
+            query_string.as_deref(),
+        )
+        .await
+    } else {
+        handle_models_catalog(
+            &state,
+            &client,
+            &api_key,
+            &anthropic_version,
+            &route_info,
+            query_string.as_deref(),
+        )
+        .await
+    }
+}
+
+async fn handle_models_standard(
+    client: &reqwest::Client,
+    api_key: &str,
+    anthropic_version: &str,
+    route_info: &RouteInfo,
+    query_string: Option<&str>,
+) -> Result<Response<Body>, (StatusCode, axum::Json<serde_json::Value>)> {
+    use crate::conversion::error::convert_non_streaming_error;
+    use crate::conversion::models::{anthropic_list_to_openai_list, anthropic_to_openai_model};
+
+    match &route_info.route_type {
+        RouteType::ModelsList => {
+            let url = route_info.upstream_models_list_url();
+            let mut request_builder = client
+                .get(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", anthropic_version);
+
+            if let Some(query) = query_string {
+                request_builder = request_builder.query(query);
+            }
+
+            let resp = request_builder
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| upstream_network_error(&e))?;
+
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.map_err(|_| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        502,
+                        "server_error",
+                        "Invalid upstream response",
+                    )),
+                )
+            })?;
+
+            if !status.is_success() {
+                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                return Err((
+                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    axum::Json(mapped_body),
+                ));
+            }
+
+            let converted = anthropic_list_to_openai_list(&body);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&converted).unwrap()))
+                .unwrap())
+        }
+        RouteType::ModelsGet(_) => {
+            let url = route_info.upstream_models_get_url();
+            let resp = client
+                .get(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", anthropic_version)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| upstream_network_error(&e))?;
+
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.map_err(|_| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        502,
+                        "server_error",
+                        "Invalid upstream response",
+                    )),
+                )
+            })?;
+
+            if !status.is_success() {
+                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                return Err((
+                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    axum::Json(mapped_body),
+                ));
+            }
+
+            let converted = anthropic_to_openai_model(&body);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&converted).unwrap()))
+                .unwrap())
+        }
+        _ => Err(bad_request_error("")),
+    }
+}
+
+async fn handle_models_catalog(
+    state: &AppState,
+    client: &reqwest::Client,
+    api_key: &str,
+    anthropic_version: &str,
+    route_info: &RouteInfo,
+    query_string: Option<&str>,
+) -> Result<Response<Body>, (StatusCode, axum::Json<serde_json::Value>)> {
+    use crate::conversion::error::convert_non_streaming_error;
+    use crate::conversion::models::{anthropic_list_to_openai_list, anthropic_to_openai_model};
+
+    let catalog = state.catalog.as_ref().unwrap();
+
+    match &route_info.route_type {
+        RouteType::ModelsList => {
+            let url = route_info.upstream_models_list_url();
+            let mut request_builder = client
+                .get(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", anthropic_version);
+
+            if let Some(query) = query_string {
+                request_builder = request_builder.query(query);
+            }
+
+            let resp = request_builder
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| upstream_network_error(&e))?;
+
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.map_err(|_| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        502,
+                        "server_error",
+                        "Invalid upstream response",
+                    )),
+                )
+            })?;
+
+            if !status.is_success() {
+                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                return Err((
+                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    axum::Json(mapped_body),
+                ));
+            }
+
+            let upstream_ids: Vec<String> = body
+                .get("data")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut filtered: Vec<crate::catalog::ModelInfo> = catalog
+                .models
+                .iter()
+                .filter(|m| upstream_ids.iter().any(|id| id == &m.slug))
+                .cloned()
+                .collect();
+
+            if filtered.is_empty() {
+                let converted = anthropic_list_to_openai_list(&body);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&converted).unwrap()))
+                    .unwrap());
+            }
+
+            filtered.sort_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| a.slug.cmp(&b.slug))
+            });
+
+            let response = serde_json::json!({ "models": filtered });
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&response).unwrap()))
+                .unwrap())
+        }
+        RouteType::ModelsGet(model_id) => {
+            let url = route_info.upstream_models_get_url();
+            let resp = client
+                .get(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", anthropic_version)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| upstream_network_error(&e))?;
+
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.map_err(|_| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        502,
+                        "server_error",
+                        "Invalid upstream response",
+                    )),
+                )
+            })?;
+
+            if !status.is_success() {
+                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                return Err((
+                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    axum::Json(mapped_body),
+                ));
+            }
+
+            let catalog_entry = catalog.models.iter().find(|m| m.slug == *model_id);
+            if let Some(entry) = catalog_entry {
+                let response = serde_json::json!({ "models": [entry] });
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&response).unwrap()))
+                    .unwrap())
+            } else {
+                let converted = anthropic_to_openai_model(&body);
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&converted).unwrap()))
+                    .unwrap())
+            }
+        }
+        _ => Err(bad_request_error("")),
+    }
+}
+
+fn auth_error() -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "error": {
+                "message": "Missing or invalid Authorization header",
+                "type": "authentication_error",
+                "param": null,
+                "code": "invalid_api_key"
+            }
+        })),
+    )
+}
+
+fn bad_request_error(path: &str) -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(serde_json::json!({
+            "error": {
+                "message": format!("Invalid route path: {}", path),
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_request"
+            }
+        })),
+    )
+}
+
+fn internal_error(msg: &str) -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({
+            "error": {
+                "message": format!("Internal proxy error: {}", msg),
+                "type": "server_error",
+                "param": null,
+                "code": "server_error"
+            }
+        })),
+    )
+}
+
+fn upstream_network_error(e: &reqwest::Error) -> (StatusCode, axum::Json<serde_json::Value>) {
+    tracing::error!(error = %e, "upstream network error");
+    let message = if e.is_timeout() {
+        "Upstream request timed out"
+    } else if e.is_connect() {
+        "Upstream connection failed"
+    } else {
+        "Upstream request failed"
+    };
+    (
+        StatusCode::BAD_GATEWAY,
+        axum::Json(crate::conversion::error::proxy_error_response(
+            502,
+            "server_error",
+            message,
+        )),
+    )
 }
 
 /// Format error message for invalid apply_patch format.
@@ -1132,6 +1490,7 @@ mod tests {
         use crate::config::AppConfig;
         let state = AppState {
             config: AppConfig::default(),
+            catalog: None,
         };
         build_router(state)
     }

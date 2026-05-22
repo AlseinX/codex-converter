@@ -5,10 +5,14 @@ use tokio::signal;
 use tokio::time::Duration;
 
 /// Run the HTTP/HTTPS server until a shutdown signal is received.
-pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    config: AppConfig,
+    catalog: Option<crate::catalog::ModelsResponse>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = config.server.listen.parse()?;
     let state = AppState {
         config: config.clone(),
+        catalog,
     };
     let app = build_router(state);
 

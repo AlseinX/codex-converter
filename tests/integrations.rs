@@ -127,7 +127,10 @@ async fn start_proxy() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
 
     let config = AppConfig::default();
-    let state = AppState { config };
+    let state = AppState {
+        config,
+        catalog: None,
+    };
     let app = build_router(state);
 
     let handle = tokio::spawn(async move {

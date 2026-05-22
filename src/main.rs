@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
+use codex_conv::catalog;
 use codex_conv::config::AppConfig;
 use codex_conv::logging;
 use std::path::PathBuf;
@@ -73,8 +74,21 @@ async fn main() {
         "starting codex-conv"
     );
 
-    // Step 5: Start server.
-    if let Err(e) = codex_conv::server::run(config).await {
+    // Step 6: Validate and load model catalog (if configured).
+    let catalog = match catalog::validate_and_load_catalog(&config, cli.config_file.as_deref()) {
+        Ok(c) if c.models.is_empty() => None,
+        Ok(c) => {
+            tracing::info!(models = c.models.len(), "loaded model catalog");
+            Some(c)
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Step 7: Start server.
+    if let Err(e) = codex_conv::server::run(config, catalog).await {
         tracing::error!(error = %e, "server exited with error");
         std::process::exit(1);
     }
