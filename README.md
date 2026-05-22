@@ -161,3 +161,9 @@ Multiple catalog files are supported (earlier files have higher priority). Paths
 **Server:** Set `server.tls.cert` and `server.tls.key` to enable HTTPS on the listening port.
 
 **Upstream:** Uses system CA roots by default. Add custom certificates via `upstream.tls.extra_ca_certs`.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE) or [MIT License](LICENSE) at your option.
+
+Copyright 2026 AlseinX \<xyh951115@live.com\>

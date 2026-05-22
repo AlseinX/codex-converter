@@ -161,3 +161,9 @@ model_catalog: /path/to/catalog.json
 **服务端：** 设置 `server.tls.cert` 和 `server.tls.key` 启用 HTTPS。
 
 **上游：** 默认使用系统 CA 证书。自定义证书通过 `upstream.tls.extra_ca_certs` 添加。
+
+## 许可证
+
+在 [Apache License 2.0](LICENSE) 或 [MIT License](LICENSE) 中任选其一。
+
+Copyright 2026 AlseinX \<xyh951115@live.com\>
