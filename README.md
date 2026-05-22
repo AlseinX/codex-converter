@@ -46,13 +46,16 @@ All projects below convert OpenAI Responses API → Anthropic Messages API.
 | 64-char name truncation | Yes | Yes | Yes | No | No |
 | apply_patch | Yes | No | No | No | No |
 | Models API | Yes | Yes | No | No | Yes |
-| Model catalog | Full Codex¹ | No² | No | No | Standard OpenAI³ |
+| Model catalog | Full Codex² | No³ | No | No | Standard OpenAI⁴ |
 | Language | Rust | Go | Rust | Python | Python |
 
 ¹ AnthMorph: uses SHA1 hash suffix for name shortening, but targets Chat Completions API — does not handle OpenAI Responses API `type: "namespace"` tool definitions.
-¹ Full Codex: complete Codex CLI `ModelInfo` spec (all 32 fields), intersected with actual upstream model availability.
-² CLIProxyAPI: returns hardcoded OpenAI model templates (gpt-5.5, gpt-5.4, etc.) — these models do not exist on Anthropic upstream.
-³ Standard OpenAI: basic model list with `id`, `object`, `owned_by`, `created` only — no Codex-specific fields.
+
+² Full Codex: complete Codex CLI `ModelInfo` spec (all 32 fields), intersected with actual upstream model availability.
+
+³ CLIProxyAPI: returns hardcoded OpenAI model templates (gpt-5.5, gpt-5.4, etc.) — these models do not exist on Anthropic upstream.
+
+⁴ Standard OpenAI: basic model list with `id`, `object`, `owned_by`, `created` only — no Codex-specific fields.
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
 [AnthMorph]: https://github.com/DioNanos/AnthMorph

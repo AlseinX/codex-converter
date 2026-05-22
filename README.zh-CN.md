@@ -46,13 +46,16 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 | 64字符名称截断 | Yes | Yes | Yes | No | No |
 | apply_patch | Yes | No | No | No | No |
 | Models API | Yes | Yes | No | No | Yes |
-| 模型目录 | 完整 Codex¹ | No² | No | No | 标准 OpenAI³ |
+| 模型目录 | 完整 Codex² | No³ | No | No | 标准 OpenAI⁴ |
 | 语言 | Rust | Go | Rust | Python | Python |
 
 ¹ AnthMorph：使用 SHA1 哈希后缀缩短名称，但目标是 Chat Completions API，不支持 OpenAI Responses API 的 `type: "namespace"` 工具定义。
-¹ 完整 Codex：完整 Codex CLI `ModelInfo` 规范（全部 32 字段），与上游实际可用模型取交集。
-² CLIProxyAPI：返回硬编码的 OpenAI 模型模板（gpt-5.5、gpt-5.4 等）——这些模型在 Anthropic 上游并不存在。
-³ 标准 OpenAI：仅返回基础模型列表，包含 `id`、`object`、`owned_by`、`created`，无 Codex 专有字段。
+
+² 完整 Codex：完整 Codex CLI `ModelInfo` 规范（全部 32 字段），与上游实际可用模型取交集。
+
+³ CLIProxyAPI：返回硬编码的 OpenAI 模型模板（gpt-5.5、gpt-5.4 等）——这些模型在 Anthropic 上游并不存在。
+
+⁴ 标准 OpenAI：仅返回基础模型列表，包含 `id`、`object`、`owned_by`、`created`，无 Codex 专有字段。
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
 [AnthMorph]: https://github.com/DioNanos/AnthMorph
