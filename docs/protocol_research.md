@@ -2266,18 +2266,30 @@ Synthesis of findings from entries #41–#44. Is the proposed retry mechanism fe
 
 ---
 
-## 13. Models API conversion: OpenAI Models API ↔ Anthropic Models API
+## 13. Models API: Dual-Mode Design (Standard OpenAI ↔ Codex Extended)
 
 ### Description
-Codex CLI calls `GET /v1/models` to list available models and `GET /v1/models/{model}` to retrieve a specific model. The proxy must forward these requests to Anthropic's Models API and convert the response format to match what Codex CLI expects.
+The proxy supports two modes for the Models API, selected by the `model_catalog` configuration option. When no catalog is configured, Mode 1 converts Anthropic's Models API to standard OpenAI format. When a catalog is configured, Mode 2 serves Codex CLI's `ModelsResponse { models: Vec<ModelInfo> }` format directly from catalog files with no upstream call.
 
 ### Result
 
-**Anthropic Models API** [1]:
-- `GET /v1/models` — returns paginated list with cursor-based pagination
-- `GET /v1/models/{model_id}` — returns single model object
+#### 13a. Anthropic Models API — Complete Specification [1][6][7]
 
-Anthropic response format (List):
+**Authentication:**
+- Required header: `x-api-key` (string) — API key for authentication
+- Required header: `anthropic-version` (string) — API version, currently `"2023-06-01"`
+- Optional header: `anthropic-beta` (string[]) — Beta features, comma-separated or multiple headers
+
+**GET /v1/models (List Models):**
+- HTTP Method: GET
+- Path: `/v1/models`
+- Query Parameters:
+  - `before_id` (string, optional) — cursor for backward pagination
+  - `after_id` (string, optional) — cursor for forward pagination
+  - `limit` (integer, optional, default 20, range 1–1000) — number of items per page
+- Models returned newest-first
+
+200 Response:
 ```json
 {
   "data": [
@@ -2285,79 +2297,204 @@ Anthropic response format (List):
       "type": "model",
       "id": "claude-sonnet-4-20250514",
       "display_name": "Claude Sonnet 4",
-      "created_at": "2025-05-14T00:00:00Z"
+      "created_at": "2025-02-19T00:00:00Z"
     }
   ],
-  "has_more": false,
-  "first_id": "...",
-  "last_id": "..."
+  "first_id": "string or null",
+  "has_more": true,
+  "last_id": "string or null"
 }
 ```
 
-Anthropic response format (Get):
+**GET /v1/models/{model_id} (Get Model):**
+- Path Parameter: `model_id` (string, required)
+
+200 Response:
 ```json
 {
   "type": "model",
   "id": "claude-sonnet-4-20250514",
   "display_name": "Claude Sonnet 4",
-  "created_at": "2025-05-14T00:00:00Z"
+  "created_at": "2025-02-19T00:00:00Z"
 }
 ```
 
-**OpenAI Models API** [2][3]:
-- `GET /v1/models` — returns list of models
-- `GET /v1/models/{model}` — returns single model
+**Model object completeness:** Verified via live API test and official docs. The Anthropic model object contains ONLY these 4 fields: `type`, `id`, `display_name`, `created_at` [1][6][7].
 
-OpenAI response format (List):
+**Error response format** [8]:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "authentication_error",
+    "message": "invalid x-api-key"
+  },
+  "request_id": "req_011CbFiYBxzLcZqUJ37B9bap"
+}
+```
+
+#### 13b. Standard OpenAI Models Format (Mode 1 — no catalog) [2][3]
+
+When `model_catalog` is empty, the proxy converts Anthropic responses to standard OpenAI format.
+
+**GET /models response:**
 ```json
 {
   "object": "list",
   "data": [
     {
-      "id": "model-id",
+      "id": "claude-sonnet-4-20250514",
       "object": "model",
-      "created": 1686935002,
-      "owned_by": "openai"
+      "created": 1739923200,
+      "owned_by": "anthropic"
     }
   ]
 }
 ```
 
-OpenAI response format (Get):
+**GET /models/{model} response:**
 ```json
 {
-  "id": "model-id",
+  "id": "claude-sonnet-4-20250514",
   "object": "model",
-  "created": 1686935002,
-  "owned_by": "openai"
+  "created": 1739923200,
+  "owned_by": "anthropic"
 }
 ```
 
-**Field mapping:**
+Field mapping:
 
 | Anthropic field | OpenAI field | Conversion |
 |---|---|---|
-| `type: "model"` | `object: "model"` | Rename field |
 | `id` | `id` | Direct passthrough |
-| `created_at` (ISO 8601) | `created` (Unix timestamp) | Parse ISO 8601 → Unix seconds |
-| N/A | `owned_by` | Default to `"anthropic"` |
-| `display_name` | N/A | Discard (OpenAI has no equivalent) |
-| `has_more`, `first_id`, `last_id` | N/A | Discard (OpenAI list has no pagination) |
-| N/A | `object: "list"` | Add wrapper for list response |
+| `type` (`"model"`) | `object` | Rename field |
+| `created_at` (ISO 8601) | `created` (Unix timestamp) | Parse ISO 8601 → epoch seconds. Parse failure → `0` with warning log |
+| — | `owned_by` | Hardcoded `"anthropic"` |
+| `display_name` | — | Discarded |
 
-**Codex CLI behavior** [4][5]:
+#### 13c. Codex CLI Extended Format (Mode 2 — catalog configured) [4][5][12][13]
+
+When `model_catalog` has one or more files, the proxy serves Codex CLI's `ModelsResponse { models: Vec<ModelInfo> }` format from catalog files — no upstream Anthropic call needed.
+
+**GET /models response:**
+```json
+{
+  "models": [
+    { "slug": "...", "display_name": "...", ... },
+    { "slug": "...", "display_name": "...", ... }
+  ]
+}
+```
+
+**GET /models/{model} response (found):**
+```json
+{
+  "models": [
+    { "slug": "claude-sonnet-4-20250514", ... }
+  ]
+}
+```
+
+**GET /models/{model} response (not found):** 404 with standard OpenAI error format.
+
+Codex CLI deserializes this into `ModelsResponse { models: Vec<ModelInfo> }` — there is no code path that accepts standard OpenAI format when using a custom `base_url` [13].
+
+#### 13d. ModelInfo Field List (Required vs Optional) [13]
+
+**Required fields** (no `#[serde(default)]`, must be present):
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `slug` | String | Model identifier, deduplication key in merge |
+| `display_name` | String | Human-readable name |
+| `description` | Option\<String\> | Model description |
+| `supported_reasoning_levels` | Vec\<ReasoningEffortPreset\> | Each: `{ "effort": String, "description": String }` |
+| `shell_type` | ConfigShellToolType | `"default"`\|`"local"`\|`"unified_exec"`\|`"disabled"`\|`"shell_command"` |
+| `visibility` | ModelVisibility | `"list"`\|`"hide"`\|`"none"` |
+| `supported_in_api` | bool | |
+| `priority` | i32 | Lower = higher priority |
+| `base_instructions` | String | |
+| `supports_reasoning_summaries` | bool | |
+| `support_verbosity` | bool | |
+| `default_verbosity` | Option\<Verbosity\> | `"low"`\|`"medium"`\|`"high"` |
+| `apply_patch_tool_type` | Option\<ApplyPatchToolType\> | `"freeform"` or null |
+| `truncation_policy` | TruncationPolicyConfig | `{ "mode": "bytes"\|"tokens", "limit": i64 }` |
+| `supports_parallel_tool_calls` | bool | |
+| `experimental_supported_tools` | Vec\<String\> | |
+
+**Optional fields** (have `#[serde(default)]`):
+
+| Field | Type | Default |
+|-------|------|---------|
+| `default_reasoning_summary` | ReasoningSummary | `"auto"` — `"auto"`\|`"none"`\|`"concise"`\|`"detailed"` |
+| `default_reasoning_level` | Option\<ReasoningEffort\> | `None` — `"none"`\|`"minimal"`\|`"low"`\|`"medium"`\|`"high"`\|`"xhigh"` |
+| `additional_speed_tiers` | Vec\<String\> | `[]` |
+| `service_tiers` | Vec\<ModelServiceTier\> | `[]` — each: `{ "id", "name", "description" }` |
+| `supports_image_detail_original` | bool | `false` |
+| `context_window` | Option\<i64\> | `None` |
+| `max_context_window` | Option\<i64\> | `None` |
+| `auto_compact_token_limit` | Option\<i64\> | `None` |
+| `effective_context_window_percent` | i64 | `95` |
+| `input_modalities` | Vec\<InputModality\> | `["text", "image"]` |
+| `supports_search_tool` | bool | `false` |
+| `web_search_tool_type` | WebSearchToolType | `"text"` — `"text"`\|`"text_and_image"` |
+| `availability_nux` | Option\<ModelAvailabilityNux\> | `None` — `{ "message": String }` |
+| `upgrade` | Option\<ModelInfoUpgrade\> | `None` — `{ "model": String, "migration_markdown": String }` |
+| `model_messages` | Option\<ModelMessages\> | `None` — `{ "instructions_template": Option\<String\>, ... }` |
+
+**Enum serialization:** `ModelVisibility` uses `rename_all = "lowercase"`, `ConfigShellToolType` uses `rename_all = "snake_case"` [13].
+
+#### 13e. Catalog Config and Multi-File Merge
+
+The `model_catalog` config field (`Vec<PathBuf>`, default `[]`) controls mode selection:
+- Empty → Mode 1 (standard OpenAI, upstream Anthropic call)
+- Non-empty → Mode 2 (Codex Extended, serve from catalog)
+
+**Multi-file merge** (files processed in config order, first = highest priority):
+- Each catalog file must be a valid `ModelsResponse` on its own — all fields without `#[serde(default)]` must be present in every file. The merge overlay only adjusts fields that have serde defaults or are `Option<T>`.
+- Different slugs → union (include all)
+- Same slug → field-by-field overlay:
+  - Non-`Option` scalars: earlier file wins
+  - `Option<T>` fields: `null`/absent in earlier file → fall through to later file
+  - Vec fields: complete replacement from earlier file
+  - Nested objects: entire object replacement, same `Option` rules
+
+**Startup validation** (failure = error + exit):
+- Catalog file must exist and be parseable as YAML (JSON superset)
+- Merged catalog must have at least one model
+
+#### 13f. Codex CLI Behavior [4][5][12][13]
+
 - Calls `GET /v1/models` to populate the model picker
+- Deserializes response into `ModelsResponse { models: Vec<ModelInfo> }` (NOT standard OpenAI format)
 - Falls back to bundled `models.json` if the endpoint is unavailable
+- Falls back to `model_info_from_slug()` hardcoded defaults if a model slug is not found
 - Calls `GET /v1/models/{model}` to verify a model exists before use
-- Expects standard OpenAI format response
 
-**Routing**: The proxy URL pattern mirrors the existing `/responses` route:
-- `GET /https/api.anthropic.com/models` → `GET https://api.anthropic.com/v1/models`
-- `GET /https/api.anthropic.com/models/{model}` → `GET https://api.anthropic.com/v1/models/{model}`
+#### 13g. Error Conversion
+
+Mode 1 error mapping reuses existing `convert_non_streaming_error()`:
+- Anthropic 404 → 404 `model_not_found`
+- Anthropic 401 → 401 `invalid_api_key`
+- Anthropic 200 non-JSON → 502 `server_error`
+- Network errors → 502/504 as specified in design doc
+
+Mode 2 runtime errors:
+- Model not found → 404 `model_not_found`
+- Mode 2 startup errors → exit with message
 
 ### Reference
 - [1] Anthropic List Models API — https://docs.anthropic.com/en/api/models-list
 - [2] OpenAI List Models API — https://developers.openai.com/api/reference/resources/models/methods/list/
 - [3] OpenAI Retrieve Model API — https://developers.openai.com/api/reference/resources/models/methods/retrieve/
-- [4] Codex CLI issue #2507 — https://github.com/openai/codex/issues/2507 (shows Codex uses /v1/models to verify models)
-- [5] Codex CLI issue #10867 — https://github.com/openai/codex/issues/10867 (shows /v1/models endpoint usage with custom providers)
+- [4] Codex CLI issue #2507 — https://github.com/openai/codex/issues/2507
+- [5] Codex CLI issue #10867 — https://github.com/openai/codex/issues/10867
+- [6] Anthropic Get Model API — https://docs.anthropic.com/en/api/models
+- [7] Anthropic API Versioning — https://docs.anthropic.com/en/api/versioning
+- [8] Anthropic Errors — https://docs.anthropic.com/en/api/errors
+- [9] OpenAI API Errors — https://developers.openai.com/api/reference/debugging/errors
+- [10] LiteLLM model response handling — https://github.com/BerriAI/litellm
+- [11] CLIProxyAPI model response handling — https://github.com/anthropics/claude-code-proxy
+- [12] Codex CLI source (model picker) — https://github.com/openai/codex
+- [13] Codex CLI source: `codex-rs/protocol/src/openai_models.rs` and `codex-rs/models-manager/src/model_info.rs` — https://github.com/openai/codex
