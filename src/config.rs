@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default, deserialize_with = "deserialize_model_catalog")]
+    pub model_catalog: Vec<std::path::PathBuf>,
 }
 
 impl AppConfig {
@@ -94,6 +96,15 @@ impl AppConfig {
                 if let Some(ref mut f) = self.log.file {
                     f.rotation = value.to_string();
                 }
+            }
+            "model_catalog" => {
+                let paths: Vec<std::path::PathBuf> = value
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                self.model_catalog = paths;
             }
             _ => {
                 return Err(ConfigError::UnknownKey {
@@ -248,6 +259,26 @@ fn parse_bool_option(value: &str) -> Option<bool> {
     }
 }
 
+/// Custom deserializer: accept either a string or array of strings for model_catalog.
+fn deserialize_model_catalog<'de, D>(deserializer: D) -> Result<Vec<std::path::PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::path::PathBuf;
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+
+    match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Single(s) => Ok(vec![PathBuf::from(s)]),
+        StringOrVec::Multiple(v) => Ok(v.into_iter().map(PathBuf::from).collect()),
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::path::PathBuf, std::io::Error),
@@ -359,5 +390,40 @@ upstream:
         let mut cfg = AppConfig::default();
         let result = cfg.apply_cli("nonexistent.field", "value");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn model_catalog_default_is_empty() {
+        let cfg = AppConfig::default();
+        assert!(cfg.model_catalog.is_empty());
+    }
+
+    #[test]
+    fn model_catalog_single_string() {
+        let yaml = r#"
+model_catalog: "./models.json"
+"#;
+        let cfg: AppConfig = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.model_catalog,
+            vec![std::path::PathBuf::from("./models.json")]
+        );
+    }
+
+    #[test]
+    fn model_catalog_array() {
+        let yaml = r#"
+model_catalog:
+  - "./overrides/models.json"
+  - "./base/models.json"
+"#;
+        let cfg: AppConfig = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.model_catalog,
+            vec![
+                std::path::PathBuf::from("./overrides/models.json"),
+                std::path::PathBuf::from("./base/models.json"),
+            ]
+        );
     }
 }
