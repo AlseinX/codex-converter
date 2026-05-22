@@ -28,12 +28,12 @@ pub struct RouteInfo {
 impl RouteInfo {
     /// Parse the request path to extract the upstream base URL and route type.
     ///
-    /// Accepted formats (all normalized to `https://host` unless `/http/` prefix is used):
-    /// - `/https/api.anthropic.com/responses`
+    /// Accepted formats:
+    /// - `/https/api.anthropic.com/responses` (HTTPS upstream, default)
     /// - `/https:/api.anthropic.com/responses`
     /// - `/https://api.anthropic.com/responses`
     /// - `/v1/https/api.anthropic.com/responses`
-    /// - `/http/127.0.0.1:12345/responses` (plain HTTP, for testing)
+    /// - `/http/127.0.0.1:12345/responses` (HTTP upstream, for reverse proxy chaining)
     /// - `/https/api.anthropic.com/models`
     /// - `/https/api.anthropic.com/models/claude-sonnet-4-20250514`
     ///
@@ -41,23 +41,19 @@ impl RouteInfo {
     pub fn parse(path: &str) -> Option<Self> {
         let stripped = path.strip_prefix("/v1").unwrap_or(path);
 
-        // Detect scheme: /http/ -> plain HTTP, /https/ -> HTTPS (default).
-        let (scheme, after_scheme) = if let Some(rest) = stripped.strip_prefix("/http") {
-            // Must distinguish /http/ from /https — check the next character.
+        let (scheme, host_and_rest) = if let Some(rest) = stripped.strip_prefix("/http") {
             if let Some(s) = rest.strip_prefix('/') {
-                // /http/host/... — plain HTTP.
                 ("http", s)
             } else if let Some(s) = rest.strip_prefix("s") {
-                // /https... — fall through to HTTPS parsing below.
                 let after_https = s;
-                let host_and_rest = if let Some(s) = after_https.strip_prefix("://") {
+                let h = if let Some(s) = after_https.strip_prefix("://") {
                     s
                 } else if let Some(s) = after_https.strip_prefix(":/") {
                     s
                 } else {
                     after_https.strip_prefix('/')?
                 };
-                ("https", host_and_rest)
+                ("https", h)
             } else {
                 return None;
             }
@@ -65,7 +61,6 @@ impl RouteInfo {
             return None;
         };
 
-        let host_and_rest = after_scheme;
         if host_and_rest.is_empty() {
             return None;
         }
@@ -79,7 +74,7 @@ impl RouteInfo {
             return None;
         }
 
-        let upstream_base_url = format!("{}://{}", scheme, host);
+        let upstream_base_url = format!("{scheme}://{host}");
 
         let (route_type, model_id) = if rest.is_empty() {
             return None;
@@ -252,22 +247,23 @@ async fn handle_models_standard(
                 .map_err(|e| upstream_network_error(&e))?;
 
             let status = resp.status();
-            let body: serde_json::Value = resp.json().await.map_err(|_| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    axum::Json(crate::conversion::error::proxy_error_response(
-                        502,
-                        "server_error",
-                        "Invalid upstream response",
-                    )),
-                )
-            })?;
+            let body: serde_json::Value =
+                resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
 
             if !status.is_success() {
-                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                let mapped_status =
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                if body.is_object() && body.as_object().is_some_and(|o| !o.is_empty()) {
+                    let (_, mapped_body) = convert_non_streaming_error(&body);
+                    return Err((mapped_status, axum::Json(mapped_body)));
+                }
                 return Err((
-                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    axum::Json(mapped_body),
+                    mapped_status,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        status.as_u16(),
+                        "upstream_error",
+                        "Upstream returned non-JSON error",
+                    )),
                 ));
             }
 
@@ -290,22 +286,23 @@ async fn handle_models_standard(
                 .map_err(|e| upstream_network_error(&e))?;
 
             let status = resp.status();
-            let body: serde_json::Value = resp.json().await.map_err(|_| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    axum::Json(crate::conversion::error::proxy_error_response(
-                        502,
-                        "server_error",
-                        "Invalid upstream response",
-                    )),
-                )
-            })?;
+            let body: serde_json::Value =
+                resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
 
             if !status.is_success() {
-                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                let mapped_status =
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                if body.is_object() && body.as_object().is_some_and(|o| !o.is_empty()) {
+                    let (_, mapped_body) = convert_non_streaming_error(&body);
+                    return Err((mapped_status, axum::Json(mapped_body)));
+                }
                 return Err((
-                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    axum::Json(mapped_body),
+                    mapped_status,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        status.as_u16(),
+                        "upstream_error",
+                        "Upstream returned non-JSON error",
+                    )),
                 ));
             }
 
@@ -351,22 +348,23 @@ async fn handle_models_catalog(
                 .map_err(|e| upstream_network_error(&e))?;
 
             let status = resp.status();
-            let body: serde_json::Value = resp.json().await.map_err(|_| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    axum::Json(crate::conversion::error::proxy_error_response(
-                        502,
-                        "server_error",
-                        "Invalid upstream response",
-                    )),
-                )
-            })?;
+            let body: serde_json::Value =
+                resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
 
             if !status.is_success() {
-                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                let mapped_status =
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                if body.is_object() && body.as_object().is_some_and(|o| !o.is_empty()) {
+                    let (_, mapped_body) = convert_non_streaming_error(&body);
+                    return Err((mapped_status, axum::Json(mapped_body)));
+                }
                 return Err((
-                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    axum::Json(mapped_body),
+                    mapped_status,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        status.as_u16(),
+                        "upstream_error",
+                        "Upstream returned non-JSON error",
+                    )),
                 ));
             }
 
@@ -421,22 +419,23 @@ async fn handle_models_catalog(
                 .map_err(|e| upstream_network_error(&e))?;
 
             let status = resp.status();
-            let body: serde_json::Value = resp.json().await.map_err(|_| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    axum::Json(crate::conversion::error::proxy_error_response(
-                        502,
-                        "server_error",
-                        "Invalid upstream response",
-                    )),
-                )
-            })?;
+            let body: serde_json::Value =
+                resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
 
             if !status.is_success() {
-                let (mapped_status, mapped_body) = convert_non_streaming_error(&body);
+                let mapped_status =
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                if body.is_object() && body.as_object().is_some_and(|o| !o.is_empty()) {
+                    let (_, mapped_body) = convert_non_streaming_error(&body);
+                    return Err((mapped_status, axum::Json(mapped_body)));
+                }
                 return Err((
-                    StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    axum::Json(mapped_body),
+                    mapped_status,
+                    axum::Json(crate::conversion::error::proxy_error_response(
+                        status.as_u16(),
+                        "upstream_error",
+                        "Upstream returned non-JSON error",
+                    )),
                 ));
             }
 

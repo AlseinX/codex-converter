@@ -5,11 +5,18 @@ pub fn anthropic_to_openai_model(anthropic_model: &Value) -> Value {
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let created = anthropic_model
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .map(parse_iso8601_to_epoch)
-        .unwrap_or(0);
+
+    // Upstream may return "created" as an integer (already OpenAI format) or
+    // "created_at" as an ISO 8601 string (Anthropic native format).
+    let created = if let Some(v) = anthropic_model.get("created") {
+        v.as_i64().unwrap_or(0)
+    } else {
+        anthropic_model
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(parse_iso8601_to_epoch)
+            .unwrap_or(0)
+    };
 
     json!({
         "id": id,

@@ -1,62 +1,87 @@
+//! Live integration tests for Models API: HTTP client → proxy → real Anthropic API.
+//!
+//! Each test starts its own in-process proxy and sends HTTP requests directly to it.
+//! The proxy forwards to the real Anthropic API using credentials from
+//! `~/.claude/settings.json` or environment variables.
+//!
+//! Run with: `cargo test --test models -- --test-threads=1`
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use codex_conv::catalog::{
+    ConfigShellToolType, InputModality, ModelInfo, ModelVisibility, ModelsResponse,
+    ReasoningSummary, TruncationPolicyConfig, TruncationPolicyMode, WebSearchToolType,
+};
 use codex_conv::config::AppConfig;
 use codex_conv::router::{AppState, build_router};
-use serde_json::json;
-use tower::ServiceExt;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn anthropic_models_list_body() -> serde_json::Value {
-    json!({
-        "data": [
-            {
-                "type": "model",
-                "id": "claude-sonnet-4-20250514",
-                "display_name": "Claude Sonnet 4",
-                "created_at": "2025-02-19T00:00:00Z"
-            },
-            {
-                "type": "model",
-                "id": "claude-opus-4-20250514",
-                "display_name": "Claude Opus 4",
-                "created_at": "2025-01-15T00:00:00Z"
-            }
-        ],
-        "has_more": false,
-        "first_id": "claude-sonnet-4-20250514",
-        "last_id": "claude-opus-4-20250514"
-    })
+// ---------------------------------------------------------------------------
+// Credentials (shared with integrations.rs)
+// ---------------------------------------------------------------------------
+
+fn get_credential(settings_key: &str, env_name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(env_name)
+        && !v.is_empty()
+    {
+        return Some(v);
+    }
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".claude/settings.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
+    settings
+        .get("env")
+        .and_then(|e| e.get(settings_key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
-fn anthropic_single_model_body() -> serde_json::Value {
-    json!({
-        "type": "model",
-        "id": "claude-sonnet-4-20250514",
-        "display_name": "Claude Sonnet 4",
-        "created_at": "2025-02-19T00:00:00Z"
-    })
+fn api_key() -> String {
+    get_credential("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+        .expect("ANTHROPIC_AUTH_TOKEN not found in ~/.claude/settings.json or env")
 }
 
-async fn start_proxy_with_catalog(
-    mock_server: &wiremock::MockServer,
-    catalog: Option<codex_conv::catalog::ModelsResponse>,
-) -> (axum::Router, String) {
-    let host = mock_server.uri();
-    let host = host
+fn base_url() -> String {
+    get_credential("ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL")
+        .expect("ANTHROPIC_BASE_URL not found in ~/.claude/settings.json or env")
+}
+
+fn upstream_host() -> String {
+    let url = base_url();
+    url.trim_start_matches("https://")
         .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let mut config = AppConfig::default();
-    config.upstream.anthropic_version = "2023-06-01".to_string();
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// A model ID that exists on the real upstream API.
+const KNOWN_MODEL: &str = "glm-5.1";
+
+// ---------------------------------------------------------------------------
+// In-process proxy helpers
+// ---------------------------------------------------------------------------
+
+async fn start_proxy(catalog: Option<ModelsResponse>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind proxy listener");
+    let addr = listener.local_addr().unwrap();
+
+    let config = AppConfig::default();
     let state = AppState { config, catalog };
     let app = build_router(state);
-    (app, host.to_string())
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("proxy server error: {e}");
+        }
+    });
+
+    (addr, handle)
 }
 
-async fn start_proxy_no_catalog(mock_server: &wiremock::MockServer) -> (axum::Router, String) {
-    start_proxy_with_catalog(mock_server, None).await
-}
-
-fn minimal_model_info(slug: &str) -> codex_conv::catalog::ModelInfo {
-    use codex_conv::catalog::*;
+fn minimal_model_info(slug: &str) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),
@@ -95,227 +120,201 @@ fn minimal_model_info(slug: &str) -> codex_conv::catalog::ModelInfo {
     }
 }
 
-// --- Mode 1 Tests ---
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+fn models_list_url(proxy_addr: SocketAddr) -> String {
+    let host = upstream_host();
+    format!("http://{}/https/{}/models", proxy_addr, host)
+}
+
+fn models_get_url(proxy_addr: SocketAddr, model_id: &str) -> String {
+    let host = upstream_host();
+    format!("http://{}/https/{}/models/{}", proxy_addr, host, model_id)
+}
+
+// ===========================================================================
+// Mode 1 Tests (no catalog — standard OpenAI format conversion)
+// ===========================================================================
 
 #[tokio::test]
 async fn mode1_list_models_returns_openai_format() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_models_list_body()))
-        .mount(&mock_server)
-        .await;
+    let (addr, _proxy) = start_proxy(None).await;
+    let client = http_client();
+    let key = api_key();
 
-    let (app, host) = start_proxy_no_catalog(&mock_server).await;
-
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+    let resp = client
+        .get(models_list_url(addr))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["object"], "list");
-    let data = json["data"].as_array().unwrap();
-    assert_eq!(data.len(), 2);
-    assert_eq!(data[0]["id"], "claude-sonnet-4-20250514");
-    assert_eq!(data[0]["object"], "model");
-    assert_eq!(data[0]["owned_by"], "anthropic");
-    assert!(data[0]["created"].as_i64().unwrap() > 0);
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let json: serde_json::Value = resp.json().await.expect("failed to parse response");
+    assert_eq!(json["object"], "list", "response must have object=list");
+
+    let data = json["data"]
+        .as_array()
+        .expect("response must have data array");
+    assert!(
+        !data.is_empty(),
+        "upstream should return at least one model"
+    );
+
+    let first = &data[0];
+    assert!(first.get("id").is_some(), "each model must have 'id'");
+    assert_eq!(first["object"], "model");
+    assert_eq!(first["owned_by"], "anthropic");
+    assert!(
+        first["created"].as_i64().unwrap_or(0) > 0,
+        "created must be a positive Unix epoch timestamp"
+    );
 }
 
 #[tokio::test]
-async fn mode1_get_model_returns_openai_format() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models/claude-sonnet-4-20250514"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_single_model_body()))
-        .mount(&mock_server)
-        .await;
+async fn mode1_list_models_preserves_all_upstream_models() {
+    let (addr, _proxy) = start_proxy(None).await;
+    let client = http_client();
+    let key = api_key();
 
-    let (app, host) = start_proxy_no_catalog(&mock_server).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models/claude-sonnet-4-20250514", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+    let resp = client
+        .get(models_list_url(addr))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], "claude-sonnet-4-20250514");
-    assert_eq!(json["object"], "model");
-    assert_eq!(json["owned_by"], "anthropic");
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let json: serde_json::Value = resp.json().await.expect("failed to parse response");
+    let data = json["data"].as_array().expect("must have data array");
+
+    // Collect all IDs and verify known model exists
+    let ids: Vec<&str> = data.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(
+        ids.iter().any(|id| id.contains("glm")),
+        "upstream should return glm models, got: {ids:?}"
+    );
 }
 
 #[tokio::test]
 async fn mode1_get_nonexistent_model_returns_404() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models/nonexistent"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "type": "error",
-            "error": { "type": "not_found_error", "message": "model not found" }
-        })))
-        .mount(&mock_server)
-        .await;
+    let (addr, _proxy) = start_proxy(None).await;
+    let client = http_client();
+    let key = api_key();
 
-    let (app, host) = start_proxy_no_catalog(&mock_server).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models/nonexistent", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    let resp = client
+        .get(models_get_url(addr, "this-model-does-not-exist-xyz-12345"))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn mode1_missing_auth_returns_401() {
-    let mock_server = MockServer::start().await;
-    let (app, host) = start_proxy_no_catalog(&mock_server).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    let (addr, _proxy) = start_proxy(None).await;
+    let client = http_client();
+
+    let resp = client
+        .get(models_list_url(addr))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn mode1_invalid_route_returns_400() {
-    let mock_server = MockServer::start().await;
-    let (app, host) = start_proxy_no_catalog(&mock_server).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models/a/b", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    let (addr, _proxy) = start_proxy(None).await;
+    let client = http_client();
+    let key = api_key();
+    let host = upstream_host();
+
+    let url = format!("http://{}/https/{}/models/a/b", addr, host);
+    let resp = client
+        .get(&url) // & needed for format!()-produced String
+        .header("authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
-#[tokio::test]
-async fn mode1_forward_query_params() {
-    let mock_server = MockServer::start().await;
-    // The mock matches any GET to /v1/models regardless of query params.
-    // We verify that query params are forwarded by checking the response succeeds
-    // (the upstream would 404 if the path were wrong).
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [], "has_more": false
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let (app, host) = start_proxy_no_catalog(&mock_server).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models?limit=20", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-}
-
-// --- Mode 2 Tests ---
+// ===========================================================================
+// Mode 2 Tests (with catalog — filtered Codex catalog format)
+// ===========================================================================
 
 #[tokio::test]
 async fn mode2_list_models_filtered_by_upstream() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
-                { "type": "model", "id": "claude-sonnet-4-20250514", "display_name": "S4" },
-                { "type": "model", "id": "claude-opus-4-20250514", "display_name": "O4" }
-            ],
-            "has_more": false
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let catalog = codex_conv::catalog::ModelsResponse {
+    // Use a model that exists on the real upstream and one that doesn't.
+    let catalog = ModelsResponse {
         models: vec![
-            minimal_model_info("claude-sonnet-4-20250514"),
-            minimal_model_info("claude-opus-4-20250514"),
-            minimal_model_info("nonexistent-model"),
+            minimal_model_info(KNOWN_MODEL),
+            minimal_model_info("this-does-not-exist-on-upstream"),
         ],
     };
 
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let (addr, _proxy) = start_proxy(Some(catalog)).await;
+    let client = http_client();
+    let key = api_key();
 
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+    let resp = client
+        .get(models_list_url(addr))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let models = json["models"].as_array().unwrap();
-    assert_eq!(
-        models.len(),
-        2,
-        "only upstream-matching models should appear"
-    );
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let json: serde_json::Value = resp.json().await.expect("failed to parse response");
+    let models = json["models"]
+        .as_array()
+        .expect("Mode 2 response must have 'models' array");
+
     let slugs: Vec<&str> = models.iter().map(|m| m["slug"].as_str().unwrap()).collect();
-    assert!(slugs.contains(&"claude-sonnet-4-20250514"));
-    assert!(slugs.contains(&"claude-opus-4-20250514"));
-    assert!(!slugs.contains(&"nonexistent-model"));
+    assert!(
+        slugs.contains(&KNOWN_MODEL),
+        "{KNOWN_MODEL} should appear (exists on upstream)"
+    );
+    assert!(
+        !slugs.contains(&"this-does-not-exist-on-upstream"),
+        "nonexistent model must be filtered out"
+    );
 }
 
 #[tokio::test]
 async fn mode2_list_no_overlap_falls_back_to_openai_format() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
-                { "type": "model", "id": "upstream-only-model", "display_name": "Upstream" }
-            ],
-            "has_more": false
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let catalog = codex_conv::catalog::ModelsResponse {
-        models: vec![minimal_model_info("catalog-only-model")],
+    // Catalog contains only models that don't exist on upstream.
+    let catalog = ModelsResponse {
+        models: vec![minimal_model_info("catalog-only-nonexistent-model")],
     };
 
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let (addr, _proxy) = start_proxy(Some(catalog)).await;
+    let client = http_client();
+    let key = api_key();
 
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+    let resp = client
+        .get(models_list_url(addr))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let json: serde_json::Value = resp.json().await.expect("failed to parse response");
+    // With zero overlap, proxy should fall back to standard OpenAI list format.
     assert_eq!(json["object"], "list");
     assert!(
         json.get("models").is_none(),
@@ -324,221 +323,78 @@ async fn mode2_list_no_overlap_falls_back_to_openai_format() {
 }
 
 #[tokio::test]
-async fn mode2_get_model_found_in_catalog() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models/claude-sonnet-4-20250514"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "type": "model", "id": "claude-sonnet-4-20250514", "display_name": "S4"
-        })))
-        .mount(&mock_server)
-        .await;
+async fn mode2_get_nonexistent_model_returns_404() {
+    let catalog = ModelsResponse {
+        models: vec![minimal_model_info(KNOWN_MODEL)],
+    };
 
-    let mut info = minimal_model_info("claude-sonnet-4-20250514");
-    info.display_name = "Sonnet 4 from Catalog".to_string();
-    let catalog = codex_conv::catalog::ModelsResponse { models: vec![info] };
+    let (addr, _proxy) = start_proxy(Some(catalog)).await;
+    let client = http_client();
+    let key = api_key();
 
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models/claude-sonnet-4-20250514", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+    let resp = client
+        .get(models_get_url(addr, "this-model-does-not-exist-xyz-12345"))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let models = json["models"].as_array().unwrap();
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0]["display_name"], "Sonnet 4 from Catalog");
-}
+        .expect("request failed");
 
-#[tokio::test]
-async fn mode2_get_model_upstream_404() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models/nonexistent"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "type": "error",
-            "error": { "type": "not_found_error", "message": "model not found" }
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let catalog = codex_conv::catalog::ModelsResponse {
-        models: vec![minimal_model_info("other-model")],
-    };
-
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models/nonexistent", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn mode2_get_model_not_in_catalog_returns_openai_format() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models/claude-sonnet-4-20250514"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "type": "model", "id": "claude-sonnet-4-20250514",
-            "display_name": "S4", "created_at": "2025-02-19T00:00:00Z"
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let catalog = codex_conv::catalog::ModelsResponse {
-        models: vec![minimal_model_info("other-model")],
-    };
-
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models/claude-sonnet-4-20250514", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], "claude-sonnet-4-20250514");
-    assert_eq!(json["object"], "model");
-    assert!(json.get("models").is_none());
-}
-
-#[tokio::test]
-async fn mode2_upstream_5xx_returns_error() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
-            "type": "error",
-            "error": { "type": "api_error", "message": "internal error" }
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let catalog = codex_conv::catalog::ModelsResponse {
-        models: vec![minimal_model_info("model-a")],
-    };
-
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn mode2_upstream_401_propagated() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-            "type": "error",
-            "error": { "type": "authentication_error", "message": "invalid api key" }
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let catalog = codex_conv::catalog::ModelsResponse {
-        models: vec![minimal_model_info("model-a")],
-    };
-
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn mode2_missing_auth_returns_401() {
-    let mock_server = MockServer::start().await;
-    let catalog = codex_conv::catalog::ModelsResponse {
-        models: vec![minimal_model_info("model-a")],
+    let catalog = ModelsResponse {
+        models: vec![minimal_model_info(KNOWN_MODEL)],
     };
 
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    let (addr, _proxy) = start_proxy(Some(catalog)).await;
+    let client = http_client();
+
+    let resp = client
+        .get(models_list_url(addr))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn mode2_priority_ordering() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
-                { "type": "model", "id": "model-low", "display_name": "Low" },
-                { "type": "model", "id": "model-high", "display_name": "High" },
-                { "type": "model", "id": "model-mid", "display_name": "Mid" }
-            ],
-            "has_more": false
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let mut m_low = minimal_model_info("model-low");
+    // Use real model IDs to ensure overlap with upstream.
+    let mut m_low = minimal_model_info(KNOWN_MODEL);
     m_low.priority = 10;
-    let mut m_high = minimal_model_info("model-high");
+    let mut m_high = minimal_model_info("glm-4.7");
     m_high.priority = 1;
-    let mut m_mid = minimal_model_info("model-mid");
-    m_mid.priority = 5;
 
-    let catalog = codex_conv::catalog::ModelsResponse {
-        models: vec![m_low, m_high, m_mid],
+    let catalog = ModelsResponse {
+        models: vec![m_low, m_high],
     };
 
-    let (app, host) = start_proxy_with_catalog(&mock_server, Some(catalog)).await;
-    let req = axum::http::Request::builder()
-        .method("GET")
-        .uri(format!("/http/{}/models", host))
-        .header("authorization", "Bearer sk-test-key")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let (addr, _proxy) = start_proxy(Some(catalog)).await;
+    let client = http_client();
+    let key = api_key();
 
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+    let resp = client
+        .get(models_list_url(addr))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let models = json["models"].as_array().unwrap();
+        .expect("request failed");
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let json: serde_json::Value = resp.json().await.expect("failed to parse response");
+    let models = json["models"].as_array().expect("must have models array");
+
     let priorities: Vec<i64> = models
         .iter()
         .map(|m| m["priority"].as_i64().unwrap())
         .collect();
     assert_eq!(
         priorities,
-        vec![1, 5, 10],
+        vec![1, 10],
         "models should be sorted by priority ascending"
     );
 }

@@ -28,7 +28,6 @@ tokio-stream = "0.1"
 chrono = "0.4"
 
 [dev-dependencies]
-wiremock = "0.6"
 tempfile = "3"
 tower = "0.5"
 eventsource-stream = "0.2"
