@@ -36,6 +36,27 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 
 代理从 URL 路径中提取上游地址（`/https/<host>/responses` → `https://<host>/v1/messages`），并转发 `Authorization` 头中的 API 密钥。
 
+## 功能对比
+
+| | codex-conv | [CLIProxyAPI] | [Tokligence GW] | [CC-Adapter] | [claude-code-proxy] | [LiteLLM] |
+|---|---|---|---|---|---|---|
+| 转换方向 | Responses→Anthropic | 双向 | Responses→Anthropic | Anthropic→其他 | Anthropic→其他 | 统一接口 |
+| 流式 | Yes | Yes | Yes | Yes | Yes | Yes |
+| 多轮对话 | Yes | Yes | Yes | Yes | Yes | Yes |
+| 工具调用 | Yes | 部分 | 部分 | 部分 | Yes | Yes |
+| apply_patch | Yes | No | No | No | No | No |
+| Models API | Yes | Yes | No | No | No | No |
+| 模型目录 | Yes | 部分 | No | Yes | Yes | Yes |
+| 自定义上游 | Yes | Yes | Yes | Yes | Yes | Yes |
+| 上游链式代理 | Yes | No | No | No | No | Yes |
+| 语言 | Rust | Go | TypeScript | Rust | Python | Python |
+
+[CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
+[Tokligence GW]: https://github.com/tokligence/tokligence-gateway
+[CC-Adapter]: https://github.com/Jakevin/CC-Adapter
+[claude-code-proxy]: https://github.com/1rgs/claude-code-proxy
+[LiteLLM]: https://github.com/BerriAI/litellm
+
 ## 代理配置
 
 配置优先级从高到低：

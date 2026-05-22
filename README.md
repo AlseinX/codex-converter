@@ -36,6 +36,27 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 
 The proxy extracts the upstream host from the URL path (`/https/<host>/responses` → `https://<host>/v1/messages`) and forwards the API key from the `Authorization` header.
 
+## Comparison
+
+| | codex-conv | [CLIProxyAPI] | [Tokligence GW] | [CC-Adapter] | [claude-code-proxy] | [LiteLLM] |
+|---|---|---|---|---|---|---|
+| Direction | Responses→Anthropic | Both | Responses→Anthropic | Anthropic→Others | Anthropic→Others | Unified |
+| Streaming | Yes | Yes | Yes | Yes | Yes | Yes |
+| Multi-turn | Yes | Yes | Yes | Yes | Yes | Yes |
+| Tool calls | Yes | Partial | Partial | Partial | Yes | Yes |
+| apply_patch | Yes | No | No | No | No | No |
+| Models API | Yes | Yes | No | No | No | No |
+| Model catalog | Yes | Partial | No | Yes | Yes | Yes |
+| Custom upstream | Yes | Yes | Yes | Yes | Yes | Yes |
+| Upstream chaining | Yes | No | No | No | No | Yes |
+| Language | Rust | Go | TypeScript | Rust | Python | Python |
+
+[CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
+[Tokligence GW]: https://github.com/tokligence/tokligence-gateway
+[CC-Adapter]: https://github.com/Jakevin/CC-Adapter
+[claude-code-proxy]: https://github.com/1rgs/claude-code-proxy
+[LiteLLM]: https://github.com/BerriAI/litellm
+
 ## Proxy Configuration
 
 Configuration priority (highest to lowest):
