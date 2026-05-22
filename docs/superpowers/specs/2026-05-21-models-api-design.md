@@ -11,7 +11,7 @@ Add Models API endpoints (`GET /v1/models`, `GET /v1/models/{model}`) with two r
 | Mode | `model_catalog` | Response format | Upstream call |
 |------|-----------------|-----------------|---------------|
 | 1 — Standard OpenAI | Empty (default) | `{ "object": "list", "data": [...] }` | Yes — Anthropic `GET /v1/models` |
-| 2 — Codex Extended | One or more files | `{ "models": [ModelInfo...] }` | No — serve from catalog |
+| 2 — Codex Extended | One or more files | `{ "models": [ModelInfo...] }` | Yes — Anthropic `GET /v1/models` for filtering |
 
 **Research entry:** `docs/protocol_research.md` section 13.
 
@@ -187,21 +187,47 @@ All network errors logged with `tracing::error!`.
 
 Activated when `model_catalog` has one or more files.
 
+The proxy calls Anthropic upstream to discover which models are actually available, then filters the catalog against that live set. This ensures downstream clients only see models that exist and are accessible with the current API key.
+
 ### Flow
 
 1. **Auth check** — same as Mode 1
 2. **Route parsing** — same as Mode 1
-3. **No upstream call** — serve from the loaded and merged catalog
-4. **Return** — `content-type: application/json`
+3. **Upstream call** — call Anthropic to discover available models (see per-route detail below)
+4. **Filter catalog** — keep only catalog models confirmed available upstream
+5. **Return** — `content-type: application/json`
 
 **List models (`GET /models`):**
-- Return `{ "models": [<ModelInfo>, ...] }` from the merged catalog.
-- Models sorted by `priority` (ascending — lower = higher priority), stable by `slug`.
+
+1. Call Anthropic `GET /v1/models` to retrieve the set of available model IDs.
+2. Load and merge all catalog files (existing merge logic unchanged).
+3. Filter: keep only catalog models whose `slug` matches an `id` in the Anthropic response.
+4. Return `{ "models": [<ModelInfo>, ...] }` from the filtered catalog.
+5. Models sorted by `priority` (ascending — lower = higher priority), stable by `slug`.
 
 **Get model (`GET /models/{model}`):**
-- Find model where `slug` matches the requested `model_id`.
-- If found: return `{ "models": [<ModelInfo>] }` with one element.
-- If not found: return 404 with standard OpenAI error format `{ "error": { "message": "...", "type": "invalid_request_error", "code": "model_not_found" } }`.
+
+1. Call Anthropic `GET /v1/models/{model}` to check if the model exists upstream.
+2. If Anthropic returns 404 → return 404 to downstream with standard OpenAI error format.
+3. If Anthropic confirms the model exists → look up `slug` in the merged catalog.
+4. If found in catalog → return `{ "models": [<ModelInfo>] }` with one element.
+5. If NOT found in catalog (model exists upstream but has no catalog entry) → generate a minimal `ModelInfo` from the Anthropic response data:
+   - `slug` = Anthropic `id`
+   - `display_name` = Anthropic `display_name` if present, otherwise derive from `id` (e.g. `"claude-sonnet-4-20250514"` → `"Claude Sonnet 4"` heuristic)
+   - All other required fields set to their serde defaults
+   - Return `{ "models": [generated ModelInfo] }`
+
+### Error Handling (Mode 2 — Upstream Failure)
+
+When the Anthropic upstream call fails, the proxy returns an error to the downstream client. It must never silently return unfiltered catalog data.
+
+| Upstream error scenario | Response |
+|---|---|
+| Network error (connection refused, timeout, DNS) | Log `tracing::error!`, return 502 `server_error` "Upstream request failed" |
+| Anthropic 5xx | Log `tracing::error!`, return 502 `server_error` with upstream status code |
+| Anthropic 401 | Return 401 to downstream (auth problem must propagate) |
+| Anthropic 404 (`GET /models/{model}` only) | Return 404 to downstream |
+| Non-JSON 200 body | 502 `server_error` "Invalid upstream response" |
 
 ### Response Format
 
@@ -220,11 +246,10 @@ Activated when `model_catalog` has one or more files.
 
 This is Codex CLI's `ModelsResponse { models: Vec<ModelInfo> }` format — see ModelInfo field reference below.
 
-### Error Handling (Mode 2 — Runtime)
+### Remaining Error Scenarios (Mode 2 — Non-Upstream)
 
 | Scenario | Response |
 |---|---|
-| Model not found (`GET /models/{model}`) | 404 with `{ "error": { "message": "Model not found: {model_id}", "type": "invalid_request_error", "code": "model_not_found" } }` |
 | Invalid path (extra segments) | 400 — same as Mode 1 |
 | Missing auth | 401 — same as Mode 1 |
 
@@ -401,12 +426,12 @@ async fn handle_models(State(state): State<AppState>, req: Request) -> Result<Re
     if state.config.model_catalog.is_empty() {
         handle_models_standard(&state, route_info).await  // Mode 1
     } else {
-        handle_models_catalog(&state, route_info)          // Mode 2
+        handle_models_catalog(&state, route_info).await   // Mode 2 — also async (calls upstream)
     }
 }
 ```
 
-Both mode handlers are separate functions. Shared logic (auth, route parsing, error formatting) stays in `handle_models`.
+Both mode handlers are separate async functions. Shared logic (auth, route parsing, error formatting) stays in `handle_models`. Mode 2's `handle_models_catalog` calls Anthropic upstream and then filters the merged catalog against the upstream response.
 
 ## Files Changed
 
@@ -414,7 +439,7 @@ Both mode handlers are separate functions. Shared logic (auth, route parsing, er
 |---|---|
 | `src/config.rs` | Add `model_catalog: Vec<PathBuf>` to `AppConfig` |
 | `src/router.rs` | Add `RouteType` enum, extend `RouteInfo::parse()`, add `handle_models` handler with mode dispatch |
-| `src/conversion/models.rs` | New: Mode 1 conversion (`anthropic_to_openai_model`, `anthropic_list_to_openai_list`) |
+| `src/conversion/models.rs` | New: Mode 1 conversion (`anthropic_to_openai_model`, `anthropic_list_to_openai_list`), Mode 2 upstream filter logic, minimal ModelInfo generation |
 | `src/catalog.rs` | New: catalog loading, multi-file merge, `ModelInfo` types |
 | `src/conversion/mod.rs` | Add `pub mod models;` |
 | `src/lib.rs` | No change needed |
@@ -434,15 +459,19 @@ Both mode handlers are separate functions. Shared logic (auth, route parsing, er
 
 ### Mode 2 Tests (Integration: `tests/models.rs`)
 
-1. **List models** — returns `{ "models": [ModelInfo...] }` from catalog
-2. **Get model** — returns `{ "models": [single ModelInfo] }` for matching slug
-3. **Get nonexistent model** — 404 with `model_not_found`
-4. **Auth required** — 401 without API key
-5. **All required fields present** — every ModelInfo in response has all 18 required fields
-6. **Multi-file merge: different slugs** — union of all models across files
-7. **Multi-file merge: same slug overlay** — earlier file's non-null fields override later file's
-8. **Multi-file merge: Option fallthrough** — absent/null in earlier file falls through to later file
-9. **Priority ordering** — models sorted by `priority` ascending
+1. **List models — filtered by upstream** — returns `{ "models": [ModelInfo...] }` containing only catalog models whose `slug` exists in the Anthropic upstream response
+2. **List models — upstream 5xx returns error** — when Anthropic returns 5xx, downstream receives 502 `server_error`
+3. **List models — upstream network error returns error** — when Anthropic is unreachable, downstream receives 502 `server_error`
+4. **List models — upstream 401 propagated** — when Anthropic returns 401, downstream receives 401
+5. **Get model — found in catalog** — returns `{ "models": [single ModelInfo] }` for slug that exists upstream and in catalog
+6. **Get model — upstream 404** — returns 404 with `model_not_found` when Anthropic says model doesn't exist
+7. **Get model — exists upstream but not in catalog** — returns minimal generated `ModelInfo` with `slug` = Anthropic `id`
+8. **Auth required** — 401 without API key
+9. **All required fields present** — every ModelInfo in response has all 18 required fields
+10. **Multi-file merge: different slugs** — union of all models across files (filtered by upstream)
+11. **Multi-file merge: same slug overlay** — earlier file's non-null fields override later file's
+12. **Multi-file merge: Option fallthrough** — absent/null in earlier file falls through to later file
+13. **Priority ordering** — models sorted by `priority` ascending
 
 ### Config Validation Tests (Unit: `src/catalog.rs`)
 
