@@ -46,16 +46,18 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 | 64字符名称截断 | Yes | Yes | Yes | No | No |
 | apply_patch | Yes | No | No | No | No |
 | Models API | Yes | Yes | No | No | Yes |
-| 模型目录 | 完整 Codex² | No³ | No | No | 标准 OpenAI⁴ |
+| 模型目录 | 完整 Codex³ | No⁴ | No | No | 标准 OpenAI⁵ |
 | 语言 | Rust | Go | Rust | Python | Python |
 
 ¹ AnthMorph：使用 SHA1 哈希后缀缩短名称，但目标是 Chat Completions API，不支持 OpenAI Responses API 的 `type: "namespace"` 工具定义。
 
-² 完整 Codex：完整 Codex CLI `ModelInfo` 规范（全部 32 字段），与上游实际可用模型取交集。
+² apply_patch：Codex CLI 使用 `apply_patch` 工具来应用代码变更。当模型的 `apply_patch_tool_type` 为 `"freeform"` 时，Codex 不会在请求中包含此工具——模型需要自行生成 patch 调用。codex-conv 自动注入 `apply_patch` 工具定义，将 freeform patch 输出转换为 Anthropic `tool_use` 块，并将 `tool_result` 转回 Codex 格式。
 
-³ CLIProxyAPI：返回硬编码的 OpenAI 模型模板（gpt-5.5、gpt-5.4 等）——这些模型在 Anthropic 上游并不存在。
+³ 完整 Codex：完整 Codex CLI `ModelInfo` 规范（全部 32 字段），与上游实际可用模型取交集。
 
-⁴ 标准 OpenAI：仅返回基础模型列表，包含 `id`、`object`、`owned_by`、`created`，无 Codex 专有字段。
+⁴ CLIProxyAPI：返回硬编码的 OpenAI 模型模板（gpt-5.5、gpt-5.4 等）——这些模型在 Anthropic 上游并不存在。
+
+⁵ 标准 OpenAI：仅返回基础模型列表，包含 `id`、`object`、`owned_by`、`created`，无 Codex 专有字段。
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
 [AnthMorph]: https://github.com/DioNanos/AnthMorph

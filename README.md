@@ -46,16 +46,18 @@ All projects below convert OpenAI Responses API → Anthropic Messages API.
 | 64-char name truncation | Yes | Yes | Yes | No | No |
 | apply_patch | Yes | No | No | No | No |
 | Models API | Yes | Yes | No | No | Yes |
-| Model catalog | Full Codex² | No³ | No | No | Standard OpenAI⁴ |
+| Model catalog | Full Codex³ | No⁴ | No | No | Standard OpenAI⁵ |
 | Language | Rust | Go | Rust | Python | Python |
 
 ¹ AnthMorph: uses SHA1 hash suffix for name shortening, but targets Chat Completions API — does not handle OpenAI Responses API `type: "namespace"` tool definitions.
 
-² Full Codex: complete Codex CLI `ModelInfo` spec (all 32 fields), intersected with actual upstream model availability.
+² apply_patch: Codex CLI uses the `apply_patch` tool to apply code changes. When a model's `apply_patch_tool_type` is `"freeform"`, Codex omits this tool from the request — the model is expected to know how to generate patch calls on its own. codex-conv auto-injects the `apply_patch` tool definition, converts freeform patch output to Anthropic `tool_use` blocks, and converts `tool_result` back to Codex format.
 
-³ CLIProxyAPI: returns hardcoded OpenAI model templates (gpt-5.5, gpt-5.4, etc.) — these models do not exist on Anthropic upstream.
+³ Full Codex: complete Codex CLI `ModelInfo` spec (all 32 fields), intersected with actual upstream model availability.
 
-⁴ Standard OpenAI: basic model list with `id`, `object`, `owned_by`, `created` only — no Codex-specific fields.
+⁴ CLIProxyAPI: returns hardcoded OpenAI model templates (gpt-5.5, gpt-5.4, etc.) — these models do not exist on Anthropic upstream.
+
+⁵ Standard OpenAI: basic model list with `id`, `object`, `owned_by`, `created` only — no Codex-specific fields.
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
 [AnthMorph]: https://github.com/DioNanos/AnthMorph
