@@ -202,8 +202,9 @@ The proxy calls Anthropic upstream to discover which models are actually availab
 1. Call Anthropic `GET /v1/models` to retrieve the set of available model IDs.
 2. Load and merge all catalog files (existing merge logic unchanged).
 3. Filter: keep only catalog models whose `slug` matches an `id` in the Anthropic response.
-4. Return `{ "models": [<ModelInfo>, ...] }` from the filtered catalog.
-5. Models sorted by `priority` (ascending — lower = higher priority), stable by `slug`.
+4. **If the filtered result is empty (no overlap between catalog slugs and upstream IDs)** → discard catalog, convert the Anthropic response to standard OpenAI format (same as Mode 1) and return `{ "object": "list", "data": [...] }`.
+5. If the filtered result is non-empty → return `{ "models": [<ModelInfo>, ...] }` from the filtered catalog.
+6. Models sorted by `priority` (ascending — lower = higher priority), stable by `slug`.
 
 **Get model (`GET /models/{model}`):**
 
@@ -211,11 +212,7 @@ The proxy calls Anthropic upstream to discover which models are actually availab
 2. If Anthropic returns 404 → return 404 to downstream with standard OpenAI error format.
 3. If Anthropic confirms the model exists → look up `slug` in the merged catalog.
 4. If found in catalog → return `{ "models": [<ModelInfo>] }` with one element.
-5. If NOT found in catalog (model exists upstream but has no catalog entry) → generate a minimal `ModelInfo` from the Anthropic response data:
-   - `slug` = Anthropic `id`
-   - `display_name` = Anthropic `display_name` if present, otherwise derive from `id` (e.g. `"claude-sonnet-4-20250514"` → `"Claude Sonnet 4"` heuristic)
-   - All other required fields set to their serde defaults
-   - Return `{ "models": [generated ModelInfo] }`
+5. If NOT found in catalog → return the Anthropic response converted to standard OpenAI single-model format (same as Mode 1).
 
 ### Error Handling (Mode 2 — Upstream Failure)
 
