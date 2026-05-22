@@ -44,7 +44,7 @@ All projects below convert OpenAI Responses API → Anthropic Messages API.
 |---|---|---|---|---|---|
 | MCP namespace mapping | Yes | Yes | Partial¹ | No | No |
 | 64-char name truncation | Yes | Yes | Yes | No | No |
-| apply_patch | Yes | No | No | No | No |
+| apply_patch² | Yes | No | No | No | No |
 | Models API | Yes | Yes | No | No | Yes |
 | Model catalog | Full Codex³ | No⁴ | No | No | Standard OpenAI⁵ |
 | Language | Rust | Go | Rust | Python | Python |

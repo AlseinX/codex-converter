@@ -44,7 +44,7 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 |---|---|---|---|---|---|
 | MCP 命名空间映射 | Yes | Yes | Partial¹ | No | No |
 | 64字符名称截断 | Yes | Yes | Yes | No | No |
-| apply_patch | Yes | No | No | No | No |
+| apply_patch² | Yes | No | No | No | No |
 | Models API | Yes | Yes | No | No | Yes |
 | 模型目录 | 完整 Codex³ | No⁴ | No | No | 标准 OpenAI⁵ |
 | 语言 | Rust | Go | Rust | Python | Python |
