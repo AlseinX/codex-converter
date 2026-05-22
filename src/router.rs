@@ -8,60 +8,109 @@ use futures::StreamExt;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 
+/// The type of route being requested.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteType {
+    Responses,
+    ModelsList,
+    ModelsGet(String),
+}
+
 /// Parsed route information extracted from the request URL.
 #[derive(Debug, Clone)]
 pub struct RouteInfo {
     /// The upstream base URL (e.g., "https://api.anthropic.com").
     /// No trailing slash, no /v1 prefix.
     pub upstream_base_url: String,
+    pub route_type: RouteType,
+    pub model_id: Option<String>,
 }
 
 impl RouteInfo {
-    /// Parse the request path to extract the upstream base URL.
+    /// Parse the request path to extract the upstream base URL and route type.
     ///
     /// Accepted formats (all normalized to `https://host`):
     /// - `/https/api.anthropic.com/responses`
     /// - `/https:/api.anthropic.com/responses`
     /// - `/https://api.anthropic.com/responses`
     /// - `/v1/https/api.anthropic.com/responses`
+    /// - `/https/api.anthropic.com/models`
+    /// - `/https/api.anthropic.com/models/claude-sonnet-4-20250514`
     ///
-    /// Returns None if the path does not end in `/responses` or the host is missing.
+    /// Returns None if the path does not match a known route or the host is missing.
     pub fn parse(path: &str) -> Option<Self> {
-        // Must end with /responses.
-        if !path.ends_with("/responses") {
-            return None;
-        }
+        let stripped = path.strip_prefix("/v1").unwrap_or(path);
+        let after_https = stripped.strip_prefix("/https")?;
 
-        // Strip trailing /responses.
-        let prefix = &path[..path.len() - "/responses".len()];
-
-        // Strip optional /v1 prefix.
-        let prefix = prefix.strip_prefix("/v1").unwrap_or(prefix);
-
-        // Must start with /https.
-        let after_https = prefix.strip_prefix("/https")?;
-
-        // Normalize: strip optional :// or :/ or just /.
-        let host_part = if let Some(stripped) = after_https.strip_prefix("://") {
-            stripped
-        } else if let Some(stripped) = after_https.strip_prefix(":/") {
-            stripped
+        let host_and_rest = if let Some(s) = after_https.strip_prefix("://") {
+            s
+        } else if let Some(s) = after_https.strip_prefix(":/") {
+            s
         } else {
             after_https.strip_prefix('/')?
         };
 
-        if host_part.is_empty() {
+        if host_and_rest.is_empty() {
             return None;
         }
 
+        let (host, rest) = match host_and_rest.find('/') {
+            Some(idx) => (&host_and_rest[..idx], &host_and_rest[idx..]),
+            None => (host_and_rest, ""),
+        };
+
+        if host.is_empty() {
+            return None;
+        }
+
+        let upstream_base_url = format!("https://{}", host);
+
+        let (route_type, model_id) = if rest.is_empty() {
+            return None;
+        } else if rest == "/responses" {
+            (RouteType::Responses, None)
+        } else if rest == "/models" || rest == "/models/" {
+            (RouteType::ModelsList, None)
+        } else if let Some(after_models) = rest.strip_prefix("/models/") {
+            let after_models = after_models.trim_end_matches('/');
+            if after_models.is_empty() {
+                (RouteType::ModelsList, None)
+            } else if after_models.contains('/') {
+                return None;
+            } else {
+                (
+                    RouteType::ModelsGet(after_models.to_string()),
+                    Some(after_models.to_string()),
+                )
+            }
+        } else {
+            return None;
+        };
+
         Some(RouteInfo {
-            upstream_base_url: format!("https://{}", host_part),
+            upstream_base_url,
+            route_type,
+            model_id,
         })
     }
 
     /// Build the full upstream URL for the Anthropic Messages API.
     pub fn upstream_messages_url(&self) -> String {
         format!("{}/v1/messages", self.upstream_base_url)
+    }
+
+    /// Build the full upstream URL for the Anthropic Models list API.
+    pub fn upstream_models_list_url(&self) -> String {
+        format!("{}/v1/models", self.upstream_base_url)
+    }
+
+    /// Build the full upstream URL for the Anthropic Models get API.
+    pub fn upstream_models_get_url(&self) -> String {
+        format!(
+            "{}/v1/models/{}",
+            self.upstream_base_url,
+            self.model_id.as_deref().unwrap_or("")
+        )
     }
 }
 
@@ -2319,6 +2368,58 @@ mod tests {
             Some("rs_test_signature_123".to_string()),
             "signature from the first (failed) response should be cached under reasoning_id {}",
             reasoning_id
+        );
+    }
+
+    // --- Models route parsing tests ---
+
+    #[test]
+    fn parses_models_list_route() {
+        let route = RouteInfo::parse("/https/api.anthropic.com/models").unwrap();
+        assert_eq!(route.upstream_base_url, "https://api.anthropic.com");
+        assert_eq!(route.route_type, RouteType::ModelsList);
+        assert!(route.model_id.is_none());
+    }
+
+    #[test]
+    fn parses_models_list_with_trailing_slash() {
+        let route = RouteInfo::parse("/https/api.anthropic.com/models/").unwrap();
+        assert_eq!(route.route_type, RouteType::ModelsList);
+    }
+
+    #[test]
+    fn parses_models_get_route() {
+        let route =
+            RouteInfo::parse("/https/api.anthropic.com/models/claude-sonnet-4-20250514").unwrap();
+        assert_eq!(route.upstream_base_url, "https://api.anthropic.com");
+        assert_eq!(
+            route.route_type,
+            RouteType::ModelsGet("claude-sonnet-4-20250514".to_string())
+        );
+        assert_eq!(route.model_id.as_deref(), Some("claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn rejects_models_with_extra_segments() {
+        let result = RouteInfo::parse("/https/api.anthropic.com/models/a/b");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn models_list_url() {
+        let route = RouteInfo::parse("/https/api.anthropic.com/models").unwrap();
+        assert_eq!(
+            route.upstream_models_list_url(),
+            "https://api.anthropic.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn models_get_url() {
+        let route = RouteInfo::parse("/https/api.anthropic.com/models/claude-sonnet-4").unwrap();
+        assert_eq!(
+            route.upstream_models_get_url(),
+            "https://api.anthropic.com/v1/models/claude-sonnet-4"
         );
     }
 }
