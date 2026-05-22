@@ -38,22 +38,26 @@ base_url = "http://localhost:8080/https/api.anthropic.com"
 
 ## 功能对比
 
-| | codex-conv | [CLIProxyAPI] | [Tokligence GW] | [CC-Adapter] | [claude-code-proxy] | [LiteLLM] |
+以下项目均为 OpenAI Responses API → Anthropic Messages API 转换方向（Responses→Anthropic）。
+
+| | codex-conv | [CLIProxyAPI] | [Headroom] | [codex-bridge] | [rosetta-llm] | [AnthMorph] |
 |---|---|---|---|---|---|---|
-| 转换方向 | Responses→Anthropic | 双向 | Responses→Anthropic | Anthropic→其他 | Anthropic→其他 | 统一接口 |
-| 工具调用 | Yes | 部分 | 部分 | 部分 | Yes | Yes |
+| 工具调用 | Yes | 部分¹ | Yes | Yes | 部分² | 部分² |
 | apply_patch | Yes | No | No | No | No | No |
-| Models API | Yes | Yes | No | No | No | No |
-| 模型目录 | Yes | 部分 | No | Yes | Yes | Yes |
-| 自定义上游 | Yes | Yes | Yes | Yes | Yes | Yes |
-| 上游链式代理 | Yes | No | No | No | No | Yes |
-| 语言 | Rust | Go | TypeScript | Rust | Python | Python |
+| Models API | Yes | Yes | Yes | No | Yes | No |
+| 模型目录 | Yes | 部分³ | Yes | No | Yes | No |
+| 上游链式代理 | Yes | No | Yes | No | No | No |
+| 语言 | Rust | Go | Rust+Python | Python | Python | Rust |
+
+¹ CLIProxyAPI：工具调用转换存在已知缺陷（见 [issue #736](https://github.com/router-for-me/CLIProxyAPI/issues/736)）。
+² 部分：仅支持基础 function call 映射，流式 tool-use 重建不完整。
+³ CLIProxyAPI：仅支持模型别名，无目录过滤。
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
-[Tokligence GW]: https://github.com/tokligence/tokligence-gateway
-[CC-Adapter]: https://github.com/Jakevin/CC-Adapter
-[claude-code-proxy]: https://github.com/1rgs/claude-code-proxy
-[LiteLLM]: https://github.com/BerriAI/litellm
+[Headroom]: https://github.com/chopratejas/headroom
+[codex-bridge]: https://github.com/nicholasyangyang/codex-bridge
+[rosetta-llm]: https://github.com/Lokesh-Chimakurthi/rosetta-llm
+[AnthMorph]: https://github.com/DioNanos/AnthMorph
 
 ## 代理配置
 

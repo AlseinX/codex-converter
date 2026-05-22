@@ -38,22 +38,26 @@ The proxy extracts the upstream host from the URL path (`/https/<host>/responses
 
 ## Comparison
 
-| | codex-conv | [CLIProxyAPI] | [Tokligence GW] | [CC-Adapter] | [claude-code-proxy] | [LiteLLM] |
+All projects below convert OpenAI Responses API → Anthropic Messages API (Responses→Anthropic direction).
+
+| | codex-conv | [CLIProxyAPI] | [Headroom] | [codex-bridge] | [rosetta-llm] | [AnthMorph] |
 |---|---|---|---|---|---|---|
-| Direction | Responses→Anthropic | Both | Responses→Anthropic | Anthropic→Others | Anthropic→Others | Unified |
-| Tool calls | Yes | Partial | Partial | Partial | Yes | Yes |
+| Tool calls | Yes | Partial¹ | Yes | Yes | Partial² | Partial² |
 | apply_patch | Yes | No | No | No | No | No |
-| Models API | Yes | Yes | No | No | No | No |
-| Model catalog | Yes | Partial | No | Yes | Yes | Yes |
-| Custom upstream | Yes | Yes | Yes | Yes | Yes | Yes |
-| Upstream chaining | Yes | No | No | No | No | Yes |
-| Language | Rust | Go | TypeScript | Rust | Python | Python |
+| Models API | Yes | Yes | Yes | No | Yes | No |
+| Model catalog | Yes | Partial³ | Yes | No | Yes | No |
+| Upstream chaining | Yes | No | Yes | No | No | No |
+| Language | Rust | Go | Rust+Python | Python | Python | Rust |
+
+¹ CLIProxyAPI: known bugs in tool call conversion (see [issue #736](https://github.com/router-for-me/CLIProxyAPI/issues/736)).
+² Partial: basic function call mapping only; streaming tool-use reconstruction not fully handled.
+³ CLIProxyAPI: model aliasing only, no catalog filtering.
 
 [CLIProxyAPI]: https://github.com/router-for-me/CLIProxyAPI
-[Tokligence GW]: https://github.com/tokligence/tokligence-gateway
-[CC-Adapter]: https://github.com/Jakevin/CC-Adapter
-[claude-code-proxy]: https://github.com/1rgs/claude-code-proxy
-[LiteLLM]: https://github.com/BerriAI/litellm
+[Headroom]: https://github.com/chopratejas/headroom
+[codex-bridge]: https://github.com/nicholasyangyang/codex-bridge
+[rosetta-llm]: https://github.com/Lokesh-Chimakurthi/rosetta-llm
+[AnthMorph]: https://github.com/DioNanos/AnthMorph
 
 ## Proxy Configuration
 
