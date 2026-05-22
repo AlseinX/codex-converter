@@ -1,6 +1,7 @@
 pub mod content;
 pub mod error;
 pub mod id_map;
+pub mod models;
 pub mod namespace;
 pub mod request;
 pub mod response;
