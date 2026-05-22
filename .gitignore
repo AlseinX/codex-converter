@@ -1,2 +1,6 @@
 /target
 /tests/.codex-test-home
+
+# Claude Code — personal / local-only files
+.claude/settings.local.json
+.claude/worktrees/

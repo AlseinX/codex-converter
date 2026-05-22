@@ -105,6 +105,7 @@ Task ends, all in-flight state released
 
 In-flight state maintained per request:
 - Delta accumulators (for done events)
+- Output item accumulator: collects every completed output item (from `response.output_item.done` events) into the `output` array for the final `response.completed` event. Every output item produced during streaming must appear in this array, in order, regardless of type (message, reasoning, function_call)
 - Signature accumulator: collects `signature_delta` data per thinking content block (for signature cache)
 - Tool call mappings: `content_block_index → (tool_use_id, call_id, name)`
 - ID map: `toolu_xxx` ↔ `call_xxx` bidirectional
@@ -179,10 +180,10 @@ The Anthropic SDK appends `/v1/messages` to whatever base URL is provided.
 | `tool_choice` | `tool_choice` | See mapping table |
 | `parallel_tool_calls` | `disable_parallel_tool_use` | Semantics inverted |
 | `reasoning.effort` | `thinking` + `output_config.effort` | Direct string forwarding, see mapping section |
-| `temperature` | `temperature` | Passthrough with range clamping: Anthropic range 0–1 vs OpenAI 0–2. Values >1 must be clamped to 1. When thinking enabled, omit from Anthropic request (Anthropic requires default 1.0). Codex CLI never sends `temperature` (verified: `ResponsesApiRequest` struct in `codex-rs/codex-api/src/common.rs` has no temperature field), so this is not a practical concern |
-| `top_p` | `top_p` | Passthrough. When thinking enabled, clamp to 0.95–1.0 range. Codex CLI never sends `top_p` (same source as temperature) |
-| `max_output_tokens` | `max_tokens` | Field name differs |
-| `metadata` | `metadata` | Forward `user_id`, strip other keys |
+| `temperature` | `temperature` | Passthrough. When thinking enabled, omit from Anthropic request (Anthropic requires default 1.0). Codex CLI never sends `temperature` (verified: `ResponsesApiRequest` struct in `codex-rs/codex-api/src/common.rs` has no temperature field), so this is not a practical concern |
+| `top_p` | `top_p` | Passthrough. Codex CLI never sends `top_p` (same source as temperature) |
+| `max_output_tokens` | `max_tokens` | Field name differs. Codex CLI does not send this field (verified: absent from `ResponsesApiRequest` struct in `codex-rs/codex-api/src/common.rs`). Accept and map if present for robustness |
+| `metadata` | `metadata` | Forward `user_id`, strip other keys. Codex CLI does not send this field (verified: absent from `ResponsesApiRequest` struct in `codex-rs/codex-api/src/common.rs`). Accept and map if present for robustness |
 | `service_tier` | `service_tier` | Value mapping, see Unsupported Features section |
 | `text.format` | `output_config.format` | See `text.format` → `output_config.format` Mapping below |
 | `text.verbosity` | — | Ignored (stripped). Anthropic has no verbosity control |
@@ -198,6 +199,10 @@ All requests to the Anthropic API include these HTTP headers:
 | `content-type` | `application/json` | Fixed |
 
 #### `tool_choice` Mapping
+
+> **Codex constraint**: Codex CLI declares `tool_choice` as `String` (not object), currently hardcoded to `"auto"` (source: `client.rs:750`). The proxy must handle bare strings. Object forms below are included for forward-compatibility with non-Codex clients.
+>
+> **Bare string mapping**: `"auto"` → `{"type":"auto"}`, `"required"` → `{"type":"any"}`, `"none"` → `{"type":"none"}`, `"<tool_name>"` → `{"type":"tool","name":"<tool_name>"}`. For compaction requests (`CompactionInput`), `tool_choice` is absent — default to `{"type":"auto"}`.
 
 | Responses API | Anthropic |
 |---|---|
@@ -315,14 +320,14 @@ Codex's `create_text_param_for_request` constructs `text.format` with `type: "js
 | `{"type":"message","role":"assistant","content":[...]}` | `{"role":"assistant","content":[...]}` |
 | `{"type":"function_call","call_id":"...","name":"x","arguments":"{...}"}` | `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"function_call_output","call_id":"...","output":"..."}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
-| `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}],"encrypted_content":"..."}` | `{"role":"assistant","content":[{"type":"redacted_thinking","data":"<encrypted_content>"}`]}` if `encrypted_content` present; otherwise `{"role":"assistant","content":[{"type":"thinking","thinking":"<summary>","signature":"<cached or empty>"}]}` (see Thinking/Reasoning Round-Trip) |
+| `{"type":"reasoning","summary":[{"type":"summary_text","text":"..."}],"content":[{"type":"reasoning_text","text":"..."}],"encrypted_content":"..."}` | `{"role":"assistant","content":[{"type":"redacted_thinking","data":"<encrypted_content>"}`]}` if `encrypted_content` present; otherwise `{"role":"assistant","content":[{"type":"thinking","thinking":"<summary>","signature":"<cached or empty>"}]}` (see Thinking/Reasoning Round-Trip). The `content` field (raw reasoning text from GPT-OSS models) is **dropped** — Anthropic has no raw reasoning text concept, only `thinking` (summary) and `redacted_thinking` (reference: protocol_research.md entry #9) |
 | `{"type":"custom_tool_call","call_id":"...","name":"x","input":"{...}"}` | Same mapping as `function_call`: `{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xxx","name":"x","input":{...}"}]}` |
 | `{"type":"custom_tool_call_output","call_id":"...","output":"..."}` | Same mapping as `function_call_output`: `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"..."}]}` |
 | `{"type":"compaction","encrypted_content":"..."}` | Dropped — opaque OpenAI context management data, no Anthropic equivalent |
 | `{"type":"context_compaction","encrypted_content":"..."}` | Dropped — same as `compaction` |
 | `{"type":"compaction_trigger"}` | Dropped — same as `compaction` |
 | `{"type":"tool_search_output","call_id":"...","status":"...","execution":"...","tools":[...]}` | Dropped — tool discovery metadata from a previous tool search. The relevant tools have already been registered in the current request's `tools` array. No Anthropic equivalent |
-| `{"type":"mcp_tool_call_output","call_id":"...","output":{...}}` | Same mapping as `function_call_output`: `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"<output as JSON string>"}]}`. Codex-specific variant for MCP tool results (uses `CallToolResult` from the MCP library instead of `FunctionCallOutputPayload`). The `output` is an object, not a string — serialize to JSON string for `tool_result.content`. Uses `call_id` for ID lookup in the same bidirectional map |
+| `{"type":"mcp_tool_call_output","call_id":"...","output":{...}}` | `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xxx","content":"<output as JSON string>","is_error":true}]}`. Codex-specific variant for MCP tool results (uses `CallToolResult` from the MCP library instead of `FunctionCallOutputPayload`). The `output` is a `CallToolResult` object (not a string) — serialize to JSON string for `tool_result.content`. When `CallToolResult.isError` is `true`, set `tool_result.is_error: true`. When `isError` is absent or `false`, omit `is_error` (reference: protocol_research.md entry #41). Uses `call_id` for ID lookup in the same bidirectional map |
 | Unknown input item types | Dropped with warning log. Codex uses `#[serde(other)]` catch-all for unknown items. The proxy follows the same behavior — unknown types are consumed and discarded to maintain forward compatibility with future API additions |
 | Built-in tool history items (`web_search_call`, `file_search_call`, `code_interpreter_call`, `computer_call`, `computer_call_output`, `image_generation_call`, `shell_call`, `shell_call_output`, `local_shell_call`, `apply_patch_call`, `apply_patch_call_output`, `mcp_call`, `tool_search_call`) | See Built-in Tool Conversion → Input Direction section for per-type mapping |
 
@@ -333,7 +338,7 @@ Key details:
 - **tool_result.content:** `function_call_output.output` can be either a plain string or an array of content items:
   - If string → Anthropic `tool_result.content` as plain string (current default)
   - If array of content items → Anthropic `tool_result.content` as array of Anthropic content blocks, using the same content block mapping as User Content Block Mapping (e.g., `{type: "input_text", text: "..."}` → `{type: "text", text: "..."}`, `{type: "input_image", image_url: "..."}` → `{type: "image", source: {type: "url", url: "..."}}`)
-- **`success` → `is_error`:** Codex's `function_call_output` has a `success` field (Codex extension, not standard Responses API). Map to Anthropic's `tool_result.is_error`: `success: false` → `is_error: true`; `success: true` or absent → omit `is_error` (default is no error)
+- **`success` field (internal-only, not on wire):** `FunctionCallOutputPayload` has a `success: Option<bool>` field, but its custom `Serialize` impl only serializes `self.body` — `success` is never present in wire JSON. The `Deserialize` impl always sets `success: None`. The proxy cannot map this field because it never receives it. No action needed (reference: protocol_research.md entry #41)
 - **Anthropic message alternation:** Ensure user/assistant messages strictly alternate. Consecutive same-role input items are merged:
   - Consecutive `reasoning` + `function_call` items → merged into same assistant message content array as `[thinking/redacted_thinking, tool_use]` blocks (preserving order). This is the common pattern: Codex sends a reasoning item followed by a function_call from the same model turn
   - Consecutive `function_call` items → merged into same assistant message content array as multiple `tool_use` blocks
@@ -382,12 +387,14 @@ tool_use → function_call details:
 | Anthropic `stop_reason` | Responses API `status` |
 |---|---|
 | `end_turn` | `"completed"` |
-| `max_tokens` | `"incomplete"`, `incomplete_details.reason: "max_output_tokens"`. Emits `response.incomplete` event (not `response.completed`) |
+| `max_tokens` | `"completed"`, with `incomplete_details.reason: "max_output_tokens"` as informational metadata. **Always emits `response.completed` event** (never `response.incomplete`) — see critical note below |
 | `stop_sequence` | `"completed"` |
 | `tool_use` | `"completed"` (output contains function_call items) |
 | `pause_turn` | `"completed"` |
 | `refusal` | `"completed"` (model declined to generate content) |
-| `model_context_window_exceeded` | `"incomplete"`, `incomplete_details.reason: "max_output_tokens"`. Emits `response.incomplete` event. Available on Sonnet 4.5+ by default; earlier models need beta header |
+| `model_context_window_exceeded` | `"completed"`, with `incomplete_details.reason: "max_output_tokens"` as informational metadata. **Always emits `response.completed` event** — see critical note below. Available on Sonnet 4.5+ by default; earlier models need beta header |
+
+**CRITICAL (B2): Never emit `response.incomplete`.** Codex CLI's `responses.rs` handles `response.incomplete` by creating `ApiError::Stream(...)`, which maps through `api_bridge.rs` to `CodexErr::Stream(..)` with `is_retryable() = true`. The turn retry loop in `turn.rs` will retry the entire request for any retryable error. Since `max_tokens` truncation is deterministic (same input + same token limit = same truncation), this creates a retry loop that wastes API calls and eventually fails after exhausting `stream_max_retries`. CLIProxyAPI avoids this by always emitting `response.completed` regardless of stop reason. The proxy must do the same. The `incomplete_details` field is included for informational purposes but the event type must always be `response.completed`. (Reference: protocol_research.md entry #42)
 
 Note: The Responses API defines `incomplete_details.reason: "content_filter"` as a valid value. Anthropic does not have a distinct "content filter" stop reason — content filtering manifests as `refusal` stop reason (mapped to `"completed"`) or as a streaming `error` event. If Anthropic returns a streaming error due to content policy, the proxy maps it through the standard error handling path (`response.failed`). If a need arises to distinguish content filter from other errors in the future, the error message text can be inspected, but the proxy does not fabricate `incomplete_details.reason: "content_filter"` since no Anthropic signal produces it.
 
@@ -409,7 +416,7 @@ Additional Anthropic usage fields with no Responses API equivalent (dropped):
 - `usage.service_tier` — informational, no Responses API equivalent
 - `usage.speed` — Anthropic fast mode indicator, no Responses API equivalent
 
-Note: `output_tokens_details.reasoning_tokens` is omitted from response — Anthropic has no equivalent field, so we do not fabricate values.
+Note: `output_tokens_details.reasoning_tokens` is omitted from response — Anthropic has no equivalent field, so we do not fabricate values. Codex parses this as `i64` with `unwrap_or(0)`, so omission (field not present in the JSON) correctly defaults to 0.
 
 ### Streaming Conversion (Event-by-Event, Real-Time)
 
@@ -420,6 +427,12 @@ Event sequence (Anthropic → Responses API):
 | Anthropic SSE event | Behavior |
 |---|---|
 | `ping` | Consumed silently, no event emitted. Anthropic sends these periodically during streaming to keep connections alive |
+
+**Discarded downstream events (not emitted by the proxy):**
+
+| Event | Rationale |
+|---|---|
+| `response.metadata` | OpenAI-specific server metadata event. Not emitted by the proxy. Codex uses it for `openai_verification_recommendation` (model verification). Anthropic has no equivalent. |
 
 **Forwarded events:**
 
@@ -470,6 +483,8 @@ content_block_start (index=2, type=tool_use)
 content_block_delta (index=2, type=input_json_delta)
   → response.function_call_arguments.delta         (repeated)
 
+**Why `custom_tool_call_input.*` events are not emitted:** The Responses API distinguishes `"type":"function"` tools (with `parameters`) from `"type":"custom"` tools (with `format`). Function tools produce `function_call` output items with `response.function_call_arguments.*` streaming events. Custom tools produce `custom_tool_call` output items with `response.custom_tool_call_input.*` streaming events. Since Anthropic has no freeform/grammar tool concept, the proxy registers all tools as `"type":"function"` and therefore only emits `function_call_arguments.*` events. Codex CLI maps both event types to the same internal `ResponseEvent::ToolCallInputDelta`, so emitting `function_call_arguments.*` exclusively is safe.
+
 content_block_stop (index=2)
   → response.function_call_arguments.done           (accumulated arguments)
   → response.output_item.done                       (complete function_call)
@@ -478,7 +493,7 @@ message_delta (stop_reason, usage)
   → Record stop_reason and usage to internal state
 
 message_stop
-  → response.completed OR response.incomplete      (completed for normal end, incomplete for max_tokens)
+  → response.completed                              (always, regardless of stop_reason — see B2 critical note)
 
 <upstream closes connection>                         (Anthropic closes after message_stop, no explicit [DONE])
 → proxy sends [DONE]                                 (proxy-generated terminal marker)
@@ -503,7 +518,7 @@ Codex CLI treats all IDs as opaque strings with no format validation. Reference:
 
 #### Response Object Structure
 
-The `response.completed` and `response.incomplete` events carry a full response object. Fields included:
+The `response.completed` event carries a full response object (the proxy never emits `response.incomplete` — see B2 critical note above). Fields included:
 
 | Field | Source | Notes |
 |---|---|---|
@@ -515,17 +530,34 @@ The `response.completed` and `response.incomplete` events carry a full response 
 | `status` | Mapped from `stop_reason` | See Stop Reason → Status table |
 | `output` | Accumulated during streaming | All output items generated during the request |
 | `usage` | Mapped from Anthropic `usage` | See Usage Mapping table |
-| `incomplete_details` | Conditional | Only present when `status: "incomplete"`, with `reason: "max_output_tokens"` |
+| `incomplete_details` | Conditional | Present when `stop_reason` is `max_tokens` or `model_context_window_exceeded`, with `reason: "max_output_tokens"`. Informational only — `status` is always `"completed"` |
 | `metadata` | `null` | Proxy does not store metadata |
 | `parallel_tool_calls` | From request | Echo back request value |
 | `tool_choice` | From request | Echo back request value |
 | `instructions` | From request | Echo back request value |
 
-Fields omitted from the response object: `temperature`, `top_p`, `max_output_tokens`, `reasoning`, `text`, `previous_response_id`, `truncation`, `store`, `stream`, `stream_options`, `user` — these are request-only fields that the Responses API echoes back for stateless replay, but the proxy's response object does not need them since Codex maintains its own state.
+Fields omitted from the response object: `end_turn`, `temperature`, `top_p`, `max_output_tokens`, `reasoning`, `text`, `previous_response_id`, `truncation`, `store`, `stream`, `stream_options`, `user` — `end_turn` is omitted because Anthropic has no equivalent signal. Codex parses it as `Option<bool>` and only acts on `Some(false)` (triggering follow-up); absent/`None` falls through to default behavior, which is correct for the proxy. The remaining fields are request-only fields that the Responses API echoes back for stateless replay, but the proxy's response object does not need them since Codex maintains its own state.
+
+**`end_turn` tradeoff (B5):** Omitting `end_turn` means Codex never sets `needs_follow_up` via this path (`if let Some(false) = end_turn { needs_follow_up = true; }`). Codex compensates via tool execution results — when tool calls complete, the agent loop automatically continues. The tradeoff: without `end_turn: false`, the only trigger for follow-up is the presence of tool execution results. If Anthropic returns `stop_reason: "tool_use"` (indicating the model wants to call tools), the proxy should include `"end_turn": false` in `response.completed` to explicitly signal that the turn is not complete. This maps naturally: `stop_reason: "tool_use"` → `end_turn: false`; all other stop reasons → omit `end_turn`.
+
+#### Failed Response Object Structure
+
+The `response.failed` event carries a response object with this structure:
+
+| Field | Value | Notes |
+|---|---|---|
+| `id` | Response ID from `message_start` | Same ID used throughout the stream |
+| `object` | `"response"` | Fixed Responses API type |
+| `created_at` | Timestamp from `response.created` | |
+| `status` | `"failed"` | Terminal status |
+| `error` | `{ "code": "<code>", "message": "<msg>" }` | Code per Error Type Mapping table; message passthrough from Anthropic |
+| `output` | Accumulated output items | Items emitted before the error |
+| `usage` | Accumulated usage or `null` | `null` if error before generation |
+| `metadata` | `{}` | Empty object |
 
 #### SSE Wire Format Examples
 
-Each SSE event consists of an `event:` line and a `data:` line with JSON payload. Below are representative examples. **Note:** OpenAI streaming events include a `sequence_number` field for ordering. Wire format examples omit this field for clarity, but the implementation must include it in every event.
+Each SSE event consists of an `event:` line and a `data:` line with JSON payload. Below are representative examples. **Note:** OpenAI streaming events include a `sequence_number` field, but Codex's `ResponsesStreamEvent` struct does not deserialize it — the field is silently ignored. The proxy must not include `sequence_number` as it adds complexity for zero benefit (reference: protocol_research.md entry #41).
 
 **Text streaming (Anthropic → Responses API):**
 ```
@@ -630,7 +662,7 @@ data: {"type":"response.completed","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYE
 data: [DONE]
 ```
 
-**Stream end (max_tokens — incomplete):**
+**Stream end (max_tokens truncation):**
 ```
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":4096}}
@@ -638,8 +670,38 @@ data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence
 event: message_stop
 data: {"type":"message_stop"}
 
-event: response.incomplete
-data: {"type":"response.incomplete","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","status":"incomplete","output":[...],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":4096,"input_tokens_details":{"cached_tokens":0}}}}
+event: response.completed
+data: {"type":"response.completed","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","status":"completed","output":[...],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":4096,"input_tokens_details":{"cached_tokens":0}}}}
+
+data: [DONE]
+```
+
+Note: The proxy always emits `response.completed` even when truncated by `max_tokens`. The `incomplete_details` field signals truncation as informational metadata. **Never emit `response.incomplete`** — Codex CLI treats it as a retryable error, causing an infinite retry loop (see B2 critical note).
+
+**Error streaming (generic server error):**
+```
+event: error                                          (Anthropic SSE)
+data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}
+
+event: error                                          (Responses API SSE)
+data: {"type":"error","code":"server_error","message":"Internal server error"}
+
+event: response.failed
+data: {"type":"response.failed","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","object":"response","created_at":1717000000,"status":"failed","error":{"code":"server_error","message":"Internal server error"},"output":[],"usage":null,"metadata":{}}}
+
+data: [DONE]
+```
+
+**Error streaming (context_length_exceeded):**
+```
+event: error                                          (Anthropic SSE)
+data: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > context window 200000"}}
+
+event: error                                          (Responses API SSE)
+data: {"type":"error","code":"context_length_exceeded","message":"prompt is too long: 210000 tokens > context window 200000"}
+
+event: response.failed
+data: {"type":"response.failed","response":{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","object":"response","created_at":1717000000,"status":"failed","error":{"code":"context_length_exceeded","message":"prompt is too long: 210000 tokens > context window 200000"},"output":[],"usage":null,"metadata":{}}}
 
 data: [DONE]
 ```
@@ -1044,9 +1106,10 @@ Options:
 |---|---|
 | 400 | 400 |
 | 401 | 401 |
+| 402 | 402 |
 | 403 | 403 |
 | 404 | 404 |
-| 413 | 400 |
+| 413 | 413 |
 | 429 | 429 |
 | 500 | 500 |
 | 529 | 503 |
@@ -1087,28 +1150,46 @@ Responses API:
 
 ### Error Type Mapping
 
-| Anthropic `error.type` | Responses API `error.type` | `error.code` |
-|---|---|---|
-| `invalid_request_error` | `invalid_request_error` | `invalid_request` |
-| `authentication_error` | `invalid_request_error` | `invalid_api_key` |
-| `permission_error` | `invalid_request_error` | `invalid_api_key` |
-| `not_found_error` | `invalid_request_error` | `model_not_found` |
-| `request_too_large` | `invalid_request_error` | `request_too_large` |
-| `rate_limit_error` | `rate_limit_error` | `rate_limit_exceeded` |
-| `api_error` | `server_error` | `server_error` |
-| `overloaded_error` | `server_error` | `server_error` |
-| Unknown 4XX | `invalid_request_error` | `invalid_request` |
-| Unknown 5XX | `server_error` | `server_error` |
+| Anthropic Error Type | HTTP Status | `response.error.code` | Codex Detection |
+|---|---|---|---|
+| `invalid_request_error` (context overflow) | 400 | `context_length_exceeded` | `ApiError::ContextWindowExceeded` |
+| `invalid_request_error` (other) | 400 | `invalid_request` | `ApiError::Retryable` |
+| `authentication_error` | 401 | `invalid_api_key` | `ApiError::Retryable` |
+| `permission_error` | 403 | `invalid_api_key` | `ApiError::Retryable` |
+| `not_found_error` | 404 | `model_not_found` | `ApiError::Retryable` |
+| `request_too_large` | 413 | `context_length_exceeded` | `ApiError::ContextWindowExceeded` |
+| `rate_limit_error` | 429 | `rate_limit_exceeded` | `ApiError::RateLimit` |
+| `billing_error` | 402 | `insufficient_quota` | `ApiError::QuotaExceeded` |
+| `overloaded_error` | 529 | `server_is_overloaded` | `ApiError::ServerOverloaded` |
+| `api_error` (5XX) | 500/502/503 | `server_error` | `ApiError::Retryable` |
+| Unknown 4XX | — | `invalid_request` | `ApiError::Retryable` |
+| Unknown 5XX | — | `server_error` | `ApiError::Retryable` |
+
+**Context overflow detection:** Anthropic uses `invalid_request_error` for both context overflow and other invalid request errors. The proxy distinguishes them by checking the Anthropic error message for keywords like `context window`, `context length`, `too many tokens`, or `prompt is too long`. When any of these keywords are detected, the error is mapped to `context_length_exceeded` instead of `invalid_request`. This heuristic is necessary because Anthropic does not provide a distinct error type for context overflow. The proxy logs a warning when this heuristic is applied.
 
 ### Streaming Error Handling
 
-When Anthropic sends `event: error` during streaming, proxy emits in order:
+When Anthropic sends `event: error` during streaming, the proxy emits the following SSE event sequence in order:
 
-1. `error` event (with converted error structure)
-2. `response.failed` event (with full response object, `status: "failed"`)
-3. `[DONE]` terminal marker
+1. **`error` event** — carries the converted error structure (message passthrough from Anthropic, code from Error Type Mapping table)
+2. **`response.failed` event** — carries the full response object with `status: "failed"` (see Failed Response Object Structure subsection above)
+3. **`[DONE]`** — terminal marker
 
-Streaming errors are not recoverable. Stream terminates after the sequence.
+Streaming errors are not recoverable. The stream terminates after this sequence.
+
+**Wire format:**
+
+```
+event: error
+data: {"type":"error","code":"<code>","message":"<message>"}
+
+event: response.failed
+data: {"type":"response.failed","response":{...}}
+
+data: [DONE]
+```
+
+The `error.code` field in the `error` event and the `response.error.code` field in the `response.failed` embedded response object both use the codes from the Error Type Mapping table above (e.g., `context_length_exceeded`, `rate_limit_exceeded`, `server_error`). See the Error Streaming Wire Format Examples section below for concrete examples.
 
 ### Proxy-Originated Errors
 
@@ -1116,10 +1197,11 @@ Streaming errors are not recoverable. Stream terminates after the sequence.
 |---|---|---|---|
 | URL routing parse failure | 400 | `invalid_request_error` | `invalid_request` |
 | Request body JSON parse failure | 400 | `invalid_request_error` | `invalid_request` |
-| Upstream connection failure | 502 | `server_error` | `upstream_connection_failed` |
-| Upstream response format invalid | 502 | `server_error` | `upstream_invalid_response` |
-| Namespace registry miss | 400 | `invalid_request_error` | `unknown_tool` |
+| Upstream connection failure | 502 | `server_error` | `server_error` |
+| Upstream response format invalid | 502 | `server_error` | `server_error` |
+| Namespace registry miss | 400 | `invalid_request_error` | `invalid_request` |
 | Responses API field validation failure | 400 | `invalid_request_error` | `invalid_request` |
+| Missing or empty Authorization header | 401 | `invalid_request_error` | `invalid_api_key` |
 
 ## TLS
 

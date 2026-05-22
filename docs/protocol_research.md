@@ -46,7 +46,7 @@ How should the proxy handle the round-trip conversion between Anthropic's `think
 **Evaluation:** No existing implementation fully solves the stateless multi-turn problem. The approaches fall into categories: (a) drop thinking entirely (codex-bridge), (b) fake signatures that break (token_proxy), (c) strip on error sacrificing continuity (aio-coding-hub), (d) silently drop reasoning input (CLIProxyAPI), (e) IR-based preservation (llm-rosetta, architecturally correct but complex). CLIProxyAPI's signature cache is the most pragmatic partial solution.
 
 **Design decision for codex-conv:** Use the signature cache approach inspired by CLIProxyAPI:
-1. **Output (Anthropic → Responses API):** Forward thinking text as `summary` content. Accumulate `signature_delta` data during streaming and cache it (keyed by response ID + content block index, TTL 3 hours). Discard signatures from the SSE stream.
+1. **Output (Anthropic → Responses API):** Forward thinking text as `summary` content. Accumulate `signature_delta` data during streaming and cache it (keyed by proxy-generated reasoning item ID (`rs_xxx`), TTL 3 hours). Discard signatures from the SSE stream.
 2. **Input (Responses API → Anthropic):** When `reasoning` input items contain `encrypted_content`, attempt to use it as `redacted_thinking.data`. When they contain only `summary` text, use `{"type": "thinking", "thinking": "<text>", "signature": ""}` with empty signature.
 3. **Limitation:** If `encrypted_content` is absent and the signature cache has expired, Anthropic may reject the request. In that case, implement the rectifier pattern as a fallback: strip thinking blocks and retry.
 
@@ -145,7 +145,7 @@ Must temperature and top_p be restricted when thinking is enabled? How should th
 
 **Evaluation:** None of the implementations handle this correctly. Since Codex CLI never sends `temperature`, the practical risk is low, but the proxy should still protect against invalid combinations.
 
-**Design decision for codex-conv:** When `reasoning` is present (thinking enabled): omit `temperature` from the Anthropic request regardless of what was sent, clamp `top_p` to the 0.95–1.0 range. When `reasoning` is absent: pass temperature through with range clamping (OpenAI 0–2 → Anthropic 0–1). This is safer than any existing implementation without being unnecessarily complex.
+**Design decision for codex-conv:** When `reasoning` is present (thinking enabled): omit `temperature` from the Anthropic request regardless of what was sent. When `reasoning` is absent: pass `temperature` and `top_p` through directly without clamping. Since Codex CLI never sends `temperature` or `top_p` (verified: `ResponsesApiRequest` struct has neither field), clamping logic adds complexity with no practical benefit. If a non-Codex client sends values outside Anthropic's range, Anthropic will return a clear error — let the upstream API enforce its own constraints.
 
 ### Reference
 - [1] Anthropic Extended Thinking docs — https://platform.claude.com/docs/en/build-with-claude/extended-thinking (see "Feature compatibility" section)
@@ -179,7 +179,9 @@ How should Anthropic stop reasons map to Responses API status values? Some Anthr
 
 **Evaluation:** CLIProxyAPI's approach of always returning `"completed"` is the simplest but loses information. It means Codex CLI never sees `incomplete` status when `max_tokens` is hit, which could cause it to misinterpret truncated responses as complete.
 
-**Design decision for codex-conv:** Map `max_tokens` → `"incomplete"` with `incomplete_details.reason: "max_output_tokens"` and emit `response.incomplete` (not `response.completed`). This is more correct than CLIProxyAPI. For `pause_turn` → `"completed"` (Claude server tools iteration limit, not applicable in proxy context). For `refusal` → `"completed"` (model declined to generate). For `model_context_window_exceeded` → `"incomplete"` with `incomplete_details.reason: "max_output_tokens"` (closest semantic match). This preserves the critical distinction between normal completion and truncation.
+**Design decision for codex-conv (SUPERSEDED by entry #42):** Map `max_tokens` → `"incomplete"` with `incomplete_details.reason: "max_output_tokens"` and emit `response.incomplete` (not `response.completed`). This is more correct than CLIProxyAPI. For `pause_turn` → `"completed"` (Claude server tools iteration limit, not applicable in proxy context). For `refusal` → `"completed"` (model declined to generate). For `model_context_window_exceeded` → `"incomplete"` with `incomplete_details.reason: "max_output_tokens"` (closest semantic match). This preserves the critical distinction between normal completion and truncation.
+
+**REVISED (entry #42):** The original decision to emit `response.incomplete` is **incorrect** because Codex CLI treats it as a retryable stream error (`ApiError::Stream` → `CodexErr::Stream` → `is_retryable() = true`), causing an infinite retry loop. All stop reasons must map to `status: "completed"` with `response.completed`. The `incomplete_details` field is included as informational metadata when `stop_reason` is `max_tokens` or `model_context_window_exceeded`. See entry #42 for the full analysis.
 
 ### Reference
 - [1] Anthropic Handling Stop Reasons docs — https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
@@ -281,7 +283,9 @@ Should the proxy emit `response.incomplete` when Anthropic returns `max_tokens` 
 
 **Evaluation:** No existing implementation emits `response.incomplete`. CLIProxyAPI's approach of always returning `"completed"` means the downstream client (Codex CLI) cannot distinguish between a complete response and a truncated one. This is a known inaccuracy.
 
-**Design decision for codex-conv:** Emit `response.incomplete` (not `response.completed`) when Anthropic returns `stop_reason: "max_tokens"`. Set `status: "incomplete"` and `incomplete_details: {reason: "max_output_tokens"}`. This is more correct than CLIProxyAPI's approach and gives Codex CLI proper signal about truncation. The risk is that Codex CLI may not handle `response.incomplete` well if it was designed around CLIProxyAPI's behavior, but the Responses API spec defines this event explicitly.
+**Design decision for codex-conv (SUPERSEDED by entry #42):** Emit `response.incomplete` (not `response.completed`) when Anthropic returns `stop_reason: "max_tokens"`. Set `status: "incomplete"` and `incomplete_details: {reason: "max_output_tokens"}`. This is more correct than CLIProxyAPI's approach and gives Codex CLI proper signal about truncation. The risk is that Codex CLI may not handle `response.incomplete` well if it was designed around CLIProxyAPI's behavior, but the Responses API spec defines this event explicitly.
+
+**REVISED (entry #42):** The risk identified above is confirmed: Codex CLI treats `response.incomplete` as `ApiError::Stream` with `is_retryable() = true`, causing a retry loop for `max_tokens` truncation. Always emit `response.completed` with `status: "completed"`. See entry #42 for the full analysis and source code citations.
 
 ### Reference
 - [1] OpenAI Responses streaming events reference — https://developers.openai.com/api/reference/resources/responses/streaming-events/
@@ -470,7 +474,7 @@ Which fields have a clear semantic mapping between the OpenAI Responses API and 
 | Responses API field | Anthropic field | Transform | Source |
 |---|---|---|---|
 | `reasoning.effort` | `thinking.type` + `output_config.effort` | Set `thinking.type: "adaptive"`, forward effort string directly. `"none"` → omit both. `"minimal"` → `"low"` | OpenAI [1], Anthropic [2], entries #3/#4/#5 |
-| `tool_choice` | `tool_choice` | `"auto"` → `{type:"auto"}`, `"required"` → `{type:"any"}`, `"none"` → `{type:"none"}`, `{type:"function",name}` → `{type:"tool",name}` | OpenAI [1], Anthropic [2] |
+| `tool_choice` | `tool_choice` | Codex sends bare string (`"auto"` hardcoded). `"auto"` → `{type:"auto"}`, `"required"` → `{type:"any"}`, `"none"` → `{type:"none"}`, bare name → `{type:"tool",name}`. Object form `{"type":"function",name}` → `{type:"tool",name}` for forward-compat. `{"type":"allowed_tools",...}` → `{type:"auto"}` (no Anthropic equivalent) | OpenAI [1], Anthropic [2] |
 | `parallel_tool_calls` | `tool_choice.disable_parallel_tool_use` | Semantics inverted. Embedded inside `tool_choice` object, not top-level | OpenAI [1], Anthropic [2] |
 | `tools` (function) | `tools` | `parameters` → `input_schema`. Namespace tools flattened: `mcp__{server}__{tool}` | OpenAI [1], Anthropic [2] |
 
@@ -509,7 +513,7 @@ Anthropic natively supports `cache_control` on content blocks, system blocks, an
 | (generated) | `created_at` | Proxy-generated Unix timestamp | OpenAI [5] |
 | (generated) | `completed_at` | Proxy-generated Unix timestamp (when completed) | OpenAI [5] |
 | `stop_reason` | `status` | See B3 | Anthropic [2], OpenAI [5] |
-| `stop_reason` + `usage` | `incomplete_details` | `max_tokens`/`model_context_window_exceeded` → `{reason:"max_output_tokens"}` | Anthropic [2], OpenAI [5], entry #7 |
+| `stop_reason` + `usage` | `incomplete_details` | `max_tokens`/`model_context_window_exceeded` → `{reason:"max_output_tokens"}`. Informational only; always paired with `status: "completed"` and `response.completed` event (entry #42) | Anthropic [2], OpenAI [5], entry #42 |
 
 ##### B2. Content block → output item mapping
 
@@ -521,15 +525,17 @@ Anthropic natively supports `cache_control` on content blocks, system blocks, an
 
 ##### B3. Stop reason → status mapping
 
-| Anthropic `stop_reason` | Responses API `status` | Terminal event | Source |
-|---|---|---|---|
-| `end_turn` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5], entry #7 |
-| `stop_sequence` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
-| `tool_use` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
-| `pause_turn` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
-| `refusal` | `"completed"` | `response.completed` | Anthropic [6], OpenAI [5] |
-| `max_tokens` | `"incomplete"` | `response.incomplete` | Anthropic [6], OpenAI [5], entry #7 |
-| `model_context_window_exceeded` | `"incomplete"` | `response.incomplete` | Anthropic [6], OpenAI [5], entry #7 |
+| Anthropic `stop_reason` | Responses API `status` | Terminal event | `incomplete_details` | Source |
+|---|---|---|---|---|
+| `end_turn` | `"completed"` | `response.completed` | absent | Anthropic [6], OpenAI [5], entry #7 |
+| `stop_sequence` | `"completed"` | `response.completed` | absent | Anthropic [6], OpenAI [5] |
+| `tool_use` | `"completed"` | `response.completed` | absent | Anthropic [6], OpenAI [5] |
+| `pause_turn` | `"completed"` | `response.completed` | absent | Anthropic [6], OpenAI [5] |
+| `refusal` | `"completed"` | `response.completed` | absent | Anthropic [6], OpenAI [5] |
+| `max_tokens` | `"completed"` | `response.completed` | `{reason: "max_output_tokens"}` | Anthropic [6], OpenAI [5], entry #42 |
+| `model_context_window_exceeded` | `"completed"` | `response.completed` | `{reason: "max_output_tokens"}` | Anthropic [6], OpenAI [5], entry #42 |
+
+Note (entry #42): All stop reasons map to `response.completed`. **Never emit `response.incomplete`** — Codex CLI treats it as a retryable stream error, causing an infinite retry loop.
 
 ##### B4. Usage mapping
 
@@ -559,7 +565,7 @@ Full event-by-event mapping documented in spec Streaming Conversion section. Key
 | `content_block_delta` (input_json_delta) | `response.function_call_arguments.delta` | Anthropic [3], OpenAI [7], entry #12 |
 | `content_block_stop` (tool_use) | `response.function_call_arguments.done` + `response.output_item.done` | Anthropic [3], OpenAI [7] |
 | `message_delta` (stop_reason, usage) | Internal state recorded | Anthropic [3], OpenAI [7] |
-| `message_stop` | `response.completed` or `response.incomplete` + `[DONE]` | Anthropic [3], OpenAI [7], entry #11 |
+| `message_stop` | `response.completed` + `[DONE]` (always, regardless of stop_reason — entry #42) | Anthropic [3], OpenAI [7], entry #11/#42 |
 | `error` (streaming) | `error` + `response.failed` + `[DONE]` | Anthropic [2], OpenAI [7] |
 
 ##### B6. Error mapping
@@ -570,10 +576,11 @@ Full event-by-event mapping documented in spec Streaming Conversion section. Key
 | `authentication_error` | `invalid_request_error` | `invalid_api_key` | Anthropic [2], OpenAI [5] |
 | `permission_error` | `invalid_request_error` | `invalid_api_key` | Anthropic [2], OpenAI [5] |
 | `not_found_error` | `invalid_request_error` | `model_not_found` | Anthropic [2], OpenAI [5] |
-| `request_too_large` | `invalid_request_error` | `request_too_large` | Anthropic [2], OpenAI [5] |
+| `request_too_large` | `invalid_request_error` | `context_length_exceeded` | Anthropic [2], OpenAI [5], entry #39 |
 | `rate_limit_error` | `rate_limit_error` | `rate_limit_exceeded` | Anthropic [2], OpenAI [5], entry #8 |
 | `api_error` | `server_error` | `server_error` | Anthropic [2], OpenAI [5] |
-| `overloaded_error` | `server_error` | `server_error` | Anthropic [2], OpenAI [5] |
+| `overloaded_error` | `server_error` | `server_is_overloaded` | Anthropic [2], OpenAI [5], entry #39 |
+| `billing_error` | `invalid_request_error` | `insufficient_quota` | Anthropic [2], OpenAI [5], entry #39 |
 
 ### Reference
 - [1] OpenAI Responses API — https://developers.openai.com/api/reference/responses/overview/
@@ -607,7 +614,7 @@ Which fields from each API have NO meaningful equivalent on the other side and m
 | `text.format` (JSON schema output) | Converted to `output_config.format` | OpenAI `text.format` with `type: "json_schema"` maps to Anthropic `output_config.format`. Only `schema` is forwarded — `name` and `strict` have no Anthropic equivalent (Anthropic enforces schema compliance by default). See spec `text.format` → `output_config.format` Mapping section | OpenAI [1], Anthropic [2], entry #38 |
 | `text.verbosity` | Ignored (stripped) | OpenAI output verbosity control (`"low"/"medium"/"high"`). Anthropic has no equivalent parameter | OpenAI [1] |
 | `user` | Ignored (stripped) | OpenAI end-user identifier. While Anthropic has `metadata.user_id`, the `user` field from OpenAI is a different mechanism. If `metadata.user_id` is present, that takes precedence. Codex does not send `user` | OpenAI [1] |
-| Built-in tool types (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`) | Rejected with 400 | These are Responses API built-in tool types (not function-type). Anthropic has no equivalent for web search/file search/code interpreter as built-in tools. Codex never sends these (uses only function-type tools) | OpenAI [1], entry #14 |
+| Built-in tool types (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `image_generation`, `shell`, `local_shell`, `apply_patch`, `mcp`, `tool_search`, `custom`) | Converted to Anthropic custom tools with derived `input_schema` | These are Responses API built-in tool types. The proxy converts them to Anthropic custom tools so the model can generate matching tool_use calls. See Built-in Tool Conversion section in spec and entry #35 | OpenAI [1], entry #14 |
 | Input `reasoning.content` field | Not forwarded | OpenAI reasoning items can carry a `content` field (array of `{type: "reasoning_text", text}` for raw reasoning text from GPT-OSS models). Anthropic has no raw reasoning text concept — only `thinking` (summary) and `redacted_thinking`. The proxy maps `summary` only | OpenAI [1], entry #9 |
 
 #### B. Responses API Request Fields Requiring Special Handling (Not Directly Dropped, Not Directly Mapped)
@@ -889,7 +896,7 @@ The comment in source states: "The `output` field for `function_call_output` use
 
 **Mapping:** When array → convert each content item using the existing User Content Block Mapping (input_text → text, input_image → image). When string → same as current behavior.
 
-**`success` field:** `FunctionCallOutputPayload` has `body: FunctionCallOutputBody` and `success: Option<bool>` [1]. This is a Codex extension (not standard Responses API). Anthropic's `tool_result` has `is_error: bool`. Mapping: `success: false` → `is_error: true`; `success: true` or absent → omit `is_error`.
+**`success` field (superseded by entry #41):** `FunctionCallOutputPayload` has `body: FunctionCallOutputBody` and `success: Option<bool>` [1], but its custom `Serialize` impl only serializes `self.body` — `success` is never present on the wire. The `Deserialize` impl always sets `success: None`. The proxy cannot map this field because it never receives it. See entry #41 for the corrected analysis.
 
 **`custom_tool_call_output`** uses the exact same `FunctionCallOutputPayload` type for its `output` field [1].
 
@@ -1917,7 +1924,7 @@ Verified against official sources. The following gaps were identified and fixed:
 
 **Non-gaps verified:**
 - `custom_tool_call_input.delta` SSE event — not needed because Codex maps both it and `function_call_arguments.delta` to the same `ToolCallInputDelta` handler [4]
-- `success` field on `function_call_output` — `skip_serializing_if None` means present only when explicitly set; mapping is correct when present [4]
+- `success` field on `function_call_output` — ~~`skip_serializing_if None` means present only when explicitly set; mapping is correct when present~~ **Superseded by entry #41:** The custom `Serialize` impl strips `success` entirely from wire JSON. The proxy never receives this field. No mapping needed.
 
 ### Reference
 - [1] Anthropic Messages API: Create a Message — https://platform.claude.com/docs/en/api/messages/create
@@ -2263,238 +2270,99 @@ Synthesis of findings from entries #41–#44. Is the proposed retry mechanism fe
 - [4] Source code: `src/router.rs` (streaming task architecture)
 - [5] Source code: `src/conversion/response.rs` (StreamingState, convert_to_freeform_patch, current_is_custom flag)
 - [6] OpenAI Responses streaming events reference — https://developers.openai.com/api/reference/resources/responses/streaming-events/
-
----
-
-## 13. Models API: Dual-Mode Design (Standard OpenAI ↔ Codex Extended)
+## 39. Error `code` values: Codex CLI detection, Anthropic error types, and correct mapping
 
 ### Description
-The proxy supports two modes for the Models API, selected by the `model_catalog` configuration option. When no catalog is configured, Mode 1 converts Anthropic's Models API to standard OpenAI format. When a catalog is configured, Mode 2 serves Codex CLI's `ModelsResponse { models: Vec<ModelInfo> }` format directly from catalog files with no upstream call.
+The design spec's Error Type Mapping table produced `error.code` values that Codex CLI does not recognize. Codex has hard-coded detection functions that match exact code strings; unrecognized codes fall through to a generic `Retryable` handler (auto-retry). This caused fatal errors (context overflow, overloaded server, billing) to be retried endlessly instead of stopping.
 
 ### Result
 
-#### 13a. Anthropic Models API — Complete Specification [1][6][7]
+**Codex CLI error code detection** (from `codex-rs/codex-api/src/sse/responses.rs`): Codex specifically recognizes these exact `error.code` strings via dedicated `is_*_error()` functions: `context_length_exceeded`, `insufficient_quota`, `usage_not_included`, `cyber_policy`, `invalid_prompt`, `server_is_overloaded`, `slow_down`. The code `rate_limit_exceeded` is not detected by a dedicated function but triggers retry-after delay parsing in the fallback path. All other codes fall to `ApiError::Retryable` (auto-retry) [1].
 
-**Authentication:**
-- Required header: `x-api-key` (string) — API key for authentication
-- Required header: `anthropic-version` (string) — API version, currently `"2023-06-01"`
-- Optional header: `anthropic-beta` (string[]) — Beta features, comma-separated or multiple headers
+**Fatal vs retryable** (from `codex-rs/protocol/src/error.rs`): `CodexErr::is_retryable()` returns `false` (fatal, stops session) for: `ContextWindowExceeded`, `QuotaExceeded`, `UsageNotIncluded`, `InvalidRequest`, `CyberPolicy`, `ServerOverloaded`, `UsageLimitReached`, `RetryLimit`. Returns `true` (retryable) for: `Stream`, `Timeout`, `UnexpectedStatus`, `InternalServerError`, `ConnectionFailed`, `ResponseStreamFailed`, `Io`, `Json`, `TokioJoin` [2].
 
-**GET /v1/models (List Models):**
-- HTTP Method: GET
-- Path: `/v1/models`
-- Query Parameters:
-  - `before_id` (string, optional) — cursor for backward pagination
-  - `after_id` (string, optional) — cursor for forward pagination
-  - `limit` (integer, optional, default 20, range 1–1000) — number of items per page
-- Models returned newest-first
+**Non-streaming HTTP error handling** (from `codex-rs/codex-api/src/api_bridge.rs`): Codex also checks error codes from non-streaming HTTP responses: 503 + `server_is_overloaded`/`slow_down` -> fatal; 400 + `cyber_policy` -> fatal; 429 + `usage_limit_reached` type -> fatal; 429 + `usage_not_included` type -> fatal [3].
 
-200 Response:
-```json
-{
-  "data": [
-    {
-      "type": "model",
-      "id": "claude-sonnet-4-20250514",
-      "display_name": "Claude Sonnet 4",
-      "created_at": "2025-02-19T00:00:00Z"
-    }
-  ],
-  "first_id": "string or null",
-  "has_more": true,
-  "last_id": "string or null"
-}
-```
+**Anthropic error types** [4]: `invalid_request_error` (400), `authentication_error` (401), `billing_error` (402), `permission_error` (403), `not_found_error` (404), `request_too_large` (413), `rate_limit_error` (429), `api_error` (500), `timeout_error` (504), `overloaded_error` (529). Anthropic has no distinct error type for context window overflow — it uses `invalid_request_error` with descriptive message text like "prompt is too long" [4].
 
-**GET /v1/models/{model_id} (Get Model):**
-- Path Parameter: `model_id` (string, required)
+**Required mapping corrections:**
+1. `overloaded_error` -> `server_is_overloaded` (not `server_error`): ensures fatal stop instead of auto-retry [1][4].
+2. `invalid_request_error` with context overflow message -> `context_length_exceeded`: must detect via message text since Anthropic has no distinct type for this [1][4].
+3. `billing_error` -> `insufficient_quota`: semantic match for account billing/quota issue, ensures fatal stop [1][4].
+4. `request_too_large` -> `context_length_exceeded`: semantic match, ensures fatal stop [1][4].
+5. Rate limit `resets_at` forwarding: Codex parses `resets_at` from error object when code is `rate_limit_exceeded`; proxy should derive this from Anthropic's `Retry-After` header [1][4].
+6. Proxy-originated upstream connection failure: use `server_is_overloaded` (503) instead of `upstream_connection_failed` (502) so Codex stops retrying against unreachable upstream [1].
 
-200 Response:
-```json
-{
-  "type": "model",
-  "id": "claude-sonnet-4-20250514",
-  "display_name": "Claude Sonnet 4",
-  "created_at": "2025-02-19T00:00:00Z"
-}
-```
-
-**Model object completeness:** Verified via live API test and official docs. The Anthropic model object contains ONLY these 4 fields: `type`, `id`, `display_name`, `created_at` [1][6][7].
-
-**Error response format** [8]:
-
-```json
-{
-  "type": "error",
-  "error": {
-    "type": "authentication_error",
-    "message": "invalid x-api-key"
-  },
-  "request_id": "req_011CbFiYBxzLcZqUJ37B9bap"
-}
-```
-
-#### 13b. Standard OpenAI Models Format (Mode 1 — no catalog) [2][3]
-
-When `model_catalog` is empty, the proxy converts Anthropic responses to standard OpenAI format.
-
-**GET /models response:**
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "claude-sonnet-4-20250514",
-      "object": "model",
-      "created": 1739923200,
-      "owned_by": "anthropic"
-    }
-  ]
-}
-```
-
-**GET /models/{model} response:**
-```json
-{
-  "id": "claude-sonnet-4-20250514",
-  "object": "model",
-  "created": 1739923200,
-  "owned_by": "anthropic"
-}
-```
-
-Field mapping:
-
-| Anthropic field | OpenAI field | Conversion |
-|---|---|---|
-| `id` | `id` | Direct passthrough |
-| `type` (`"model"`) | `object` | Rename field |
-| `created_at` (ISO 8601) | `created` (Unix timestamp) | Parse ISO 8601 → epoch seconds. Parse failure → `0` with warning log |
-| — | `owned_by` | Hardcoded `"anthropic"` |
-| `display_name` | — | Discarded |
-
-#### 13c. Codex CLI Extended Format (Mode 2 — catalog configured) [4][5][12][13]
-
-When `model_catalog` has one or more files, the proxy serves Codex CLI's `ModelsResponse { models: Vec<ModelInfo> }` format from catalog files — no upstream Anthropic call needed.
-
-**GET /models response:**
-```json
-{
-  "models": [
-    { "slug": "...", "display_name": "...", ... },
-    { "slug": "...", "display_name": "...", ... }
-  ]
-}
-```
-
-**GET /models/{model} response (found):**
-```json
-{
-  "models": [
-    { "slug": "claude-sonnet-4-20250514", ... }
-  ]
-}
-```
-
-**GET /models/{model} response (not found):** 404 with standard OpenAI error format.
-
-Codex CLI deserializes this into `ModelsResponse { models: Vec<ModelInfo> }` — there is no code path that accepts standard OpenAI format when using a custom `base_url` [13].
-
-#### 13d. ModelInfo Field List (Required vs Optional) [13]
-
-**Required fields** (no `#[serde(default)]`, must be present):
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `slug` | String | Model identifier, deduplication key in merge |
-| `display_name` | String | Human-readable name |
-| `description` | Option\<String\> | Model description |
-| `supported_reasoning_levels` | Vec\<ReasoningEffortPreset\> | Each: `{ "effort": String, "description": String }` |
-| `shell_type` | ConfigShellToolType | `"default"`\|`"local"`\|`"unified_exec"`\|`"disabled"`\|`"shell_command"` |
-| `visibility` | ModelVisibility | `"list"`\|`"hide"`\|`"none"` |
-| `supported_in_api` | bool | |
-| `priority` | i32 | Lower = higher priority |
-| `base_instructions` | String | |
-| `supports_reasoning_summaries` | bool | |
-| `support_verbosity` | bool | |
-| `default_verbosity` | Option\<Verbosity\> | `"low"`\|`"medium"`\|`"high"` |
-| `apply_patch_tool_type` | Option\<ApplyPatchToolType\> | `"freeform"` or null |
-| `truncation_policy` | TruncationPolicyConfig | `{ "mode": "bytes"\|"tokens", "limit": i64 }` |
-| `supports_parallel_tool_calls` | bool | |
-| `experimental_supported_tools` | Vec\<String\> | |
-
-**Optional fields** (have `#[serde(default)]`):
-
-| Field | Type | Default |
-|-------|------|---------|
-| `default_reasoning_summary` | ReasoningSummary | `"auto"` — `"auto"`\|`"none"`\|`"concise"`\|`"detailed"` |
-| `default_reasoning_level` | Option\<ReasoningEffort\> | `None` — `"none"`\|`"minimal"`\|`"low"`\|`"medium"`\|`"high"`\|`"xhigh"` |
-| `additional_speed_tiers` | Vec\<String\> | `[]` |
-| `service_tiers` | Vec\<ModelServiceTier\> | `[]` — each: `{ "id", "name", "description" }` |
-| `supports_image_detail_original` | bool | `false` |
-| `context_window` | Option\<i64\> | `None` |
-| `max_context_window` | Option\<i64\> | `None` |
-| `auto_compact_token_limit` | Option\<i64\> | `None` |
-| `effective_context_window_percent` | i64 | `95` |
-| `input_modalities` | Vec\<InputModality\> | `["text", "image"]` |
-| `supports_search_tool` | bool | `false` |
-| `web_search_tool_type` | WebSearchToolType | `"text"` — `"text"`\|`"text_and_image"` |
-| `availability_nux` | Option\<ModelAvailabilityNux\> | `None` — `{ "message": String }` |
-| `upgrade` | Option\<ModelInfoUpgrade\> | `None` — `{ "model": String, "migration_markdown": String }` |
-| `model_messages` | Option\<ModelMessages\> | `None` — `{ "instructions_template": Option\<String\>, ... }` |
-
-**Enum serialization:** `ModelVisibility` uses `rename_all = "lowercase"`, `ConfigShellToolType` uses `rename_all = "snake_case"` [13].
-
-#### 13e. Catalog Config and Multi-File Merge
-
-The `model_catalog` config field (`Vec<PathBuf>`, default `[]`) controls mode selection:
-- Empty → Mode 1 (standard OpenAI, upstream Anthropic call)
-- Non-empty → Mode 2 (Codex Extended, serve from catalog)
-
-**Multi-file merge** (files processed in config order, first = highest priority):
-- Each catalog file must be a valid `ModelsResponse` on its own — all fields without `#[serde(default)]` must be present in every file. The merge overlay only adjusts fields that have serde defaults or are `Option<T>`.
-- Different slugs → union (include all)
-- Same slug → field-by-field overlay:
-  - Non-`Option` scalars: earlier file wins
-  - `Option<T>` fields: `null`/absent in earlier file → fall through to later file
-  - Vec fields: complete replacement from earlier file
-  - Nested objects: entire object replacement, same `Option` rules
-
-**Startup validation** (failure = error + exit):
-- Catalog file must exist and be parseable as YAML (JSON superset)
-- Merged catalog must have at least one model
-
-#### 13f. Codex CLI Behavior [4][5][12][13]
-
-- Calls `GET /v1/models` to populate the model picker
-- Deserializes response into `ModelsResponse { models: Vec<ModelInfo> }` (NOT standard OpenAI format)
-- Falls back to bundled `models.json` if the endpoint is unavailable
-- Falls back to `model_info_from_slug()` hardcoded defaults if a model slug is not found
-- Calls `GET /v1/models/{model}` to verify a model exists before use
-
-#### 13g. Error Conversion
-
-Mode 1 error mapping reuses existing `convert_non_streaming_error()`:
-- Anthropic 404 → 404 `model_not_found`
-- Anthropic 401 → 401 `invalid_api_key`
-- Anthropic 200 non-JSON → 502 `server_error`
-- Network errors → 502/504 as specified in design doc
-
-Mode 2 runtime errors:
-- Model not found → 404 `model_not_found`
-- Mode 2 startup errors → exit with message
+**Unmappable codes:** `usage_not_included`, `cyber_policy`, `invalid_prompt` are recognized by Codex but have no Anthropic equivalent — they will never appear in proxy responses from Anthropic upstream [1][4].
 
 ### Reference
-- [1] Anthropic List Models API — https://docs.anthropic.com/en/api/models-list
-- [2] OpenAI List Models API — https://developers.openai.com/api/reference/resources/models/methods/list/
-- [3] OpenAI Retrieve Model API — https://developers.openai.com/api/reference/resources/models/methods/retrieve/
-- [4] Codex CLI issue #2507 — https://github.com/openai/codex/issues/2507
-- [5] Codex CLI issue #10867 — https://github.com/openai/codex/issues/10867
-- [6] Anthropic Get Model API — https://docs.anthropic.com/en/api/models
-- [7] Anthropic API Versioning — https://docs.anthropic.com/en/api/versioning
-- [8] Anthropic Errors — https://docs.anthropic.com/en/api/errors
-- [9] OpenAI API Errors — https://developers.openai.com/api/reference/debugging/errors
-- [10] LiteLLM model response handling — https://github.com/BerriAI/litellm
-- [11] CLIProxyAPI model response handling — https://github.com/anthropics/claude-code-proxy
-- [12] Codex CLI source (model picker) — https://github.com/openai/codex
-- [13] Codex CLI source: `codex-rs/protocol/src/openai_models.rs` and `codex-rs/models-manager/src/model_info.rs` — https://github.com/openai/codex
+- [1] Codex CLI source: `codex-rs/codex-api/src/sse/responses.rs` (error detection functions), `codex-rs/codex-api/src/error.rs` (`ApiError` enum), `codex-rs/codex-api/src/api_bridge.rs` (HTTP error mapping), `codex-rs/protocol/src/error.rs` (`CodexErr` enum with `is_retryable()`) — https://github.com/openai/codex
+- [2] Codex CLI source: `codex-rs/protocol/src/error.rs` — https://github.com/openai/codex
+- [3] Codex CLI source: `codex-rs/codex-api/src/api_bridge.rs` — https://github.com/openai/codex
+- [4] Anthropic API Errors documentation — https://platform.claude.com/docs/en/api/errors
+
+---
+
+## 41. Spec fixes B1/B3/B4/B5: `success` field, `CallToolResult.isError`, `sequence_number`, and `end_turn`
+
+### Description
+Four issues identified in the design spec requiring verification against Codex CLI source code and correction.
+
+### Result
+
+**B1 — `success` field never appears on wire:** `FunctionCallOutputPayload` has a custom `Serialize` impl that only serializes `self.body` — the `success: Option<bool>` field is completely stripped from wire JSON [1]. The `Deserialize` impl always sets `success: None` [1]. The proxy cannot and need not map `success` because it never appears in data received from Codex CLI. The previous spec mapping (`success: false` → `is_error: true`) was incorrect — this field is internal-only, used by Codex between its own components (e.g., `CallToolResult.as_function_call_output_payload()` sets it from `isError`, but only for internal transport, not HTTP wire).
+
+**B3 — `McpToolCallOutput` uses `CallToolResult` with `isError` field:** `McpToolCallOutput` in `ResponseInputItem` uses `output: CallToolResult` (from `codex-rs/protocol/src/mcp.rs`), not `FunctionCallOutputPayload` [1][2]. `CallToolResult` has `is_error: Option<bool>` (serialized as `isError` in camelCase) [2]. When `isError: true`, the MCP tool call failed. The proxy should set `tool_result.is_error: true` on the Anthropic side. The MCP spec defines `CallToolResult` with `isError` as the standard error indicator for tool invocations [3].
+
+**B4 — `sequence_number` is ignored by Codex:** `ResponsesStreamEvent` in `codex-rs/codex-api/src/sse/responses.rs` does not have a `sequence_number` field [4]. The struct uses `#[derive(Deserialize)]` without `#[serde(deny_unknown_fields)]`, so unknown fields like `sequence_number` are silently ignored. The spec's requirement to "include it in every event" adds implementation complexity for zero benefit. The proxy should not include `sequence_number`.
+
+**B5 — `end_turn` omission tradeoff:** Codex CLI uses `end_turn` from `ResponseCompleted` to set `needs_follow_up` [4]. The exact code is `if let Some(false) = end_turn { needs_follow_up = true; }` — only `Some(false)` triggers follow-up. When `end_turn` is absent (`None`), this path is skipped. Codex compensates via tool execution results in the agent loop. The proxy should map `stop_reason: "tool_use"` → `end_turn: false` in `response.completed` to explicitly signal continuation, and omit `end_turn` for other stop reasons. This preserves the model's intent without fabricating signals.
+
+### Reference
+- [1] Codex CLI source: `codex-rs/protocol/src/models.rs` (`FunctionCallOutputPayload` custom Serialize/Deserialize, `ResponseInputItem::McpToolCallOutput`, `ResponseInputItem::FunctionCallOutput`) — https://github.com/openai/codex
+- [2] Codex CLI source: `codex-rs/protocol/src/mcp.rs` (`CallToolResult` struct with `is_error: Option<bool>`) — https://github.com/openai/codex
+- [3] MCP Specification: Tools — https://modelcontextprotocol.io/specification/2025-11-25/server/tools (`CallToolResult` with `isError` field)
+- [4] Codex CLI source: `codex-rs/codex-api/src/sse/responses.rs` (`ResponsesStreamEvent` struct without `sequence_number`, `ResponseCompleted` with `end_turn`, `ResponseEvent::Completed` usage) — https://github.com/openai/codex
+- [5] Codex CLI source: `codex-rs/core/src/session/turn.rs` (`if let Some(false) = end_turn { needs_follow_up = true; }` at sampling result handling) — https://github.com/openai/codex
+
+---
+
+## 42. CRITICAL: `response.incomplete` triggers infinite retries in Codex CLI
+
+### Description
+The spec currently maps Anthropic `stop_reason: "max_tokens"` to `status: "incomplete"` with a `response.incomplete` event. However, Codex CLI's stream handler treats `response.incomplete` as a retryable stream error, which creates an infinite retry loop for `max_tokens` truncation — every retry hits the same token limit, produces another `response.incomplete`, and triggers another retry.
+
+### Result
+
+**Codex CLI behavior (verified from source code):**
+
+1. `codex-rs/codex-api/src/sse/responses.rs` — `process_responses_event()` handles `response.incomplete` by creating `ApiError::Stream("Incomplete response returned, reason: {reason}")` [1].
+
+2. `codex-rs/codex-api/src/api_bridge.rs` — `ApiError::Stream(msg)` maps to `CodexErr::Stream(msg, None)` [2].
+
+3. `codex-rs/protocol/src/error.rs` — `CodexErr::Stream(..)` has `is_retryable() = true`. It is grouped with `Timeout`, `UnexpectedStatus`, `ResponseStreamFailed`, `ConnectionFailed`, `InternalServerError`, `InternalAgentDied`, `Io`, `Json`, and `TokioJoin` as retryable [3].
+
+4. `codex-rs/core/src/session/turn.rs` — The turn retry loop checks `err.is_retryable()`. If true and `retries < max_retries`, it sleeps with backoff and retries the entire turn. Since `max_tokens` truncation is deterministic (same tokens, same limit), every retry produces another `response.incomplete`, creating a retry loop bounded only by `stream_max_retries` (typically 3-5), wasting API calls and time [4].
+
+**How existing implementations handle this:**
+
+- **CLIProxyAPI** [5]: **Always emits `response.completed` with `status: "completed"`** regardless of Anthropic's `stop_reason`. In `codex_claude_response.go`, both `response.completed` and `response.incomplete` are handled identically — converted to `message_delta` + `message_stop`. The `mapCodexStopReasonToClaude()` function maps `max_tokens`/`max_output_tokens` back to `"max_tokens"` as the Claude stop_reason, but the event type is always `response.completed` with `status: "completed"` and `incomplete_details: null`. This means Codex CLI **never sees `response.incomplete`** from CLIProxyAPI.
+
+- **LiteLLM** [6]: Does not emit `response.incomplete` in the Anthropic conversion path.
+
+- **codex-bridge** [7]: Does not emit `response.incomplete`.
+
+**Evaluation:** No existing implementation emits `response.incomplete`. CLIProxyAPI deliberately avoids it because Codex CLI treats it as a retryable error. The prior design decision to emit `response.incomplete` for correctness is **incorrect** — it causes a worse user experience (wasted API calls, delays, eventual failure after max retries) than the information loss from always emitting `response.completed`.
+
+**Design decision (REVISED):** Always emit `response.completed` with `status: "completed"` regardless of Anthropic's `stop_reason`, matching CLIProxyAPI's behavior. Include `incomplete_details: {reason: "max_output_tokens"}` as an informational field when `stop_reason` is `max_tokens` or `model_context_window_exceeded`. This preserves truncation information for any client that inspects `incomplete_details` without triggering Codex CLI's retry logic.
+
+**Note:** The Responses API spec allows `incomplete_details` to coexist with `status: "completed"` — it is simply a field on the response object. Codex CLI does not check `incomplete_details` at all; it only triggers retries based on the event type (`response.incomplete` vs `response.completed`).
+
+### Reference
+- [1] Codex CLI source: `codex-rs/codex-api/src/sse/responses.rs` — `response.incomplete` handler — https://github.com/openai/codex/blob/master/codex-rs/codex-api/src/sse/responses.rs
+- [2] Codex CLI source: `codex-rs/codex-api/src/api_bridge.rs` — `ApiError::Stream` to `CodexErr::Stream` mapping — https://github.com/openai/codex/blob/master/codex-rs/codex-api/src/api_bridge.rs
+- [3] Codex CLI source: `codex-rs/protocol/src/error.rs` — `is_retryable()` method — https://github.com/openai/codex/blob/master/codex-rs/protocol/src/error.rs
+- [4] Codex CLI source: `codex-rs/core/src/session/turn.rs` — retry loop with `is_retryable()` check — https://github.com/openai/codex/blob/master/codex-rs/core/src/session/turn.rs
+- [5] CLIProxyAPI source: `internal/translator/codex/claude/codex_claude_response.go` — https://github.com/router-for-me/CLIProxyAPI/blob/master/internal/translator/codex/claude/codex_claude_response.go
+- [6] LiteLLM source — https://github.com/BerriAI/litellm
+- [7] codex-bridge source — https://github.com/nicholasyangyang/codex-bridge
