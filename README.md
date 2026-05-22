@@ -12,20 +12,33 @@ No configuration required — just run:
 codex-conv
 ```
 
-The proxy listens on `0.0.0.0:8080` by default.
+The proxy listens on `0.0.0.0:8080` by default. Then configure Codex CLI:
 
-Point Codex CLI at the proxy:
+### 1. Edit `~/.codex/config.toml`
 
-```bash
-codex exec \
-  -c 'model_providers.custom.base_url="http://localhost:8080/https/api.anthropic.com"' \
-  -c 'model_provider="custom"' \
-  "your prompt here"
+```toml
+model = "claude-sonnet-4-20250514"
+model_provider = "anthropic-proxy"
+
+[model_providers.anthropic-proxy]
+name = "Anthropic via codex-conv"
+base_url = "http://localhost:8080/https/api.anthropic.com"
+wire_api = "responses"
+env_key = "ANTHROPIC_API_KEY"
+```
+
+### 2. Edit `~/.codex/auth.json`
+
+```json
+{
+  "auth_mode": "api-key",
+  "OPENAI_API_KEY": "sk-ant-..."
+}
 ```
 
 The proxy extracts the upstream host from the URL path (`/https/<host>/responses` → `https://<host>/v1/messages`) and forwards the API key from the `Authorization` header.
 
-## Configuration
+## Proxy Configuration
 
 Configuration priority (lowest to highest):
 

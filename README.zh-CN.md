@@ -12,20 +12,33 @@
 codex-conv
 ```
 
-代理默认监听 `0.0.0.0:8080`。
+代理默认监听 `0.0.0.0:8080`。然后配置 Codex CLI：
 
-将 Codex CLI 指向代理：
+### 1. 编辑 `~/.codex/config.toml`
 
-```bash
-codex exec \
-  -c 'model_providers.custom.base_url="http://localhost:8080/https/api.anthropic.com"' \
-  -c 'model_provider="custom"' \
-  "你的提示词"
+```toml
+model = "claude-sonnet-4-20250514"
+model_provider = "anthropic-proxy"
+
+[model_providers.anthropic-proxy]
+name = "Anthropic via codex-conv"
+base_url = "http://localhost:8080/https/api.anthropic.com"
+wire_api = "responses"
+env_key = "ANTHROPIC_API_KEY"
+```
+
+### 2. 编辑 `~/.codex/auth.json`
+
+```json
+{
+  "auth_mode": "api-key",
+  "OPENAI_API_KEY": "sk-ant-..."
+}
 ```
 
 代理从 URL 路径中提取上游地址（`/https/<host>/responses` → `https://<host>/v1/messages`），并转发 `Authorization` 头中的 API 密钥。
 
-## 配置方式
+## 代理配置
 
 配置优先级从低到高：
 
